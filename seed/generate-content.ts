@@ -7,6 +7,7 @@ import { Pool } from 'pg';
 import dotenv from 'dotenv';
 import { courseSlides } from './content/all-slides';
 import { courseQuizzes } from './content/all-quizzes';
+import { courseExercises } from './content/exercises';
 
 dotenv.config();
 
@@ -75,6 +76,23 @@ async function generate(): Promise<void> {
       }
       console.log(`Inserted ${questions.length} questions for ${courseCode}`);
     }
+
+    // Insert exercises as interactive slides
+    for (const exercise of courseExercises) {
+      const courseResult = await pool.query(
+        'SELECT id FROM acc_training_courses WHERE course_code = $1', [exercise.courseCode]
+      );
+      if (courseResult.rows.length === 0) continue;
+      const courseId = courseResult.rows[0].id;
+
+      await pool.query(
+        `INSERT INTO acc_training_slides (course_id, title, content, slide_type, order_index, interactive_config)
+         VALUES ($1, $2, $3, 'interactive', $4, $5)
+         ON CONFLICT DO NOTHING`,
+        [courseId, exercise.title, exercise.config.instruction || '', exercise.order, JSON.stringify(exercise.config)]
+      );
+    }
+    console.log(`Inserted ${courseExercises.length} interactive exercises`);
 
     console.log('Content generation complete!');
   } catch (error) {
