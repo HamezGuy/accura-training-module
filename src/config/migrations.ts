@@ -70,6 +70,21 @@ const MIGRATIONS: string[] = [
   `CREATE INDEX IF NOT EXISTS idx_training_audit_action ON acc_training_audit_log(action)`,
   `CREATE INDEX IF NOT EXISTS idx_training_audit_created_at ON acc_training_audit_log(created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_training_questions_course_id ON acc_training_questions(course_id)`,
+
+  `CREATE TABLE IF NOT EXISTS acc_training_slides (
+    id SERIAL PRIMARY KEY,
+    course_id INTEGER NOT NULL REFERENCES acc_training_courses(id) ON DELETE CASCADE,
+    title VARCHAR(255) NOT NULL,
+    content TEXT NOT NULL,
+    slide_type VARCHAR(20) NOT NULL DEFAULT 'text' CHECK (slide_type IN ('text', 'image', 'video', 'interactive')),
+    order_index INTEGER NOT NULL DEFAULT 0,
+    media_url TEXT,
+    interactive_config JSONB,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+  )`,
+
+  `CREATE INDEX IF NOT EXISTS idx_training_slides_course_id ON acc_training_slides(course_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_training_slides_order ON acc_training_slides(course_id, order_index)`,
 ];
 
 export async function runMigrations(): Promise<void> {

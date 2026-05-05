@@ -523,3 +523,59 @@ export async function expireOverdueRecords(): Promise<number> {
   }
   return count;
 }
+
+// ============================================================================
+// Course Content (Slides) Operations
+// ============================================================================
+
+export interface SlideContent {
+  id: number;
+  courseId: number;
+  title: string;
+  content: string;
+  slideType: string;
+  orderIndex: number;
+  mediaUrl: string | null;
+  interactiveConfig: Record<string, unknown> | null;
+}
+
+export interface CourseContentResponse {
+  course: TrainingCourse;
+  slides: SlideContent[];
+  questions: TrainingQuizQuestion[];
+}
+
+export async function getCourseContent(courseId: number): Promise<CourseContentResponse | null> {
+  const course = await queryOne<TrainingCourse>(
+    'SELECT * FROM acc_training_courses WHERE id = $1 AND active = true',
+    [courseId]
+  );
+
+  if (!course) return null;
+
+  const { rows: slides } = await query<SlideContent>(
+    `SELECT id, course_id, title, content, slide_type, order_index, media_url, interactive_config
+     FROM acc_training_slides
+     WHERE course_id = $1
+     ORDER BY order_index ASC`,
+    [courseId]
+  );
+
+  const { rows: questions } = await query<TrainingQuizQuestion>(
+    `SELECT id, course_id, question_text, question_type, options, explanation, order_index
+     FROM acc_training_questions
+     WHERE course_id = $1 AND active = true
+     ORDER BY order_index ASC`,
+    [courseId]
+  );
+
+  // Strip isCorrect from options for client delivery
+  const safeQuestions = questions.map((q) => ({
+    ...q,
+    options: (q.options as unknown as Array<{ text: string; isCorrect?: boolean }>).map(
+      (opt) => ({ text: opt.text })
+    ),
+  }));
+
+  return { course, slides, questions: safeQuestions };
+}

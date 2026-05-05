@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import Joi from 'joi';
-import { authMiddleware } from '../middleware/auth.middleware';
+import { authMiddleware, AuthRequest } from '../middleware/auth.middleware';
 import { authorize } from '../middleware/authorization.middleware';
 import { validate } from '../middleware/validation.middleware';
 import { asyncHandler } from '../middleware/errorHandler.middleware';
@@ -82,66 +82,68 @@ const verifyTrainingSchema = Joi.object({
 // Course Routes
 // ============================================================================
 
-router.get('/courses', asyncHandler(controller.getCourses));
+router.get('/courses', asyncHandler<AuthRequest>(controller.getCourses));
 
-router.get('/courses/:id', asyncHandler(controller.getCourseById));
+router.get('/courses/:id', asyncHandler<AuthRequest>(controller.getCourseById));
+
+router.get('/courses/:id/content', asyncHandler<AuthRequest>(controller.getCourseContent));
 
 router.post(
   '/courses',
   authorize(['admin', 'manager']),
   validate(createCourseSchema),
-  asyncHandler(controller.createCourse)
+  asyncHandler<AuthRequest>(controller.createCourse)
 );
 
 router.put(
   '/courses/:id',
   authorize(['admin', 'manager']),
   validate(updateCourseSchema),
-  asyncHandler(controller.updateCourse)
+  asyncHandler<AuthRequest>(controller.updateCourse)
 );
 
 router.post(
   '/courses/:id/questions',
   authorize(['admin', 'manager']),
   validate(addQuestionsSchema),
-  asyncHandler(controller.addQuestions)
+  asyncHandler<AuthRequest>(controller.addQuestions)
 );
 
 // ============================================================================
 // Training Record Routes
 // ============================================================================
 
-router.get('/my-records', asyncHandler(controller.getMyRecords));
+router.get('/my-records', asyncHandler<AuthRequest>(controller.getMyRecords));
 
 router.get(
   '/user/:userId/records',
   authorize(['admin', 'manager', 'monitor']),
-  asyncHandler(controller.getUserRecords)
+  asyncHandler<AuthRequest>(controller.getUserRecords)
 );
 
-router.post('/start/:courseId', asyncHandler(controller.startTraining));
+router.post('/start/:courseId', asyncHandler<AuthRequest>(controller.startTraining));
 
 router.post(
   '/submit-quiz/:courseId',
   validate(submitQuizSchema),
-  asyncHandler(controller.submitQuiz)
+  asyncHandler<AuthRequest>(controller.submitQuiz)
 );
 
 router.post(
   '/verify/:recordId',
   authorize(['admin', 'manager', 'monitor', 'investigator']),
   validate(verifyTrainingSchema),
-  asyncHandler(controller.verifyTraining)
+  asyncHandler<AuthRequest>(controller.verifyTraining)
 );
 
 // ============================================================================
 // Compliance Routes
 // ============================================================================
 
-router.get('/compliance', asyncHandler(controller.getComplianceStatus));
+router.get('/compliance', asyncHandler<AuthRequest>(controller.getComplianceStatus));
 
-router.get('/expiring', asyncHandler(controller.getExpiringTraining));
+router.get('/expiring', asyncHandler<AuthRequest>(controller.getExpiringTraining));
 
-router.get('/user/:userId/is-compliant', asyncHandler(controller.checkCompliance));
+router.get('/user/:userId/is-compliant', asyncHandler<AuthRequest>(controller.checkCompliance));
 
 export default router;

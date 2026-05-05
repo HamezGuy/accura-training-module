@@ -19,10 +19,10 @@ export function errorHandler(err: ApiError, _req: Request, res: Response, _next:
   });
 }
 
-export function asyncHandler(
-  fn: (req: Request, res: Response, next: NextFunction) => Promise<void>
+export function asyncHandler<T extends Request = Request>(
+  fn: (req: T, res: Response, next: NextFunction) => Promise<void>
 ) {
   return (req: Request, res: Response, next: NextFunction): void => {
-    Promise.resolve(fn(req, res, next)).catch(next);
+    Promise.resolve(fn(req as T, res, next)).catch(next);
   };
 }

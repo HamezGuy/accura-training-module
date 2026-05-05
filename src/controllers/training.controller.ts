@@ -194,6 +194,39 @@ export async function verifyTraining(req: AuthRequest, res: Response): Promise<v
 }
 
 // ============================================================================
+// Course Content Endpoint
+// ============================================================================
+
+export async function getCourseContent(req: AuthRequest, res: Response): Promise<void> {
+  const courseId = parseInt(req.params['id'], 10);
+
+  const content = await trainingService.getCourseContent(courseId);
+
+  if (!content) {
+    res.status(404).json({ success: false, message: 'Course not found' });
+    return;
+  }
+
+  res.json({
+    success: true,
+    data: {
+      course: mapCourseToDto(content.course),
+      slides: content.slides.map((s) => ({
+        id: s.id,
+        courseId: s.courseId,
+        title: s.title,
+        content: s.content,
+        slideType: s.slideType,
+        orderIndex: s.orderIndex,
+        mediaUrl: s.mediaUrl,
+        interactiveConfig: s.interactiveConfig,
+      })),
+      questions: content.questions,
+    },
+  });
+}
+
+// ============================================================================
 // Compliance Endpoints
 // ============================================================================
 
