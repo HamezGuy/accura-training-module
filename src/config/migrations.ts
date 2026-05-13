@@ -76,7 +76,7 @@ const MIGRATIONS: string[] = [
     course_id INTEGER NOT NULL REFERENCES acc_training_courses(id) ON DELETE CASCADE,
     title VARCHAR(255) NOT NULL,
     content TEXT NOT NULL,
-    slide_type VARCHAR(20) NOT NULL DEFAULT 'text' CHECK (slide_type IN ('text', 'image', 'video', 'interactive')),
+    slide_type VARCHAR(20) NOT NULL DEFAULT 'text' CHECK (slide_type IN ('text', 'image', 'video', 'interactive', 'knowledge-check')),
     order_index INTEGER NOT NULL DEFAULT 0,
     media_url TEXT,
     interactive_config JSONB,
@@ -85,6 +85,9 @@ const MIGRATIONS: string[] = [
 
   `CREATE INDEX IF NOT EXISTS idx_training_slides_course_id ON acc_training_slides(course_id)`,
   `CREATE INDEX IF NOT EXISTS idx_training_slides_order ON acc_training_slides(course_id, order_index)`,
+
+  `ALTER TABLE acc_training_slides DROP CONSTRAINT IF EXISTS acc_training_slides_slide_type_check`,
+  `ALTER TABLE acc_training_slides ADD CONSTRAINT acc_training_slides_slide_type_check CHECK (slide_type IN ('text', 'image', 'video', 'interactive', 'knowledge-check'))`,
 ];
 
 export async function runMigrations(): Promise<void> {

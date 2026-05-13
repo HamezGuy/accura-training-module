@@ -146,4 +146,7 @@ router.get('/expiring', asyncHandler<AuthRequest>(controller.getExpiringTraining
 
 router.get('/user/:userId/is-compliant', asyncHandler<AuthRequest>(controller.checkCompliance));
 
+// Learning paths
+router.get('/learning-paths', asyncHandler<AuthRequest>(controller.getLearningPaths));
+
 export default router;
