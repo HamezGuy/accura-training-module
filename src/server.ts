@@ -10,6 +10,7 @@ import { pool } from './config/database';
 import { errorHandler } from './middleware/errorHandler.middleware';
 import trainingRoutes from './routes/training.routes';
 import { expireOverdueRecords } from './services/training.service';
+import { reportError, startErrorReporter, stopErrorReporter } from './services/error-reporter.service';
 
 const app = express();
 
@@ -41,19 +42,40 @@ app.get('/health', (_req, res) => {
 app.use('/api/training', trainingRoutes);
 
 // Global error handler
-app.use(errorHandler);
+app.use((err: import('./middleware/errorHandler.middleware').ApiError, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (!err.statusCode || err.statusCode >= 500) {
+    reportError(err);
+  }
+  errorHandler(err, req, res, next);
+});
 
 // Start server
 async function start(): Promise<void> {
   try {
-    // Verify database connection
+    startErrorReporter();
+
+    process.on('uncaughtException', (error) => {
+      reportError(error);
+      logger.error('Uncaught exception', { error: error.message, stack: error.stack });
+    });
+
+    process.on('unhandledRejection', (reason) => {
+      reportError(reason);
+      const message = reason instanceof Error ? reason.message : String(reason);
+      logger.error('Unhandled rejection', { error: message });
+    });
+
+    process.on('SIGTERM', async () => {
+      logger.info('SIGTERM received — flushing error reporter');
+      await stopErrorReporter();
+      process.exit(0);
+    });
+
     await pool.query('SELECT 1');
     logger.info('Database connection established');
 
-    // Run migrations
     await runMigrations();
 
-    // Schedule expiration check cron job
     cron.schedule(config.training.expirationCheckCron, async () => {
       logger.info('Running scheduled expiration check');
       try {
