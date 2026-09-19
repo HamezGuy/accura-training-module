@@ -412,7 +412,7 @@ export async function getComplianceStatus(options?: {
     role: string;
   }>(
     `SELECT user_id, username, first_name, last_name, role 
-     FROM acc_users ${userFilter}
+     FROM acc_users u ${userFilter}
      ORDER BY username`,
     params
   );
@@ -492,11 +492,17 @@ export async function getExpiringTraining(daysAhead: number = 30): Promise<Train
 }
 
 export async function checkUserCompliance(userId: number): Promise<TrainingComplianceCheck> {
+  if (!Number.isSafeInteger(userId) || userId < 1) {
+    throw Object.assign(new Error('An exact positive user ID is required'), { statusCode: 400 });
+  }
   const statuses = await getComplianceStatus({ userId });
   const status = statuses[0];
 
   if (!status) {
-    return { userId, isCompliant: true, missingCount: 0, expiredCount: 0 };
+    throw Object.assign(new Error('User not found for training compliance'), { statusCode: 404 });
+  }
+  if (statuses.length !== 1 || status.userId !== userId) {
+    throw Object.assign(new Error('Training compliance user identity is ambiguous'), { statusCode: 409 });
   }
 
   return {

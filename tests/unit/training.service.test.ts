@@ -270,4 +270,45 @@ describe('TrainingService', () => {
       );
     });
   });
+
+  describe('exact compliance identity', () => {
+    it('cannot report an absent user as compliant', async () => {
+      mockQuery.mockResolvedValue({ rows: [], rowCount: 0 });
+      await expect(trainingService.checkUserCompliance(77)).rejects.toMatchObject({ statusCode: 404 });
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      expect(mockQuery.mock.calls[0][1]).toEqual([77]);
+    });
+
+    it.each([0, -1, NaN, 1.5, Number.MAX_SAFE_INTEGER + 1])('rejects invalid user identity %s before reading records', async userId => {
+      await expect(trainingService.checkUserCompliance(userId)).rejects.toMatchObject({ statusCode: 400 });
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('propagates a failed user read rather than manufacturing compliant empty state', async () => {
+      const failure = new Error('Identity storage unavailable');
+      mockQuery.mockRejectedValue(failure);
+      await expect(trainingService.checkUserCompliance(77)).rejects.toBe(failure);
+    });
+
+    it('refuses a successful-looking compliance result for a different user', async () => {
+      mockQuery.mockResolvedValueOnce({
+        rows: [{ userId: 78, username: 'other', firstName: 'Other', lastName: 'Person', role: 'monitor' }],
+        rowCount: 1,
+      }).mockResolvedValue({ rows: [], rowCount: 0 });
+      await expect(trainingService.checkUserCompliance(77)).rejects.toMatchObject({ statusCode: 409 });
+    });
+
+    it('keeps the existing required-course calculation for an exact known user', async () => {
+      mockQuery.mockResolvedValueOnce({
+        rows: [{ userId: 77, username: 'known', firstName: 'Known', lastName: 'Person', role: 'monitor' }],
+        rowCount: 1,
+      }).mockResolvedValueOnce({
+        rows: [{ courseCode: 'REQUIRED-1', courseName: 'Required course', regulatoryReference: null }],
+        rowCount: 1,
+      }).mockResolvedValueOnce({ rows: [], rowCount: 0 });
+      await expect(trainingService.checkUserCompliance(77)).resolves.toEqual({
+        userId: 77, isCompliant: false, missingCount: 1, expiredCount: 0,
+      });
+    });
+  });
 });
