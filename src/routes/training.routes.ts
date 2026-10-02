@@ -90,21 +90,21 @@ router.get('/courses/:id/content', asyncHandler<AuthRequest>(controller.getCours
 
 router.post(
   '/courses',
-  authorize(['admin', 'manager']),
+  authorize(['admin', 'data_manager']),
   validate(createCourseSchema),
   asyncHandler<AuthRequest>(controller.createCourse)
 );
 
 router.put(
   '/courses/:id',
-  authorize(['admin', 'manager']),
+  authorize(['admin', 'data_manager']),
   validate(updateCourseSchema),
   asyncHandler<AuthRequest>(controller.updateCourse)
 );
 
 router.post(
   '/courses/:id/questions',
-  authorize(['admin', 'manager']),
+  authorize(['admin', 'data_manager']),
   validate(addQuestionsSchema),
   asyncHandler<AuthRequest>(controller.addQuestions)
 );
@@ -117,7 +117,7 @@ router.get('/my-records', asyncHandler<AuthRequest>(controller.getMyRecords));
 
 router.get(
   '/user/:userId/records',
-  authorize(['admin', 'manager', 'monitor']),
+  authorize(['admin', 'data_manager', 'monitor']),
   asyncHandler<AuthRequest>(controller.getUserRecords)
 );
 
@@ -131,7 +131,7 @@ router.post(
 
 router.post(
   '/verify/:recordId',
-  authorize(['admin', 'manager', 'monitor', 'investigator']),
+  authorize(['admin', 'data_manager', 'monitor', 'investigator']),
   validate(verifyTrainingSchema),
   asyncHandler<AuthRequest>(controller.verifyTraining)
 );

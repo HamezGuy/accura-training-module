@@ -37,7 +37,7 @@ jest.mock('../../src/config/database', () => ({
 }));
 
 jest.mock('../../src/config/logger', () => ({
-  logger: { error: jest.fn(), info: jest.fn(), warn: jest.fn() },
+  logger: { error: jest.fn(), info: jest.fn(), warn: jest.fn(), debug: jest.fn() },
 }));
 
 const JWT_SECRET = 'test-secret';
@@ -63,11 +63,13 @@ function generateToken(payload: Record<string, unknown> = {}) {
       userId: 1,
       username: 'testuser',
       role: 'admin',
-      organizationId: 1,
+      email: 'owned@example.invalid',
+      type: 'access',
+      organizationIds: [1],
       ...payload,
     },
     JWT_SECRET,
-    { expiresIn: '1h' }
+    { expiresIn: '1h', algorithm: 'HS256', issuer: 'libreclinica-api', audience: 'libreclinica-client' }
   );
 }
 
@@ -306,4 +308,33 @@ describe('Training API Integration', () => {
       expect(res.body.data.isCompliant).toBe(true);
     });
   });
+  test.each(['0', '-1', '1.5', '1abc', '', '1&studyId=2'])('rejects malformed supplied study scope %s before calling services', async value => {
+    const response = await request(app).get(`/api/training/compliance?studyId=${value}`).set('Authorization', `Bearer ${generateToken()}`);
+    expect(response.status).toBe(400); expect(mockGetComplianceStatus).not.toHaveBeenCalled();
+  });
+  test('preserves exact explicit user and study scope at the DTO boundary', async () => {
+    mockGetComplianceStatus.mockResolvedValue([]);
+    expect((await request(app).get('/api/training/compliance?studyId=5&userId=7').set('Authorization', `Bearer ${generateToken()}`)).status).toBe(200);
+    expect(mockGetComplianceStatus).toHaveBeenCalledWith({ studyId: 5, userId: 7 });
+  });
+
+  test.each(['data_manager', 'study_director'])('actual course route accepts governed management role %s', async role => {
+    mockCreateCourse.mockResolvedValue({ id: 10, courseCode: 'OWNED-ROLE', requiredForRoles: [role] });
+    const response = await request(app).post('/api/training/courses').set('Authorization', `Bearer ${generateToken({ role })}`)
+      .send({ courseCode: 'OWNED-ROLE', courseName: 'Owned role course', version: '1', passingScore: 80, requiredForRoles: [role] });
+    expect(response.status).toBe(201); expect(mockCreateCourse).toHaveBeenCalledTimes(1);
+  });
+
+  test('course route accepts legacy empty email while preserving actor identity', async () => {
+    mockCreateCourse.mockResolvedValue({ id:10, courseCode:'OWNED-LEGACY', requiredForRoles:['admin'] });
+    const response = await request(app).post('/api/training/courses').set('Authorization', `Bearer ${generateToken({email:''})}`)
+      .send({courseCode:'OWNED-LEGACY',courseName:'Owned legacy',version:'1',passingScore:80,requiredForRoles:['admin']});
+    expect(response.status).toBe(201); expect(mockCreateCourse.mock.calls[0][1]).toBe(1);
+  });
+  test('learning-path role uses the same canonical data-manager identity', async () => {
+    const response = await request(app).get('/api/training/learning-paths').set('Authorization', `Bearer ${generateToken({role:'data_manager'})}`);
+    expect(response.status).toBe(200);
+    expect(response.body.data.find((path:any) => path.id==='data-manager-path').targetRole).toBe('data_manager');
+  });
+
 });

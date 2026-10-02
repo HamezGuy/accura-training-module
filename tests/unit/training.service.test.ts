@@ -49,14 +49,8 @@ describe('TrainingService', () => {
     });
 
     it('should filter by role when specified', async () => {
-      mockQuery.mockResolvedValue({ rows: [], rowCount: 0 });
-
-      await trainingService.getCourses({ role: 'monitor' });
-
-      expect(mockQuery).toHaveBeenCalledWith(
-        expect.stringContaining('required_for_roles'),
-        expect.arrayContaining([JSON.stringify(['monitor'])])
-      );
+      mockQuery.mockResolvedValue({ rows: [{ id: 1, requiredForRoles: ['site_monitor'] }, { id: 2, requiredForRoles: ['manager'] }], rowCount: 2 });
+      expect((await trainingService.getCourses({ role: 'monitor' })).map(course => course.id)).toEqual([1]);
     });
   });
 
@@ -293,7 +287,7 @@ describe('TrainingService', () => {
 
     it('refuses a successful-looking compliance result for a different user', async () => {
       mockQuery.mockResolvedValueOnce({
-        rows: [{ userId: 78, username: 'other', firstName: 'Other', lastName: 'Person', role: 'monitor' }],
+        rows: [{ userId: 78, username: 'other', firstName: 'Other', lastName: 'Person', userTypeId: 2, platformRole: 'monitor', studyRoles: [] }],
         rowCount: 1,
       }).mockResolvedValue({ rows: [], rowCount: 0 });
       await expect(trainingService.checkUserCompliance(77)).rejects.toMatchObject({ statusCode: 409 });
@@ -301,10 +295,10 @@ describe('TrainingService', () => {
 
     it('keeps the existing required-course calculation for an exact known user', async () => {
       mockQuery.mockResolvedValueOnce({
-        rows: [{ userId: 77, username: 'known', firstName: 'Known', lastName: 'Person', role: 'monitor' }],
+        rows: [{ userId: 77, username: 'known', firstName: 'Known', lastName: 'Person', userTypeId: 2, platformRole: 'monitor', studyRoles: [] }],
         rowCount: 1,
       }).mockResolvedValueOnce({
-        rows: [{ courseCode: 'REQUIRED-1', courseName: 'Required course', regulatoryReference: null }],
+        rows: [{ id: 5, requiredForRoles: ['monitor'], courseCode: 'REQUIRED-1', courseName: 'Required course', regulatoryReference: null }],
         rowCount: 1,
       }).mockResolvedValueOnce({ rows: [], rowCount: 0 });
       await expect(trainingService.checkUserCompliance(77)).resolves.toEqual({

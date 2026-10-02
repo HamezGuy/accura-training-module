@@ -244,8 +244,15 @@ export async function getCourseContent(req: AuthRequest, res: Response): Promise
 // ============================================================================
 
 export async function getComplianceStatus(req: AuthRequest, res: Response): Promise<void> {
-  const userId = req.query['userId'] ? parseInt(req.query['userId'] as string, 10) : undefined;
-  const studyId = req.query['studyId'] ? parseInt(req.query['studyId'] as string, 10) : undefined;
+  const exactId = (value: unknown, field: string): number | undefined => {
+    if (value === undefined) return undefined;
+    if (typeof value !== 'string' || !/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(Number(value))) {
+      throw Object.assign(new Error(`An exact positive ${field} is required`), { statusCode: 400 });
+    }
+    return Number(value);
+  };
+  const userId = exactId(req.query['userId'], 'user ID');
+  const studyId = exactId(req.query['studyId'], 'study ID');
 
   const statuses = await trainingService.getComplianceStatus({ userId, studyId });
 
@@ -275,7 +282,7 @@ export async function getExpiringTraining(req: AuthRequest, res: Response): Prom
 }
 
 export async function checkCompliance(req: AuthRequest, res: Response): Promise<void> {
-  const userId = parseInt(req.params['userId'], 10);
+  const userId = Number(req.params['userId']);
   const result = await trainingService.checkUserCompliance(userId);
 
   const dto: TrainingComplianceCheck = {
@@ -352,7 +359,7 @@ function mapRecordToDto(r: TrainingRecord): TrainingRecord {
 const LEARNING_PATHS = [
   { id: 'coordinator-path', name: 'Site Coordinator Path', description: 'Essential training for CRCs — data entry, patient management, queries, and e-signatures.', targetRole: 'coordinator', courseCodes: ['LOGIN-NAV','DATA-ENTRY','PATIENT-MGMT','QUERY-MGMT','E-SIGN'], totalMinutes: 115 },
   { id: 'monitor-path', name: 'Clinical Monitor Path', description: 'Training for CRAs — SDV, query management, data locks, and reporting.', targetRole: 'monitor', courseCodes: ['LOGIN-NAV','SDV','QUERY-MGMT','DATA-LOCKS','REPORTS'], totalMinutes: 115 },
-  { id: 'data-manager-path', name: 'Data Manager Path', description: 'Comprehensive training — form design, validation, workflows, locks, and exports.', targetRole: 'manager', courseCodes: ['LOGIN-NAV','FORM-CREATE','VAL-RULES','WORKFLOW','DATA-LOCKS','DATA-EXPORT','QUERY-MGMT'], totalMinutes: 200 },
+  { id: 'data-manager-path', name: 'Data Manager Path', description: 'Comprehensive training — form design, validation, workflows, locks, and exports.', targetRole: 'data_manager', courseCodes: ['LOGIN-NAV','FORM-CREATE','VAL-RULES','WORKFLOW','DATA-LOCKS','DATA-EXPORT','QUERY-MGMT'], totalMinutes: 200 },
   { id: 'investigator-path', name: 'Principal Investigator Path', description: 'Training for PIs — data entry, patients, randomization, and e-signatures.', targetRole: 'investigator', courseCodes: ['LOGIN-NAV','DATA-ENTRY','PATIENT-MGMT','RANDOMIZE','E-SIGN'], totalMinutes: 115 },
   { id: 'admin-path', name: 'System Administrator Path', description: 'Complete system training covering all features plus compliance.', targetRole: 'admin', courseCodes: ['LOGIN-NAV','USER-MGMT','STUDY-MGMT','FORM-CREATE','DATA-ENTRY','PATIENT-MGMT','VAL-RULES','QUERY-MGMT','DATA-LOCKS','E-SIGN','SDV','WORKFLOW','DATA-EXPORT','REPORTS','RANDOMIZE','GCP-101','CFR11-101','HIPAA-101'], totalMinutes: 420 },
 ];

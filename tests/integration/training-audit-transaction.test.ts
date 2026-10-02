@@ -17,7 +17,7 @@ jest.mock('../../src/config/environment', () => ({ config: {
   database: { host: 'unused.invalid', port: 1, name: 'offline-only', user: 'offline', password: '', ssl: false },
   jwt: { secret: 'training-audit-offline-test' }, training: { certificateValidityDays: 365 },
 } }));
-jest.mock('../../src/config/logger', () => ({ logger: { error: jest.fn(), info: jest.fn(), warn: jest.fn() } }));
+jest.mock('../../src/config/logger', () => ({ logger: { error: jest.fn(), info: jest.fn(), warn: jest.fn(), debug: jest.fn() } }));
 
 const course = { id: 3, course_code: 'OWNED-AUDIT', course_name: 'Audit fixture', version: '1', active: true,
   passing_score: 80, required_for_roles: ['admin'], validity_period_days: 365 };
@@ -44,7 +44,7 @@ const cases = [
 
 describe('training mutation and audit share the real database transaction boundary', () => {
   const app = express(); app.use(express.json()); app.use('/api/training', trainingRoutes); app.use(errorHandler);
-  const token = jwt.sign({ userId: 1, username: 'owned-test', role: 'admin' }, 'training-audit-offline-test');
+  const token = jwt.sign({ userId: 1, username: 'owned-test', role: 'admin', email: 'owned@example.invalid', type: 'access' }, 'training-audit-offline-test', { algorithm: 'HS256', issuer: 'libreclinica-api', audience: 'libreclinica-client', expiresIn: '1h' });
   let responses: Array<{ rows: Record<string, unknown>[]; rowCount: number }>;
   let active: boolean, stagedWrites: number, committedWrites: number, stagedAudits: unknown[][], committedAudits: unknown[][];
   let auditAttempts: number, failAuditAt: number, businessAttempts: number, failBusinessAt: number;

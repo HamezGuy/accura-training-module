@@ -1,3 +1,4 @@
+import { ADMIN_USER_TYPE_IDS, getRoleByName, getHighestRole, ROLES } from '@accura-trial/auth-core';
 import { query, queryOne, transaction, TransactionClient } from '../config/database';
 import { logger } from '../config/logger';
 import { logAudit } from './audit.service';
@@ -17,6 +18,21 @@ import {
 
 const database: TransactionClient = { query, queryOne };
 
+/** Course configuration retains the legacy manager alias; token authority does not. */
+function canonicalCourseRoles(value: unknown, statusCode: number): string[] {
+  if (!Array.isArray(value) || value.some(role => typeof role !== 'string')) {
+    throw Object.assign(new Error('Invalid required training role configuration'), { statusCode });
+  }
+  return value.map(name => {
+    const role = name.trim().toLowerCase() === 'manager' ? ROLES.DATA_MANAGER : getRoleByName(name);
+    if (role.id === ROLES.INVALID.id) {
+      throw Object.assign(new Error('Unknown required training role configuration'), { statusCode });
+    }
+    return role.name;
+  });
+}
+
+
 // ============================================================================
 // Course Operations
 // ============================================================================
@@ -33,16 +49,12 @@ export async function getCourses(options?: {
     sql += ` AND active = $${params.length}`;
   }
 
-  if (options?.role) {
-    params.push(options.role);
-    sql += ` AND required_for_roles @> $${params.length}::jsonb`;
-    params[params.length - 1] = JSON.stringify([options.role]);
-  }
+  const role = options?.role !== undefined ? canonicalCourseRoles([options.role], 400)[0] : undefined;
 
   sql += ' ORDER BY course_code ASC';
 
   const { rows } = await query<TrainingCourse>(sql, params);
-  return rows;
+  return role === undefined ? rows : rows.filter(course => canonicalCourseRoles(course.requiredForRoles, 409).includes(role));
 }
 
 export async function getCourseById(
@@ -83,6 +95,7 @@ export async function createCourse(
   createdBy: number,
   client: TransactionClient = database
 ): Promise<TrainingCourse> {
+  canonicalCourseRoles(dto.requiredForRoles, 400);
   const result = await client.queryOne<TrainingCourse>(
     `INSERT INTO acc_training_courses 
      (course_code, course_name, description, version, duration_minutes, 
@@ -137,6 +150,7 @@ export async function updateCourse(
     params.push(dto.passingScore);
   }
   if (dto.requiredForRoles !== undefined) {
+    canonicalCourseRoles(dto.requiredForRoles, 400);
     setClauses.push(`required_for_roles = $${paramIdx++}`);
     params.push(JSON.stringify(dto.requiredForRoles));
   }
@@ -404,81 +418,89 @@ export async function getComplianceStatus(options?: {
   userId?: number;
   studyId?: number;
 }): Promise<TrainingComplianceStatus[]> {
-  let userFilter = '';
   const params: unknown[] = [];
-
-  if (options?.userId) {
-    params.push(options.userId);
-    userFilter = `WHERE u.user_id = $${params.length}`;
+  const filters = ['u.status_id = 1'];
+  for (const [field, value] of Object.entries(options ?? {})) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 1)) {
+      throw Object.assign(new Error(`An exact positive ${field} is required`), { statusCode: 400 });
+    }
   }
-
-  // Get users from the main acc_users table (shared DB)
+  if (options?.studyId !== undefined) {
+    const study = await queryOne<{ studyId: number }>('SELECT study_id FROM study WHERE study_id = $1', [options.studyId]);
+    if (!study || study.studyId !== options.studyId) {
+      throw Object.assign(new Error('Study not found for training compliance'), { statusCode: 404 });
+    }
+    params.push(options.studyId);
+    // Same native parent/site membership scope as EDC notification audiences.
+    filters.push(`EXISTS (SELECT 1 FROM study_user_role scoped WHERE scoped.user_name = u.user_name
+      AND scoped.status_id = 1 AND (scoped.study_id = $${params.length}
+      OR scoped.study_id IN (SELECT study_id FROM study WHERE parent_study_id = $${params.length})))`);
+  }
+  if (options?.userId !== undefined) {
+    params.push(options.userId);
+    filters.push(`u.user_id = $${params.length}`);
+  }
   const { rows: users } = await query<{
-    userId: number;
-    username: string;
-    firstName: string;
-    lastName: string;
-    role: string;
-  }>(
-    `SELECT user_id, username, first_name, last_name, role 
-     FROM acc_users u ${userFilter}
-     ORDER BY username`,
-    params
-  );
+    userId: number; username: string; firstName: string; lastName: string;
+    userTypeId: number | null; platformRole: string | null; studyRoles: string[];
+  }>(`SELECT u.user_id, u.user_name AS username, u.first_name, u.last_name, u.user_type_id,
+      extended.platform_role,
+      ARRAY(SELECT DISTINCT sur.role_name FROM study_user_role sur
+        WHERE sur.user_name = u.user_name AND sur.status_id = 1 AND sur.role_name IS NOT NULL) AS study_roles
+    FROM user_account u LEFT JOIN user_account_extended extended ON extended.user_id = u.user_id
+    WHERE ${filters.join(' AND ')} ORDER BY u.user_name`, params);
 
+  const { rows: activeCourses } = users.length
+    ? await query<TrainingCourse>('SELECT * FROM acc_training_courses WHERE active = true')
+    : { rows: [] };
+  // Validate every active course before assigning requirements, so corrupt or
+  // unknown configuration cannot disappear and manufacture complete compliance.
+  const rolesByCourse = new Map(activeCourses.map(course => [course.id, canonicalCourseRoles(course.requiredForRoles, 409)]));
   const statuses: TrainingComplianceStatus[] = [];
-
+  const now = Date.now();
   for (const user of users) {
-    const { rows: requiredCourses } = await query<TrainingCourse>(
-      `SELECT * FROM acc_training_courses 
-       WHERE active = true AND required_for_roles @> $1::jsonb`,
-      [JSON.stringify([user.role])]
-    );
-
+    // Match native resolvePrimaryRole precedence; DB failures remain failures.
+    const role = ADMIN_USER_TYPE_IDS.includes(user.userTypeId as number) ? ROLES.ADMIN
+      : user.platformRole?.trim() ? getRoleByName(user.platformRole)
+      : getHighestRole(user.studyRoles ?? []).id !== ROLES.INVALID.id ? getHighestRole(user.studyRoles ?? [])
+      : ROLES.COORDINATOR;
+    if (role.id === ROLES.INVALID.id) {
+      throw Object.assign(new Error('Unknown native platform role for training compliance'), { statusCode: 409 });
+    }
+    const requiredCourses = activeCourses.filter(course => rolesByCourse.get(course.id)!.includes(role.name));
     const { rows: records } = await query<TrainingRecord>(
-      `SELECT r.*, c.course_code, c.course_name
-       FROM acc_training_records r
-       JOIN acc_training_courses c ON c.id = r.course_id
-       WHERE r.user_id = $1`,
-      [user.userId]
+      'SELECT * FROM acc_training_records WHERE user_id = $1 AND course_id = ANY($2::integer[])',
+      [user.userId, requiredCourses.map(course => course.id)]
     );
-
-    const completed = records.filter(
-      (r) => r.status === 'completed' && (!r.expirationDate || new Date(r.expirationDate) > new Date())
-    ).length;
-
-    const expired = records.filter(
-      (r) => r.status === 'expired' || (r.expirationDate && new Date(r.expirationDate) <= new Date())
-    ).length;
-
-    const completedCodes = records
-      .filter((r) => r.status === 'completed' && (!r.expirationDate || new Date(r.expirationDate) > new Date()))
-      .map((r) => r.courseCode);
-
-    const missingCourses = requiredCourses
-      .filter((c) => !completedCodes.includes(c.courseCode))
-      .map((c) => ({
-        courseCode: c.courseCode,
-        courseName: c.courseName,
-        requiredBy: (c.regulatoryReference ?? 'Organization Policy'),
-      }));
-
-    const totalRequired = requiredCourses.length;
-    const pending = totalRequired - completed - expired;
-    const compliancePercentage = totalRequired > 0 ? Math.round((completed / totalRequired) * 100) : 100;
-
+    const byCourse = new Map<number, TrainingRecord>();
+    for (const record of records) {
+      if (!requiredCourses.some(course => course.id === record.courseId)) continue;
+      if (byCourse.has(record.courseId)) {
+        throw Object.assign(new Error('Ambiguous training records for required course'), { statusCode: 409 });
+      }
+      byCourse.set(record.courseId, record);
+    }
+    const completedIds = new Set<number>(), expiredIds = new Set<number>();
+    for (const course of requiredCourses) {
+      const record = byCourse.get(course.id);
+      if (!record) continue;
+      const expiration = record.expirationDate ? new Date(record.expirationDate).getTime() : null;
+      if (expiration !== null && !Number.isFinite(expiration)) {
+        throw Object.assign(new Error('Invalid training expiration date'), { statusCode: 409 });
+      }
+      if (record.status === 'expired' || (expiration !== null && expiration <= now)) expiredIds.add(course.id);
+      else if (record.status === 'completed') completedIds.add(course.id);
+    }
+    const missingCourses = requiredCourses.filter(course => !completedIds.has(course.id)).map(course => ({
+      courseCode: course.courseCode, courseName: course.courseName,
+      requiredBy: course.regulatoryReference ?? 'Organization Policy',
+    }));
+    const totalRequired = requiredCourses.length, completed = completedIds.size, expired = expiredIds.size;
     statuses.push({
-      userId: user.userId,
-      username: user.username,
-      userFullName: `${user.firstName} ${user.lastName}`.trim(),
-      role: user.role,
-      totalRequired,
-      completed,
-      expired,
-      pending: Math.max(0, pending),
-      compliancePercentage,
-      isCompliant: missingCourses.length === 0 && expired === 0,
-      missingCourses,
+      userId: user.userId, username: user.username, userFullName: `${user.firstName} ${user.lastName}`.trim(),
+      role: role.name, totalRequired, completed, expired, pending: totalRequired - completed - expired,
+      compliancePercentage: totalRequired ? Math.round(completed / totalRequired * 100) : 100,
+      isCompliant: completed === totalRequired, missingCourses,
     });
   }
 

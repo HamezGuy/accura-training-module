@@ -24,6 +24,7 @@
   "author": "AccuraTrial",
   "license": "MIT",
   "dependencies": {
+    "@accura-trial/auth-core": "github:HamezGuy/accura-auth#93520e77b9d010934770687674a28db166fff90b",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.21.1",
