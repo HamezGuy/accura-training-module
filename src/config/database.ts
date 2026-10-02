@@ -69,6 +69,7 @@ export async function transaction<T>(
   fn: (client: TransactionClient) => Promise<T>
 ): Promise<T> {
   const client: PoolClient = await pool.connect();
+  let discardClient = false;
   try {
     await client.query('BEGIN');
 
@@ -91,9 +92,22 @@ export async function transaction<T>(
     await client.query('COMMIT');
     return result;
   } catch (error) {
-    await client.query('ROLLBACK');
+    try { await client.query('ROLLBACK'); }
+    catch (rollbackError) {
+      discardClient = true;
+      // Keep the operation's original failure, and retain the separate rollback
+      // failure without returning an unusable connection to the pool.
+      if (error instanceof Error && Object.isExtensible(error) && !Object.prototype.hasOwnProperty.call(error, 'rollbackError')) {
+        Object.defineProperty(error, 'rollbackError', { value: rollbackError });
+        throw error;
+      }
+      const failure = new Error(error instanceof Error ? error.message : 'Transaction failed');
+      Object.defineProperties(failure, { cause: { value: error }, rollbackError: { value: rollbackError } });
+      throw failure;
+    }
     throw error;
   } finally {
-    client.release();
+    if (discardClient) client.release(true);
+    else client.release();
   }
 }

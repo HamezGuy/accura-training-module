@@ -53,12 +53,22 @@ describe('AuditService', () => {
       );
     });
 
-    it('should not throw on database error (logs instead)', async () => {
-      mockQuery.mockRejectedValue(new Error('Connection lost'));
+    it('propagates the original audit error so the owning mutation can roll back', async () => {
+      const failure = new Error('Connection lost');
+      mockQuery.mockRejectedValue(failure);
 
       await expect(
         logAudit({ userId: 1, action: 'training_started' })
-      ).resolves.toBeUndefined();
+      ).rejects.toBe(failure);
+    });
+
+    it('writes through the supplied transaction client without a pool query', async () => {
+      const client = { query: jest.fn().mockResolvedValue({ rows: [], rowCount: 1 }) };
+      await logAudit({ userId: null, action: 'training_expired', recordId: 9,
+        details: { actor: 'scheduled-expiration', affectedUserId: 4 } }, client);
+      expect(mockQuery).not.toHaveBeenCalled();
+      expect(client.query).toHaveBeenCalledWith(expect.any(String),
+        [null, 'training_expired', 9, null, '{"actor":"scheduled-expiration","affectedUserId":4}', null, null]);
     });
   });
 });

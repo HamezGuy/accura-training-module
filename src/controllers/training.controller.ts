@@ -2,6 +2,7 @@ import { Response } from 'express';
 import { AuthRequest } from '../middleware/auth.middleware';
 import * as trainingService from '../services/training.service';
 import { logAudit } from '../services/audit.service';
+import { transaction } from '../config/database';
 import {
   TrainingCourse,
   TrainingRecord,
@@ -43,15 +44,17 @@ export async function getCourseById(req: AuthRequest, res: Response): Promise<vo
 
 export async function createCourse(req: AuthRequest, res: Response): Promise<void> {
   const userId = req.user!.userId;
-  const course = await trainingService.createCourse(req.body, userId);
-
-  await logAudit({
-    userId,
-    action: 'course_created',
-    courseId: course.id,
-    details: { courseCode: course.courseCode, courseName: course.courseName },
-    ipAddress: req.ip,
-    userAgent: req.headers['user-agent'],
+  const course = await transaction(async (client) => {
+    const created = await trainingService.createCourse(req.body, userId, client);
+    await logAudit({
+      userId,
+      action: 'course_created',
+      courseId: created.id,
+      details: { courseCode: created.courseCode, courseName: created.courseName },
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
+    }, client);
+    return created;
   });
 
   const dto: TrainingCourse = mapCourseToDto(course);
@@ -62,21 +65,23 @@ export async function updateCourse(req: AuthRequest, res: Response): Promise<voi
   const courseId = parseInt(req.params['id'], 10);
   const userId = req.user!.userId;
 
-  const course = await trainingService.updateCourse(courseId, req.body);
+  const course = await transaction(async (client) => {
+    const updated = await trainingService.updateCourse(courseId, req.body, client);
+    if (updated) await logAudit({
+      userId,
+      action: 'course_updated',
+      courseId: updated.id,
+      details: { changes: req.body },
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
+    }, client);
+    return updated;
+  });
 
   if (!course) {
     res.status(404).json({ success: false, message: 'Course not found' });
     return;
   }
-
-  await logAudit({
-    userId,
-    action: 'course_updated',
-    courseId: course.id,
-    details: { changes: req.body },
-    ipAddress: req.ip,
-    userAgent: req.headers['user-agent'],
-  });
 
   const dto: TrainingCourse = mapCourseToDto(course);
   res.json({ success: true, data: dto });
@@ -86,22 +91,24 @@ export async function addQuestions(req: AuthRequest, res: Response): Promise<voi
   const courseId = parseInt(req.params['id'], 10);
   const userId = req.user!.userId;
 
-  const existing = await trainingService.getCourseById(courseId);
-  if (!existing) {
+  const questions = await transaction(async (client) => {
+    const existing = await trainingService.getCourseById(courseId, false, client);
+    if (!existing) return null;
+    const added = await trainingService.addQuestions(courseId, req.body.questions, client);
+    await logAudit({
+      userId,
+      action: 'questions_added',
+      courseId,
+      details: { count: added.length },
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
+    }, client);
+    return added;
+  });
+  if (!questions) {
     res.status(404).json({ success: false, message: 'Course not found' });
     return;
   }
-
-  const questions = await trainingService.addQuestions(courseId, req.body.questions);
-
-  await logAudit({
-    userId,
-    action: 'questions_added',
-    courseId,
-    details: { count: questions.length },
-    ipAddress: req.ip,
-    userAgent: req.headers['user-agent'],
-  });
 
   const dto: TrainingQuizQuestion[] = questions.map(mapQuestionToDto);
   res.status(201).json({ success: true, data: dto });
@@ -131,15 +138,17 @@ export async function startTraining(req: AuthRequest, res: Response): Promise<vo
   const userId = req.user!.userId;
   const courseId = parseInt(req.params['courseId'], 10);
 
-  const record = await trainingService.startTraining(userId, courseId);
-
-  await logAudit({
-    userId,
-    action: 'training_started',
-    recordId: record.id,
-    courseId,
-    ipAddress: req.ip,
-    userAgent: req.headers['user-agent'],
+  const record = await transaction(async (client) => {
+    const started = await trainingService.startTraining(userId, courseId, client);
+    await logAudit({
+      userId,
+      action: 'training_started',
+      recordId: started.id,
+      courseId,
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
+    }, client);
+    return started;
   });
 
   const dto: TrainingRecord = mapRecordToDto(record);
@@ -151,15 +160,17 @@ export async function submitQuiz(req: AuthRequest, res: Response): Promise<void>
   const courseId = parseInt(req.params['courseId'], 10);
   const { answers } = req.body;
 
-  const result = await trainingService.submitQuiz(userId, courseId, answers);
-
-  await logAudit({
-    userId,
-    action: result.passed ? 'quiz_passed' : 'quiz_failed',
-    courseId,
-    details: { score: result.score, passed: result.passed, totalQuestions: result.totalQuestions },
-    ipAddress: req.ip,
-    userAgent: req.headers['user-agent'],
+  const result = await transaction(async (client) => {
+    const submitted = await trainingService.submitQuiz(userId, courseId, answers, client);
+    await logAudit({
+      userId,
+      action: submitted.passed ? 'quiz_passed' : 'quiz_failed',
+      courseId,
+      details: { score: submitted.score, passed: submitted.passed, totalQuestions: submitted.totalQuestions },
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
+    }, client);
+    return submitted;
   });
 
   const dto: TrainingQuizResult = {
@@ -179,15 +190,17 @@ export async function verifyTraining(req: AuthRequest, res: Response): Promise<v
   const recordId = parseInt(req.params['recordId'], 10);
   const { notes } = req.body;
 
-  const result = await trainingService.verifyTraining(recordId, verifierId, notes);
-
-  await logAudit({
-    userId: verifierId,
-    action: 'training_verified',
-    recordId,
-    details: { notes },
-    ipAddress: req.ip,
-    userAgent: req.headers['user-agent'],
+  const result = await transaction(async (client) => {
+    const verified = await trainingService.verifyTraining(recordId, verifierId, notes, client);
+    await logAudit({
+      userId: verifierId,
+      action: 'training_verified',
+      recordId,
+      details: { notes },
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
+    }, client);
+    return verified;
   });
 
   res.json({ success: true, data: result });

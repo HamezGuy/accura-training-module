@@ -28,6 +28,7 @@ describe('TrainingService', () => {
     mockQuery.mockReset();
     mockQueryOne.mockReset();
     mockTransaction.mockReset();
+    mockTransaction.mockImplementation(async (fn) => fn({ query: mockQuery, queryOne: mockQueryOne }));
   });
 
   describe('getCourses', () => {
@@ -260,7 +261,7 @@ describe('TrainingService', () => {
 
   describe('expireOverdueRecords', () => {
     it('should update overdue records to expired status', async () => {
-      mockQuery.mockResolvedValue({ rows: [{ id: 1 }, { id: 2 }], rowCount: 2 });
+      mockQuery.mockResolvedValue({ rows: [{ id: 1, userId: 4, courseId: 2 }, { id: 2, userId: 5, courseId: 2 }], rowCount: 2 });
 
       const count = await trainingService.expireOverdueRecords();
 

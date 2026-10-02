@@ -69,6 +69,22 @@ const MIGRATIONS: string[] = [
   `CREATE INDEX IF NOT EXISTS idx_training_audit_user_id ON acc_training_audit_log(user_id)`,
   `CREATE INDEX IF NOT EXISTS idx_training_audit_action ON acc_training_audit_log(action)`,
   `CREATE INDEX IF NOT EXISTS idx_training_audit_created_at ON acc_training_audit_log(created_at)`,
+  // A scheduled expiration has no human actor. Keep the affected user in the
+  // event details and prohibit anonymous interactive events, including missing
+  // JSON fields (SQL CHECK must not accept an unknown/null predicate).
+  `DO $$ BEGIN
+    ALTER TABLE acc_training_audit_log ALTER COLUMN user_id DROP NOT NULL;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+      WHERE conrelid = 'acc_training_audit_log'::regclass AND conname = 'acc_training_audit_actor_required') THEN
+      ALTER TABLE acc_training_audit_log ADD CONSTRAINT acc_training_audit_actor_required CHECK (
+        user_id IS NOT NULL OR (
+          action = 'training_expired'
+          AND COALESCE(details @> '{"actor":"scheduled-expiration"}'::jsonb, false)
+          AND COALESCE(jsonb_typeof(details -> 'affectedUserId') = 'number', false)
+        )
+      );
+    END IF;
+  END; $$`,
   `CREATE INDEX IF NOT EXISTS idx_training_questions_course_id ON acc_training_questions(course_id)`,
 
   `CREATE TABLE IF NOT EXISTS acc_training_slides (

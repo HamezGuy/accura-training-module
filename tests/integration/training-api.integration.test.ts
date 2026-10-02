@@ -32,6 +32,10 @@ jest.mock('../../src/services/audit.service', () => ({
   logAudit: jest.fn(),
 }));
 
+jest.mock('../../src/config/database', () => ({
+  transaction: (fn: (client: unknown) => Promise<unknown>) => fn({}),
+}));
+
 jest.mock('../../src/config/logger', () => ({
   logger: { error: jest.fn(), info: jest.fn(), warn: jest.fn() },
 }));

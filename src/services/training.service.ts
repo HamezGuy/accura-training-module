@@ -1,5 +1,6 @@
-import { query, queryOne, transaction } from '../config/database';
+import { query, queryOne, transaction, TransactionClient } from '../config/database';
 import { logger } from '../config/logger';
+import { logAudit } from './audit.service';
 import { generateCertificateNumber, calculateExpirationDate } from './certificate.service';
 import {
   TrainingCourse,
@@ -13,6 +14,8 @@ import {
   UpdateCourseRequest,
   CreateQuestionRequest,
 } from '../types/training.types';
+
+const database: TransactionClient = { query, queryOne };
 
 // ============================================================================
 // Course Operations
@@ -44,9 +47,10 @@ export async function getCourses(options?: {
 
 export async function getCourseById(
   courseId: number,
-  includeQuestions: boolean = false
+  includeQuestions: boolean = false,
+  client: TransactionClient = database
 ): Promise<TrainingCourse | null> {
-  const course = await queryOne<TrainingCourse>(
+  const course = await client.queryOne<TrainingCourse>(
     'SELECT * FROM acc_training_courses WHERE id = $1',
     [courseId]
   );
@@ -54,7 +58,7 @@ export async function getCourseById(
   if (!course) return null;
 
   if (includeQuestions) {
-    const { rows: questions } = await query<TrainingQuizQuestion>(
+    const { rows: questions } = await client.query<TrainingQuizQuestion>(
       `SELECT id, course_id, question_text, question_type, options, explanation, order_index
        FROM acc_training_questions 
        WHERE course_id = $1 AND active = true 
@@ -76,9 +80,10 @@ export async function getCourseById(
 
 export async function createCourse(
   dto: CreateCourseRequest,
-  createdBy: number
+  createdBy: number,
+  client: TransactionClient = database
 ): Promise<TrainingCourse> {
-  const result = await queryOne<TrainingCourse>(
+  const result = await client.queryOne<TrainingCourse>(
     `INSERT INTO acc_training_courses 
      (course_code, course_name, description, version, duration_minutes, 
       passing_score, required_for_roles, regulatory_reference, validity_period_days, created_by)
@@ -104,7 +109,8 @@ export async function createCourse(
 
 export async function updateCourse(
   courseId: number,
-  dto: UpdateCourseRequest
+  dto: UpdateCourseRequest,
+  client: TransactionClient = database
 ): Promise<TrainingCourse | null> {
   const setClauses: string[] = [];
   const params: unknown[] = [];
@@ -147,23 +153,24 @@ export async function updateCourse(
     params.push(dto.validityPeriodDays);
   }
 
-  if (setClauses.length === 0) return getCourseById(courseId);
+  if (setClauses.length === 0) return getCourseById(courseId, false, client);
 
   setClauses.push(`updated_at = NOW()`);
   params.push(courseId);
 
   const sql = `UPDATE acc_training_courses SET ${setClauses.join(', ')} WHERE id = $${paramIdx} RETURNING *`;
-  return queryOne<TrainingCourse>(sql, params);
+  return client.queryOne<TrainingCourse>(sql, params);
 }
 
 export async function addQuestions(
   courseId: number,
-  questions: CreateQuestionRequest[]
+  questions: CreateQuestionRequest[],
+  client: TransactionClient = database
 ): Promise<TrainingQuizQuestion[]> {
   const results: TrainingQuizQuestion[] = [];
 
   for (const q of questions) {
-    const row = await queryOne<TrainingQuizQuestion>(
+    const row = await client.queryOne<TrainingQuizQuestion>(
       `INSERT INTO acc_training_questions 
        (course_id, question_text, question_type, options, explanation, order_index)
        VALUES ($1, $2, $3, $4, $5, $6)
@@ -204,8 +211,8 @@ export async function getUserRecords(userId: number): Promise<TrainingRecord[]> 
   return rows;
 }
 
-export async function startTraining(userId: number, courseId: number): Promise<TrainingRecord> {
-  const course = await queryOne<TrainingCourse>(
+export async function startTraining(userId: number, courseId: number, client: TransactionClient = database): Promise<TrainingRecord> {
+  const course = await client.queryOne<TrainingCourse>(
     'SELECT * FROM acc_training_courses WHERE id = $1 AND active = true',
     [courseId]
   );
@@ -214,7 +221,7 @@ export async function startTraining(userId: number, courseId: number): Promise<T
     throw Object.assign(new Error('Course not found or inactive'), { statusCode: 404 });
   }
 
-  const existing = await queryOne<TrainingRecord>(
+  const existing = await client.queryOne<TrainingRecord>(
     'SELECT * FROM acc_training_records WHERE user_id = $1 AND course_id = $2',
     [userId, courseId]
   );
@@ -224,7 +231,7 @@ export async function startTraining(userId: number, courseId: number): Promise<T
   }
 
   if (existing) {
-    const updated = await queryOne<TrainingRecord>(
+    const updated = await client.queryOne<TrainingRecord>(
       `UPDATE acc_training_records 
        SET status = 'in_progress', started_at = COALESCE(started_at, NOW()), updated_at = NOW()
        WHERE id = $1 RETURNING *`,
@@ -234,7 +241,7 @@ export async function startTraining(userId: number, courseId: number): Promise<T
     return updated;
   }
 
-  const record = await queryOne<TrainingRecord>(
+  const record = await client.queryOne<TrainingRecord>(
     `INSERT INTO acc_training_records (user_id, course_id, status, started_at)
      VALUES ($1, $2, 'in_progress', NOW())
      RETURNING *`,
@@ -248,9 +255,10 @@ export async function startTraining(userId: number, courseId: number): Promise<T
 export async function submitQuiz(
   userId: number,
   courseId: number,
-  answers: TrainingQuizAnswer[]
+  answers: TrainingQuizAnswer[],
+  client?: TransactionClient
 ): Promise<TrainingQuizResult> {
-  const course = await queryOne<TrainingCourse>(
+  const course = await (client ?? database).queryOne<TrainingCourse>(
     'SELECT * FROM acc_training_courses WHERE id = $1',
     [courseId]
   );
@@ -259,7 +267,7 @@ export async function submitQuiz(
     throw Object.assign(new Error('Course not found'), { statusCode: 404 });
   }
 
-  const { rows: questions } = await query<TrainingQuizQuestion & { options: Array<{ text: string; isCorrect?: boolean }> }>(
+  const { rows: questions } = await (client ?? database).query<TrainingQuizQuestion & { options: Array<{ text: string; isCorrect?: boolean }> }>(
     'SELECT * FROM acc_training_questions WHERE course_id = $1 AND active = true ORDER BY order_index',
     [courseId]
   );
@@ -294,7 +302,7 @@ export async function submitQuiz(
   const passed = score >= course.passingScore;
 
   // Update the training record in a transaction
-  const result = await transaction(async (client) => {
+  const updateRecord = async (client: TransactionClient) => {
     const record = await client.queryOne<TrainingRecord>(
       'SELECT * FROM acc_training_records WHERE user_id = $1 AND course_id = $2 FOR UPDATE',
       [userId, courseId]
@@ -350,18 +358,19 @@ export async function submitQuiz(
       certificateNumber,
       expirationDate,
     } satisfies TrainingQuizResult;
-  });
+  };
 
-  return result;
+  return client ? updateRecord(client) : transaction(updateRecord);
 }
 
 export async function verifyTraining(
   recordId: number,
   verifierId: number,
-  notes?: string
+  notes?: string,
+  client: TransactionClient = database
 ): Promise<{ verified: boolean }> {
-  const record = await queryOne<TrainingRecord>(
-    'SELECT * FROM acc_training_records WHERE id = $1',
+  const record = await client.queryOne<TrainingRecord>(
+    'SELECT * FROM acc_training_records WHERE id = $1 FOR UPDATE',
     [recordId]
   );
 
@@ -377,7 +386,7 @@ export async function verifyTraining(
     throw Object.assign(new Error('Cannot verify your own training'), { statusCode: 403 });
   }
 
-  await query(
+  await client.query(
     `UPDATE acc_training_records 
      SET verified_by = $1, verified_at = NOW(), notes = $2, updated_at = NOW()
      WHERE id = $3`,
@@ -514,16 +523,22 @@ export async function checkUserCompliance(userId: number): Promise<TrainingCompl
 }
 
 export async function expireOverdueRecords(): Promise<number> {
-  const result = await query(
-    `UPDATE acc_training_records 
-     SET status = 'expired', updated_at = NOW()
-     WHERE status = 'completed'
-       AND expiration_date IS NOT NULL
-       AND expiration_date < NOW()
-     RETURNING id`
-  );
-
-  const count = result.rowCount ?? 0;
+  const count = await transaction(async (client) => {
+    const result = await client.query<{ id: number; userId: number; courseId: number; expirationDate: string }>(
+      `UPDATE acc_training_records
+       SET status = 'expired', updated_at = NOW()
+       WHERE status = 'completed'
+         AND expiration_date IS NOT NULL
+         AND expiration_date < NOW()
+       RETURNING id, user_id, course_id, expiration_date`
+    );
+    for (const record of result.rows) {
+      await logAudit({ userId: null, action: 'training_expired', recordId: record.id, courseId: record.courseId,
+        details: { actor: 'scheduled-expiration', affectedUserId: record.userId, expirationDate: record.expirationDate,
+          previousStatus: 'completed', status: 'expired' } }, client);
+    }
+    return result.rows.length;
+  });
   if (count > 0) {
     logger.info(`Expired ${count} overdue training records`);
   }
