@@ -3,6 +3,7 @@ import { AuthRequest } from '../middleware/auth.middleware';
 import * as trainingService from '../services/training.service';
 import { logAudit } from '../services/audit.service';
 import { transaction } from '../config/database';
+import { exactPositiveId } from '../middleware/validation.middleware';
 import {
   TrainingCourse,
   TrainingRecord,
@@ -244,15 +245,8 @@ export async function getCourseContent(req: AuthRequest, res: Response): Promise
 // ============================================================================
 
 export async function getComplianceStatus(req: AuthRequest, res: Response): Promise<void> {
-  const exactId = (value: unknown, field: string): number | undefined => {
-    if (value === undefined) return undefined;
-    if (typeof value !== 'string' || !/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(Number(value))) {
-      throw Object.assign(new Error(`An exact positive ${field} is required`), { statusCode: 400 });
-    }
-    return Number(value);
-  };
-  const userId = exactId(req.query['userId'], 'user ID');
-  const studyId = exactId(req.query['studyId'], 'study ID');
+  const userId = exactPositiveId(req.query['userId'], 'user ID');
+  const studyId = exactPositiveId(req.query['studyId'], 'study ID');
 
   const statuses = await trainingService.getComplianceStatus({ userId, studyId });
 
@@ -282,7 +276,7 @@ export async function getExpiringTraining(req: AuthRequest, res: Response): Prom
 }
 
 export async function checkCompliance(req: AuthRequest, res: Response): Promise<void> {
-  const userId = Number(req.params['userId']);
+  const userId = exactPositiveId(req.params['userId'], 'user ID')!;
   const result = await trainingService.checkUserCompliance(userId);
 
   const dto: TrainingComplianceCheck = {

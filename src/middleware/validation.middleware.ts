@@ -27,3 +27,11 @@ export function validate(schema: Joi.ObjectSchema, source: 'body' | 'query' | 'p
     next();
   };
 }
+
+export function exactPositiveId(value: unknown, field: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || !/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(Number(value))) {
+    throw Object.assign(new Error(`An exact positive ${field} is required`), { statusCode: 400 });
+  }
+  return Number(value);
+}

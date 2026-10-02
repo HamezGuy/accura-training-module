@@ -350,4 +350,99 @@ describe('Training API Integration', () => {
     expect(response.body.data.find((path:any) => path.id==='data-manager-path').targetRole).toBe('data_manager');
   });
 
+
+  describe('training read privacy', () => {
+    const readMocks = [mockGetComplianceStatus, mockGetExpiringTraining, mockCheckUserCompliance];
+    beforeEach(() => {
+      mockGetComplianceStatus.mockResolvedValue([]);
+      mockGetExpiringTraining.mockResolvedValue([]);
+      mockCheckUserCompliance.mockImplementation(async (userId: number) => ({ userId, isCompliant: false, missingCount: 1, expiredCount: 0 }));
+    });
+    const routes = ['/compliance', '/compliance?studyId=5', '/compliance?userId=2', '/user/2/is-compliant', '/expiring'];
+    test.each(routes)('rejects unrelated viewer access to %s before any data service', async route => {
+      const response = await request(app).get(`/api/training${route}`)
+        .set('Authorization', `Bearer ${generateToken({ role: 'viewer' })}`);
+      expect(response.status).toBe(403);
+      for (const read of readMocks) expect(read).not.toHaveBeenCalled();
+    });
+    test.each(['coordinator', 'investigator'])(
+      'does not widen global reads to the non-oversight role %s', async role => {
+        for (const route of routes) {
+          const response = await request(app).get(`/api/training${route}`)
+            .set('Authorization', `Bearer ${generateToken({ role })}`);
+          expect(response.status).toBe(403);
+        }
+        for (const read of readMocks) expect(read).not.toHaveBeenCalled();
+      });
+    test.each(['viewer', 'coordinator', 'investigator'])(
+      'allows exact self compliance reads for %s without widening the query', async role => {
+        const bearer = generateToken({ role });
+        expect((await request(app).get('/api/training/compliance?userId=1&studyId=5')
+          .set('Authorization', `Bearer ${bearer}`)).status).toBe(200);
+        expect(mockGetComplianceStatus).toHaveBeenCalledWith({ userId: 1, studyId: 5 });
+        const response = await request(app).get('/api/training/user/1/is-compliant').set('Authorization', `Bearer ${bearer}`);
+        expect(response.status).toBe(200);
+        expect(response.body.data).toEqual({ userId: 1, isCompliant: false, missingCount: 1, expiredCount: 0 });
+        expect(mockCheckUserCompliance).toHaveBeenCalledWith(1);
+        expect(mockGetExpiringTraining).not.toHaveBeenCalled();
+      });
+    test.each(['admin', 'data_manager', 'monitor', 'study_director'])(
+      'preserves existing oversight access for %s and governed aliases', async role => {
+        for (const route of routes) {
+          const response = await request(app).get(`/api/training${route}`)
+            .set('Authorization', `Bearer ${generateToken({ role })}`);
+          expect(response.status).toBe(200);
+        }
+        expect(mockGetComplianceStatus).toHaveBeenNthCalledWith(1, { userId: undefined, studyId: undefined });
+        expect(mockGetComplianceStatus).toHaveBeenNthCalledWith(2, { userId: undefined, studyId: 5 });
+        expect(mockGetComplianceStatus).toHaveBeenNthCalledWith(3, { userId: 2, studyId: undefined });
+        expect(mockCheckUserCompliance).toHaveBeenCalledWith(2);
+        expect(mockGetExpiringTraining).toHaveBeenCalledWith(30);
+      });
+    test.each(['0', '-1', '1.5', '1abc', '01', '0x1', '1e0', '9007199254740992'])(
+      'refuses malformed target %s even for an oversight actor without reading data', async target => {
+        for (const route of [`/compliance?userId=${target}`, `/user/${target}/is-compliant`]) {
+          const response = await request(app).get(`/api/training${route}`)
+            .set('Authorization', `Bearer ${generateToken()}`);
+          expect(response.status).toBe(400);
+        }
+        for (const read of readMocks) expect(read).not.toHaveBeenCalled();
+      });
+    test.each(['userId=', 'userId[]=1', 'userId=1&userId=2', 'userId[member]=1'])(
+      'does not coerce ambiguous self query %s into permission', async query => {
+        const response = await request(app).get(`/api/training/compliance?${query}`)
+          .set('Authorization', `Bearer ${generateToken({ role: 'viewer' })}`);
+        expect(response.status).toBe(400);
+        for (const read of readMocks) expect(read).not.toHaveBeenCalled();
+      });
+    test.each(['constructor', 'unknown-role'])(
+      'refuses fresh unknown authority role %s before data reads', async role => {
+        const response = await request(app).get('/api/training/compliance?userId=1')
+          .set('Authorization', `Bearer ${generateToken({ role })}`);
+        expect(response.status).toBe(503);
+        for (const read of readMocks) expect(read).not.toHaveBeenCalled();
+      });
+    test('fresh viewer authority cannot retain a stale administrator read grant', async () => {
+      const bearer = generateToken({ role: 'admin' });
+      (globalThis.fetch as jest.Mock).mockImplementation(async (_url, options) => {
+        const token = new Headers(options?.headers).get('Authorization')!.slice('Bearer '.length);
+        const decoded = createJwtService({ secret: JWT_SECRET }).verifyAccessToken(token);
+        return new Response(JSON.stringify(decoded ? { success: true, data: {
+          userId: decoded.userId, username: decoded.username, email: decoded.email, role: 'viewer',
+          userType: 'user', studyIds: [], organizationIds: [1],
+        } } : { success: false }), { status: decoded ? 200 : 401 });
+      });
+      expect((await request(app).get('/api/training/compliance?userId=2')
+        .set('Authorization', `Bearer ${bearer}`)).status).toBe(403);
+      for (const read of readMocks) expect(read).not.toHaveBeenCalled();
+      expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    });
+    test('preserves the existing separate self-record and oversight-record routes', async () => {
+      mockGetMyRecords.mockResolvedValue([]);
+      const bearer = generateToken({ role: 'viewer' });
+      expect((await request(app).get('/api/training/user/1/records').set('Authorization', `Bearer ${bearer}`)).status).toBe(403);
+      expect((await request(app).get('/api/training/my-records').set('Authorization', `Bearer ${bearer}`)).status).toBe(200);
+      expect(mockGetMyRecords).toHaveBeenCalledWith(1);
+    });
+  });
 });
