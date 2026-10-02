@@ -1,7 +1,7 @@
 {
   "name": "accura-training-module",
   "version": "1.0.0",
-  "description": "21 CFR Part 11 compliant training module backend for AccuraTrial EDC — course management, quiz grading, compliance tracking, and certificate generation",
+  "description": "Training management backend for AccuraTrial EDC",
   "main": "dist/server.js",
   "type": "commonjs",
   "scripts": {
@@ -24,7 +24,7 @@
   "author": "AccuraTrial",
   "license": "MIT",
   "dependencies": {
-    "@accura-trial/auth-core": "github:HamezGuy/accura-auth#93520e77b9d010934770687674a28db166fff90b",
+    "@accura-trial/auth-core": "github:HamezGuy/accura-auth#d9758e5aebc66462a1a43b34784fb2ded0eb87a2",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.21.1",

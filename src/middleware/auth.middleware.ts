@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
-import { createJwtService, extractTokenFromHeader, getRoleByName, ROLES } from '@accura-trial/auth-core';
+import { AccuraAuthClient, extractTokenFromHeader, getRoleByName, ROLES } from '@accura-trial/auth-core';
+import { decode } from 'jsonwebtoken';
 import { config } from '../config/environment';
 import { logger } from '../config/logger';
 
@@ -14,9 +15,9 @@ export interface AuthRequest extends Request {
   user?: AuthUser;
 }
 
-const jwtService = createJwtService({ secret: config.jwt.secret }, logger);
+const authorityClient = new AccuraAuthClient(config.authority, logger);
 
-export function authMiddleware(req: AuthRequest, res: Response, next: NextFunction): void {
+export async function authMiddleware(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
   const token = extractTokenFromHeader(req.headers.authorization);
 
   if (!token) {
@@ -24,26 +25,61 @@ export function authMiddleware(req: AuthRequest, res: Response, next: NextFuncti
     return;
   }
 
+  let userId: number;
   try {
-    const decoded = jwtService.verifyAccessToken(token);
-    if (!decoded) throw new Error('Invalid access token');
-    if (!Number.isSafeInteger(decoded.userId) || decoded.userId < 1 || !decoded.username.trim()) {
+    // Decode only for subject continuity with the authority's response. These
+    // unverified claims never establish authentication or authorization.
+    const decoded = decode(token);
+    if (!decoded || typeof decoded !== 'object' || !Number.isSafeInteger(decoded.userId) || decoded.userId < 1) {
       throw new Error('Invalid access-token identity');
     }
-    const role = getRoleByName(decoded.role);
-    if (role.id === ROLES.INVALID.id) throw new Error('Unknown access-token role');
-
-    req.user = {
-      userId: decoded.userId,
-      username: decoded.username,
-      role: role.name,
-      organizationIds: decoded.organizationIds,
-    };
-
-    next();
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : 'Token verification failed';
-    logger.warn('JWT verification failed', { error: message, ip: req.ip });
+    userId = decoded.userId;
+  } catch {
     res.status(401).json({ success: false, message: 'Invalid or expired token' });
+    return;
   }
+
+  try {
+    // The native authority owns signature/claim verification and current
+    // sessions, active accounts and role/membership grants. Never authorize
+    // from decoded claims, or distribute the authority's signing secret here.
+    const result = await authorityClient.verify(token);
+    if (result.httpStatus === 401 || result.httpStatus === 403) {
+      const code = typeof result.error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,79}$/.test(result.error.code)
+        ? result.error.code : 'AUTHORITY_REFUSED';
+      res.status(result.httpStatus).json({ success: false, code,
+        message: code === 'PASSWORD_EXPIRED' ? 'Password expired. Change your password before continuing.'
+          : 'Authentication refused by the account authority' });
+      return;
+    }
+    if (!Number.isInteger(result.httpStatus) || result.httpStatus < 200 || result.httpStatus >= 300 || result.success !== true) {
+      throw new Error('Authority verification unavailable');
+    }
+    const current = result.data;
+    if (!current || typeof current !== 'object' || Array.isArray(current)
+      || !Number.isSafeInteger(current.userId) || current.userId < 1 || current.userId !== userId
+      || typeof current.username !== 'string' || !current.username.trim()
+      || typeof current.email !== 'string' || typeof current.role !== 'string'
+      || typeof current.userType !== 'string' || !current.userType.trim()
+      || !Array.isArray(current.studyIds) || !current.studyIds.every(id => Number.isSafeInteger(id) && id > 0)
+      || !Array.isArray(current.organizationIds) || !current.organizationIds.every(id => Number.isSafeInteger(id) && id > 0)) {
+      throw new Error('Invalid authoritative identity');
+    }
+    const currentRole = getRoleByName(current.role);
+    if (currentRole.id === ROLES.INVALID.id) throw new Error('Unknown authoritative role');
+    req.user = {
+      userId: current.userId,
+      username: current.username,
+      role: currentRole.name,
+      organizationIds: [...current.organizationIds],
+    };
+  } catch {
+    // Never log the bearer, upstream body or exception text; a transport error
+    // may contain request details. There is no local-only fallback or cache.
+    logger.warn('Native authority verification unavailable', { ip: req.ip });
+    res.status(503).json({ success: false, code: 'AUTH_TEMPORARILY_UNAVAILABLE',
+      message: 'Could not verify your current session. Please try again.' });
+    return;
+  }
+  next();
 }

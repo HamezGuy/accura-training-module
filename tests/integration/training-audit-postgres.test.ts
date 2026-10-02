@@ -3,6 +3,7 @@
 import express from 'express';
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
+import { createJwtService } from '@accura-trial/auth-core';
 import trainingRoutes from '../../src/routes/training.routes';
 import { errorHandler } from '../../src/middleware/errorHandler.middleware';
 import { pool } from '../../src/config/database';
@@ -11,7 +12,7 @@ import { expireOverdueRecords } from '../../src/services/training.service';
 
 jest.mock('../../src/config/environment', () => ({ config: {
   database: { url: process.env['TRAINING_AUDIT_TEST_DATABASE_URL'] ?? 'postgresql://127.0.0.1:1/disabled', ssl: false },
-  jwt: { secret: 'owned-training-postgres-test' }, training: { certificateValidityDays: 365 },
+  authority: { baseUrl: 'http://authority.invalid', timeoutMs: 100 }, training: { certificateValidityDays: 365 },
 } }));
 jest.mock('../../src/config/logger', () => ({ logger: { error: jest.fn(), info: jest.fn(), warn: jest.fn(), debug: jest.fn() } }));
 
@@ -50,6 +51,14 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
   afterAll(async () => { await pool.end(); });
 
   beforeEach(async () => {
+    const verifier = createJwtService({ secret: 'owned-training-postgres-test' });
+    jest.spyOn(globalThis, 'fetch').mockImplementation(async (_url, options) => {
+      const bearer = new Headers(options?.headers).get('Authorization')!.slice('Bearer '.length);
+      const verified = verifier.verifyAccessToken(bearer);
+      return new Response(JSON.stringify(verified ? { success: true, data: {
+        userId: 111, username: 'owned-fixture-admin', email: '', role: 'admin', userType: 'user', studyIds: [], organizationIds: [],
+      } } : { success: false }), { status: verified ? 200 : 401 });
+    });
     if (!ready) throw new Error('Owned test database preparation did not complete.');
     await pool.query('DROP TRIGGER IF EXISTS reject_owned_training_audit ON acc_training_audit_log');
     await pool.query('TRUNCATE acc_training_questions, acc_training_records, acc_training_audit_log, acc_training_courses RESTART IDENTITY CASCADE');
@@ -80,6 +89,7 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
     }
     return state;
   }
+  afterEach(() => jest.restoreAllMocks());
   async function refuseAudit() {
     await pool.query(`CREATE TRIGGER reject_owned_training_audit BEFORE INSERT ON acc_training_audit_log
       FOR EACH ROW EXECUTE FUNCTION reject_owned_training_audit()`);

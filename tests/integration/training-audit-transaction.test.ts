@@ -1,6 +1,7 @@
 import express from 'express';
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
+import { createJwtService } from '@accura-trial/auth-core';
 import trainingRoutes from '../../src/routes/training.routes';
 import { errorHandler } from '../../src/middleware/errorHandler.middleware';
 import { expireOverdueRecords } from '../../src/services/training.service';
@@ -15,7 +16,7 @@ jest.mock('pg', () => ({ Pool: jest.fn(() => ({
 })) }));
 jest.mock('../../src/config/environment', () => ({ config: {
   database: { host: 'unused.invalid', port: 1, name: 'offline-only', user: 'offline', password: '', ssl: false },
-  jwt: { secret: 'training-audit-offline-test' }, training: { certificateValidityDays: 365 },
+  authority: { baseUrl: 'http://authority.invalid', timeoutMs: 100 }, training: { certificateValidityDays: 365 },
 } }));
 jest.mock('../../src/config/logger', () => ({ logger: { error: jest.fn(), info: jest.fn(), warn: jest.fn(), debug: jest.fn() } }));
 
@@ -52,6 +53,14 @@ describe('training mutation and audit share the real database transaction bounda
 
   beforeEach(() => {
     jest.clearAllMocks(); responses = []; active = false; stagedWrites = 0; committedWrites = 0;
+    const verifier = createJwtService({ secret: 'training-audit-offline-test' });
+    jest.spyOn(globalThis, 'fetch').mockImplementation(async (_url, options) => {
+      const bearer = new Headers(options?.headers).get('Authorization')!.slice('Bearer '.length);
+      const verified = verifier.verifyAccessToken(bearer);
+      return new Response(JSON.stringify(verified ? { success: true, data: {
+        userId: 1, username: 'owned-test', email: '', role: 'admin', userType: 'user', studyIds: [], organizationIds: [],
+      } } : { success: false }), { status: verified ? 200 : 401 });
+    });
     stagedAudits = []; committedAudits = []; auditAttempts = 0; failAuditAt = 0; businessAttempts = 0; failBusinessAt = 0;
     failure = new Error('Injected audit storage refusal'); rollbackFailure = null;
     mockRelease.mockImplementation((destroy?: boolean) => { if (destroy) active = false; });
@@ -83,6 +92,7 @@ describe('training mutation and audit share the real database transaction bounda
   async function send(spec: typeof cases[number], body: unknown = spec.body) {
     return request(app)[spec.method](`/api/training${spec.route}`).set('Authorization', `Bearer ${token}`).send(body as object);
   }
+  afterEach(() => jest.restoreAllMocks());
   function assertTransaction(outcome: 'COMMIT' | 'ROLLBACK') {
     expect(mockConnect).toHaveBeenCalledTimes(1);
     expect(mockRelease).toHaveBeenCalledTimes(1);

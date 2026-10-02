@@ -1,6 +1,7 @@
 import express from 'express';
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
+import { createJwtService } from '@accura-trial/auth-core';
 import trainingRoutes from '../../src/routes/training.routes';
 import { errorHandler } from '../../src/middleware/errorHandler.middleware';
 
@@ -44,7 +45,7 @@ const JWT_SECRET = 'test-secret';
 
 jest.mock('../../src/config/environment', () => ({
   config: {
-    jwt: { secret: 'test-secret' },
+    authority: { baseUrl: 'http://authority.invalid', timeoutMs: 100 },
     training: { certificateValidityDays: 365 },
   },
 }));
@@ -82,7 +83,19 @@ describe('Training API Integration', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    const verifier = createJwtService({ secret: JWT_SECRET });
+    jest.spyOn(globalThis, 'fetch').mockImplementation(async (_url, options) => {
+      const bearer = new Headers(options?.headers).get('Authorization')!.slice('Bearer '.length);
+      const decoded = verifier.verifyAccessToken(bearer);
+      // Test authority fixture only. Production grants always come from native
+      // account lookup, exercised independently by the authority contract suite.
+      return new Response(JSON.stringify(decoded ? { success: true, data: {
+        userId: decoded.userId, username: decoded.username, email: decoded.email, role: decoded.role,
+        userType: 'user', studyIds: [], organizationIds: [1],
+      } } : { success: false }), { status: decoded ? 200 : 401 });
+    });
   });
+  afterEach(() => jest.restoreAllMocks());
 
   describe('Authentication', () => {
     it('should reject requests without token', async () => {
