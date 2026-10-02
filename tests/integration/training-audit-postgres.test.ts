@@ -41,6 +41,9 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
     await pool.query(`CREATE TABLE user_account (user_id integer PRIMARY KEY, user_name text UNIQUE NOT NULL,
       first_name text, last_name text, user_type_id integer, status_id integer NOT NULL);
       CREATE TABLE user_account_extended (user_id integer PRIMARY KEY REFERENCES user_account, platform_role text);
+      CREATE TABLE acc_organization_member (organization_id integer NOT NULL,
+        user_id integer NOT NULL REFERENCES user_account, status varchar(30) NOT NULL DEFAULT 'active',
+        UNIQUE (organization_id, user_id));
       CREATE TABLE study (study_id integer PRIMARY KEY, parent_study_id integer REFERENCES study);
       CREATE TABLE study_user_role (user_name text REFERENCES user_account(user_name), study_id integer REFERENCES study,
         role_name text, status_id integer NOT NULL)`);
@@ -62,10 +65,11 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
     if (!ready) throw new Error('Owned test database preparation did not complete.');
     await pool.query('DROP TRIGGER IF EXISTS reject_owned_training_audit ON acc_training_audit_log');
     await pool.query('TRUNCATE acc_training_questions, acc_training_records, acc_training_audit_log, acc_training_courses RESTART IDENTITY CASCADE');
-    await pool.query(`TRUNCATE study_user_role, user_account_extended, user_account, study;
+    await pool.query(`TRUNCATE acc_organization_member, study_user_role, user_account_extended, user_account, study;
       INSERT INTO user_account VALUES (111,'owned-admin','Owned','Admin',1,1),(222,'owned-manager','Owned','Manager',2,1),
         (333,'owned-inactive','Owned','Inactive',2,1),(444,'owned-outside','Owned','Outside',2,1);
       INSERT INTO user_account_extended VALUES (111,'monitor'),(222,'study_director'),(333,'monitor'),(444,'monitor');
+      INSERT INTO acc_organization_member VALUES (10,111,'active'),(10,222,'active'),(10,333,'removed'),(20,444,'active');
       INSERT INTO study VALUES (100,NULL),(101,100),(200,NULL);
       INSERT INTO study_user_role VALUES ('owned-admin',100,'ra',1),('owned-manager',101,'site_monitor',1),
         ('owned-inactive',100,'monitor',5),('owned-outside',200,'monitor',1)`);
@@ -178,6 +182,105 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
     expect((await pool.query('SELECT COUNT(*)::int AS n FROM acc_training_audit_log')).rows[0].n).toBe(0);
     await pool.query(`UPDATE acc_training_courses SET required_for_roles='["invented"]' WHERE id=$1`,[courseId]);
     expect((await request(app).get('/api/training/compliance?userId=222').set('Authorization', `Bearer ${token}`)).status).toBe(409);
+  });
+
+  test('active organization peers are the only aggregate and expiring rows, including under a study filter', async () => {
+    await pool.query(`INSERT INTO acc_training_records (user_id,course_id,status,expiration_date)
+      VALUES (333,$1,'completed',NOW() + INTERVAL '1 day'),(444,$1,'completed',NOW() + INTERVAL '1 day')`, [courseId]);
+    // Foreign and removed members share the study: its filter must not replace organization isolation.
+    await pool.query(`INSERT INTO study_user_role VALUES ('owned-outside',100,'monitor',1);
+      UPDATE study_user_role SET status_id=1 WHERE user_name='owned-inactive'`);
+    const before = await snapshot();
+    for (const path of ['/compliance', '/compliance?studyId=100']) {
+      const response = await request(app).get(`/api/training${path}`).set('Authorization', `Bearer ${token}`);
+      expect(response.status).toBe(200); expect(response.body.success).toBe(true);
+      expect(response.body.data.map((row: any) => row.userId).sort()).toEqual([111,222]);
+    }
+    const records = await request(app).get('/api/training/user/222/records').set('Authorization', `Bearer ${token}`);
+    expect(records.status).toBe(200); expect(records.body.data).toHaveLength(1);
+    expect(records.body.data[0]).toMatchObject({ id: recordId, userId: 222 });
+    const compliance = await request(app).get('/api/training/user/222/is-compliant').set('Authorization', `Bearer ${token}`);
+    expect(compliance.status).toBe(200); expect(compliance.body.data.userId).toBe(222);
+    const expiring = await request(app).get('/api/training/expiring?days=30').set('Authorization', `Bearer ${token}`);
+    expect(expiring.status).toBe(200);
+    expect(expiring.body.data.map((row: any) => [row.id, row.userId])).toEqual([[recordId,222]]);
+    expect(await snapshot()).toEqual(before);
+  });
+
+  test('foreign and removed organization members cannot be read through any targeted oversight route', async () => {
+    const before = await snapshot();
+    for (const targetId of [333,444]) {
+      for (const path of [`/user/${targetId}/records`, `/user/${targetId}/is-compliant`, `/compliance?userId=${targetId}`]) {
+        const response = await request(app).get(`/api/training${path}`).set('Authorization', `Bearer ${token}`);
+        expect(response.status).toBe(403); expect(response.body.success).toBe(false);
+        expect(response.body.data).toBeUndefined();
+      }
+    }
+    expect(await snapshot()).toEqual(before);
+  });
+
+  test('foreign verification is invisible and leaves all rows unchanged before a same-organization audited success', async () => {
+    const foreign = await pool.query(`INSERT INTO acc_training_records (user_id,course_id,status,score,completed_at)
+      VALUES (444,$1,'completed',100,NOW()) RETURNING *`, [courseId]);
+    const before = await snapshot();
+    const refused = await request(app).post(`/api/training/verify/${foreign.rows[0].id}`)
+      .send({ notes: 'Must not reach the foreign record' }).set('Authorization', `Bearer ${token}`);
+    expect(refused.status).toBe(404); expect(refused.body.success).toBe(false);
+    expect(await snapshot()).toEqual(before);
+    const accepted = await send('verify');
+    expect(accepted.status).toBe(200); expect(accepted.body.data).toEqual({ verified: true });
+    expect((await pool.query('SELECT * FROM acc_training_records WHERE id=$1', [foreign.rows[0].id])).rows).toEqual(foreign.rows);
+    expect((await pool.query('SELECT verified_by,notes FROM acc_training_records WHERE id=$1', [recordId])).rows)
+      .toEqual([{ verified_by:111, notes:'Owned verification note' }]);
+    expect((await pool.query('SELECT user_id,action,record_id FROM acc_training_audit_log')).rows)
+      .toEqual([{ user_id:111, action:'training_verified', record_id:recordId }]);
+  });
+
+  test('organization-less study-derived admin stays self-only while explicit platform and native admins retain global scope', async () => {
+    // The same authenticated admin role cannot itself grant global database scope.
+    await pool.query(`DELETE FROM acc_organization_member WHERE user_id=111;
+      UPDATE user_account SET user_type_id=2 WHERE user_id=111;
+      UPDATE user_account_extended SET platform_role=NULL WHERE user_id=111;
+      UPDATE study_user_role SET role_name='admin' WHERE user_name='owned-admin'`);
+    const before = await snapshot();
+    const restricted = await request(app).get('/api/training/compliance').set('Authorization', `Bearer ${token}`);
+    expect(restricted.status).toBe(200);
+    expect(restricted.body.data.map((row: any) => [row.userId,row.role])).toEqual([[111,'admin']]);
+    expect((await request(app).get('/api/training/user/222/records').set('Authorization', `Bearer ${token}`)).status).toBe(403);
+    expect((await send('verify')).status).toBe(404);
+    expect(await snapshot()).toEqual(before);
+    await pool.query("UPDATE user_account_extended SET platform_role='admin' WHERE user_id=111");
+    const platform = await request(app).get('/api/training/compliance').set('Authorization', `Bearer ${token}`);
+    expect(platform.status).toBe(200);
+    expect(platform.body.data.map((row: any) => row.userId).sort()).toEqual([111,222,333,444]);
+    await pool.query(`UPDATE user_account SET user_type_id=1 WHERE user_id=111;
+      UPDATE user_account_extended SET platform_role='monitor' WHERE user_id=111`);
+    const native = await request(app).get('/api/training/compliance').set('Authorization', `Bearer ${token}`);
+    expect(native.status).toBe(200);
+    expect(native.body.data.map((row: any) => row.userId).sort()).toEqual([111,222,333,444]);
+    expect((await request(app).get('/api/training/user/444/records').set('Authorization', `Bearer ${token}`)).status).toBe(200);
+    expect(await snapshot()).toEqual(before);
+  });
+
+  test('a real organization lookup failure refuses reads and verification without granting empty-membership global scope', async () => {
+    const before = await snapshot();
+    // Only this already-qualified empty disposable database is modified; restore even if an assertion fails.
+    await pool.query('ALTER TABLE acc_organization_member RENAME TO owned_unavailable_organization_member');
+    try {
+      for (const path of ['/compliance', '/expiring', '/user/222/records', '/user/222/is-compliant', '/compliance?userId=222']) {
+        const response = await request(app).get(`/api/training${path}`).set('Authorization', `Bearer ${token}`);
+        expect(response.status).toBe(503); expect(response.body.success).toBe(false);
+        expect(response.body.data).toBeUndefined();
+      }
+      const response = await send('verify');
+      expect(response.status).toBe(503); expect(response.body.success).toBe(false);
+      expect(await snapshot()).toEqual(before);
+    } finally {
+      await pool.query('ALTER TABLE owned_unavailable_organization_member RENAME TO acc_organization_member');
+    }
+    const restored = await request(app).get('/api/training/user/222/records').set('Authorization', `Bearer ${token}`);
+    expect(restored.status).toBe(200); expect(restored.body.data[0].id).toBe(recordId);
+    expect(await snapshot()).toEqual(before);
   });
 
 });

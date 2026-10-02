@@ -195,6 +195,10 @@ describe('TrainingService', () => {
   });
 
   describe('verifyTraining', () => {
+    beforeEach(() => {
+      mockQueryOne.mockResolvedValueOnce({ userId: 2, statusId: 1, userTypeId: 1, platformRole: null });
+      mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
+    });
     it('should throw 404 if record not found', async () => {
       mockQueryOne.mockResolvedValue(null);
 
@@ -230,10 +234,14 @@ describe('TrainingService', () => {
   });
 
   describe('getExpiringTraining', () => {
+    beforeEach(() => {
+      mockQueryOne.mockResolvedValueOnce({ userId: 2, statusId: 1, userTypeId: 1, platformRole: null });
+      mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
+    });
     it('should query for records expiring within specified days', async () => {
       mockQuery.mockResolvedValue({ rows: [], rowCount: 0 });
 
-      await trainingService.getExpiringTraining(14);
+      await trainingService.getExpiringTraining(2, 14);
 
       expect(mockQuery).toHaveBeenCalledWith(
         expect.stringContaining("INTERVAL '1 day' * $1"),
@@ -244,7 +252,7 @@ describe('TrainingService', () => {
     it('should default to 30 days', async () => {
       mockQuery.mockResolvedValue({ rows: [], rowCount: 0 });
 
-      await trainingService.getExpiringTraining();
+      await trainingService.getExpiringTraining(2);
 
       expect(mockQuery).toHaveBeenCalledWith(
         expect.any(String),

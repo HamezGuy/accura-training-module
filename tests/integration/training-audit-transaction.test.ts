@@ -40,7 +40,7 @@ const cases = [
   { name: 'failed quiz', method: 'post', route: '/submit-quiz/3', action: 'quiz_failed',
     body: { answers: [{ questionId: 7, selectedOptions: [1] }] }, responses: [rows(course), rows(question), rows(), rows()] },
   { name: 'verify training', method: 'post', route: '/verify/12', action: 'training_verified',
-    body: { notes: 'Owned test verification' }, responses: [rows(record), rows()] },
+    body: { notes: 'Owned test verification' }, responses: [rows({ user_id: 1, status_id: 1, user_type_id: 1, platform_role: null }), rows(), rows(record), rows()] },
 ] as const;
 
 describe('training mutation and audit share the real database transaction boundary', () => {

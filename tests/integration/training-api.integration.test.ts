@@ -11,6 +11,7 @@ const mockCreateCourse = jest.fn();
 const mockStartTraining = jest.fn();
 const mockSubmitQuiz = jest.fn();
 const mockGetMyRecords = jest.fn();
+const mockGetUserRecords = jest.fn();
 const mockVerifyTraining = jest.fn();
 const mockGetComplianceStatus = jest.fn();
 const mockGetExpiringTraining = jest.fn();
@@ -23,6 +24,7 @@ jest.mock('../../src/services/training.service', () => ({
   startTraining: (...args: unknown[]) => mockStartTraining(...args),
   submitQuiz: (...args: unknown[]) => mockSubmitQuiz(...args),
   getMyRecords: (...args: unknown[]) => mockGetMyRecords(...args),
+  getUserRecords: (...args: unknown[]) => mockGetUserRecords(...args),
   verifyTraining: (...args: unknown[]) => mockVerifyTraining(...args),
   getComplianceStatus: (...args: unknown[]) => mockGetComplianceStatus(...args),
   getExpiringTraining: (...args: unknown[]) => mockGetExpiringTraining(...args),
@@ -79,6 +81,26 @@ describe('Training API Integration', () => {
 
   beforeAll(() => {
     app = createApp();
+  });
+
+  test('target-record reads pass the authenticated caller separately from the requested user', async () => {
+    mockGetUserRecords.mockResolvedValue([]);
+    const response = await request(app).get('/api/training/user/2/records').set('Authorization', `Bearer ${generateToken()}`);
+    expect(response.status).toBe(200);
+    expect(mockGetUserRecords).toHaveBeenCalledWith(2, 1);
+  });
+
+  test.each(['0', '01', '1junk', '1.5', '9007199254740992'])('malformed user/record ID %s cannot reach a training service', async id => {
+    const headers = `Bearer ${generateToken()}`;
+    expect((await request(app).get(`/api/training/user/${id}/records`).set('Authorization', headers)).status).toBe(400);
+    expect((await request(app).post(`/api/training/verify/${id}`).set('Authorization', headers).send({})).status).toBe(400);
+    expect(mockGetUserRecords).not.toHaveBeenCalled();
+    expect(mockVerifyTraining).not.toHaveBeenCalled();
+  });
+
+  test.each(['0', '30junk', '1.5', '9007199254740992', '1&days=2'])('malformed expiry horizon %s cannot reach the service', async days => {
+    const response = await request(app).get(`/api/training/expiring?days=${days}`).set('Authorization', `Bearer ${generateToken()}`);
+    expect(response.status).toBe(400); expect(mockGetExpiringTraining).not.toHaveBeenCalled();
   });
 
   beforeEach(() => {
@@ -328,7 +350,7 @@ describe('Training API Integration', () => {
   test('preserves exact explicit user and study scope at the DTO boundary', async () => {
     mockGetComplianceStatus.mockResolvedValue([]);
     expect((await request(app).get('/api/training/compliance?studyId=5&userId=7').set('Authorization', `Bearer ${generateToken()}`)).status).toBe(200);
-    expect(mockGetComplianceStatus).toHaveBeenCalledWith({ studyId: 5, userId: 7 });
+    expect(mockGetComplianceStatus).toHaveBeenCalledWith(1, { studyId: 5, userId: 7 });
   });
 
   test.each(['data_manager', 'study_director'])('actual course route accepts governed management role %s', async role => {
@@ -379,11 +401,11 @@ describe('Training API Integration', () => {
         const bearer = generateToken({ role });
         expect((await request(app).get('/api/training/compliance?userId=1&studyId=5')
           .set('Authorization', `Bearer ${bearer}`)).status).toBe(200);
-        expect(mockGetComplianceStatus).toHaveBeenCalledWith({ userId: 1, studyId: 5 });
+        expect(mockGetComplianceStatus).toHaveBeenCalledWith(1, { userId: 1, studyId: 5 });
         const response = await request(app).get('/api/training/user/1/is-compliant').set('Authorization', `Bearer ${bearer}`);
         expect(response.status).toBe(200);
         expect(response.body.data).toEqual({ userId: 1, isCompliant: false, missingCount: 1, expiredCount: 0 });
-        expect(mockCheckUserCompliance).toHaveBeenCalledWith(1);
+        expect(mockCheckUserCompliance).toHaveBeenCalledWith(1, 1);
         expect(mockGetExpiringTraining).not.toHaveBeenCalled();
       });
     test.each(['admin', 'data_manager', 'monitor', 'study_director'])(
@@ -393,11 +415,11 @@ describe('Training API Integration', () => {
             .set('Authorization', `Bearer ${generateToken({ role })}`);
           expect(response.status).toBe(200);
         }
-        expect(mockGetComplianceStatus).toHaveBeenNthCalledWith(1, { userId: undefined, studyId: undefined });
-        expect(mockGetComplianceStatus).toHaveBeenNthCalledWith(2, { userId: undefined, studyId: 5 });
-        expect(mockGetComplianceStatus).toHaveBeenNthCalledWith(3, { userId: 2, studyId: undefined });
-        expect(mockCheckUserCompliance).toHaveBeenCalledWith(2);
-        expect(mockGetExpiringTraining).toHaveBeenCalledWith(30);
+        expect(mockGetComplianceStatus).toHaveBeenNthCalledWith(1, 1, { userId: undefined, studyId: undefined });
+        expect(mockGetComplianceStatus).toHaveBeenNthCalledWith(2, 1, { userId: undefined, studyId: 5 });
+        expect(mockGetComplianceStatus).toHaveBeenNthCalledWith(3, 1, { userId: 2, studyId: undefined });
+        expect(mockCheckUserCompliance).toHaveBeenCalledWith(2, 1);
+        expect(mockGetExpiringTraining).toHaveBeenCalledWith(1, 30);
       });
     test.each(['0', '-1', '1.5', '1abc', '01', '0x1', '1e0', '9007199254740992'])(
       'refuses malformed target %s even for an oversight actor without reading data', async target => {

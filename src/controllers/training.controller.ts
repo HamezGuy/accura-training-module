@@ -128,8 +128,8 @@ export async function getMyRecords(req: AuthRequest, res: Response): Promise<voi
 }
 
 export async function getUserRecords(req: AuthRequest, res: Response): Promise<void> {
-  const userId = parseInt(req.params['userId'], 10);
-  const records = await trainingService.getUserRecords(userId);
+  const userId = exactPositiveId(req.params['userId'], 'user ID')!;
+  const records = await trainingService.getUserRecords(userId, req.user!.userId);
 
   const dto: TrainingRecord[] = records.map(mapRecordToDto);
   res.json({ success: true, data: dto });
@@ -188,7 +188,7 @@ export async function submitQuiz(req: AuthRequest, res: Response): Promise<void>
 
 export async function verifyTraining(req: AuthRequest, res: Response): Promise<void> {
   const verifierId = req.user!.userId;
-  const recordId = parseInt(req.params['recordId'], 10);
+  const recordId = exactPositiveId(req.params['recordId'], 'training record ID')!;
   const { notes } = req.body;
 
   const result = await transaction(async (client) => {
@@ -248,7 +248,7 @@ export async function getComplianceStatus(req: AuthRequest, res: Response): Prom
   const userId = exactPositiveId(req.query['userId'], 'user ID');
   const studyId = exactPositiveId(req.query['studyId'], 'study ID');
 
-  const statuses = await trainingService.getComplianceStatus({ userId, studyId });
+  const statuses = await trainingService.getComplianceStatus(req.user!.userId, { userId, studyId });
 
   const dto: TrainingComplianceStatus[] = statuses.map((s) => ({
     userId: s.userId,
@@ -268,8 +268,8 @@ export async function getComplianceStatus(req: AuthRequest, res: Response): Prom
 }
 
 export async function getExpiringTraining(req: AuthRequest, res: Response): Promise<void> {
-  const days = parseInt(req.query['days'] as string || '30', 10);
-  const records = await trainingService.getExpiringTraining(days);
+  const days = exactPositiveId(req.query['days'], 'number of days') ?? 30;
+  const records = await trainingService.getExpiringTraining(req.user!.userId, days);
 
   const dto: TrainingRecord[] = records.map(mapRecordToDto);
   res.json({ success: true, data: dto });
@@ -277,7 +277,7 @@ export async function getExpiringTraining(req: AuthRequest, res: Response): Prom
 
 export async function checkCompliance(req: AuthRequest, res: Response): Promise<void> {
   const userId = exactPositiveId(req.params['userId'], 'user ID')!;
-  const result = await trainingService.checkUserCompliance(userId);
+  const result = await trainingService.checkUserCompliance(userId, req.user!.userId);
 
   const dto: TrainingComplianceCheck = {
     userId: result.userId,
