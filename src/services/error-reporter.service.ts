@@ -15,6 +15,8 @@ const RECIPIENT = 'info@accuratrials.com';
 let buffer: BufferedError[] = [];
 let flushTimer: NodeJS.Timeout | null = null;
 let transporter: nodemailer.Transporter | null = null;
+let inFlight: Promise<void> | null = null;
+let stopping: Promise<void> | null = null;
 
 function smtpConfigured(): boolean {
   return !!(process.env.SMTP_HOST && process.env.SMTP_PORT);
@@ -66,7 +68,12 @@ function buildHtml(errors: BufferedError[]): string {
     ${stacks}`;
 }
 
-async function flush(): Promise<void> {
+function flush(): Promise<void> {
+  if (!inFlight) inFlight = flushBuffered().finally(() => { inFlight = null; });
+  return inFlight;
+}
+
+async function flushBuffered(): Promise<void> {
   if (buffer.length === 0) return;
 
   const errors = [...buffer];
@@ -89,7 +96,8 @@ async function flush(): Promise<void> {
     logger.error('ErrorReporter: failed to send error digest email', {
       error: err instanceof Error ? err.message : String(err),
     });
-    buffer.push(...errors);
+    buffer.unshift(...errors);
+    throw err;
   }
 }
 
@@ -104,6 +112,7 @@ export function reportError(error: unknown): void {
 }
 
 export function startErrorReporter(): void {
+  if (stopping) throw new Error('Error reporter cannot restart after shutdown.');
   if (flushTimer) return;
   flushTimer = setInterval(() => {
     flush().catch(() => {});
@@ -112,14 +121,30 @@ export function startErrorReporter(): void {
   logger.info('ErrorReporter: started (flush every 5 min)');
 }
 
-export async function stopErrorReporter(): Promise<void> {
+export function stopErrorReporter(): Promise<void> {
+  if (stopping) return stopping;
   if (flushTimer) {
     clearInterval(flushTimer);
     flushTimer = null;
   }
-  await flush();
-  if (transporter) {
-    transporter.close();
-    transporter = null;
-  }
+  stopping = (async () => {
+    let failure: unknown;
+    let failed = false;
+    try {
+      // A periodic send may already own a batch. Its failure has requeued it;
+      // retry that batch together with any final errors in this final drain.
+      if (inFlight) await inFlight.catch(() => {});
+      while (buffer.length > 0) await flush();
+    } catch (error) {
+      failed = true;
+      failure = error;
+    }
+    try { transporter?.close(); }
+    catch (error) {
+      if (!failed) { failed = true; failure = error; }
+      else logger.error('ErrorReporter: transporter cleanup also failed');
+    } finally { transporter = null; }
+    if (failed) throw failure;
+  })();
+  return stopping;
 }

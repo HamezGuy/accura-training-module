@@ -16,10 +16,23 @@ function camelizeRows<T>(rows: Record<string, unknown>[]): T[] {
   });
 }
 
+// pg reparses connectionString after its other configuration and lets URL TLS
+// options override ssl. Refuse options that weaken explicitly verified TLS.
+// Existing explicit CA/client certificate URL parameters remain supported.
+if (config.database.ssl && config.database.url) {
+  const params = new URL(config.database.url).searchParams;
+  if (params.getAll('ssl').length > 1 || params.getAll('sslmode').length > 1
+    || (params.has('ssl') && params.get('ssl') !== 'true')
+    || (params.has('sslmode') && params.get('sslmode') !== 'verify-full')
+    || params.has('uselibpqcompat')) {
+    throw new Error('DATABASE_SSL requires verified TLS; conflicting database URL TLS options are not allowed.');
+  }
+}
+
 const poolConfig = config.database.url
   ? {
       connectionString: config.database.url,
-      ssl: config.database.ssl ? { rejectUnauthorized: false } : false,
+      ssl: config.database.ssl ? { rejectUnauthorized: true } : false,
     }
   : {
       host: config.database.host,
@@ -27,7 +40,7 @@ const poolConfig = config.database.url
       database: config.database.name,
       user: config.database.user,
       password: config.database.password,
-      ssl: config.database.ssl ? { rejectUnauthorized: false } : false,
+      ssl: config.database.ssl ? { rejectUnauthorized: true } : false,
     };
 
 export const pool = new Pool({
