@@ -3,6 +3,7 @@ FROM node:20-alpine AS builder
 WORKDIR /app
 
 COPY package*.json ./
+COPY vendor/ ./vendor/
 RUN npm ci
 
 COPY tsconfig.json ./
@@ -17,6 +18,7 @@ WORKDIR /app
 ENV NODE_ENV=production
 
 COPY package*.json ./
+COPY vendor/ ./vendor/
 RUN npm ci --omit=dev
 
 COPY --from=builder /app/dist ./dist

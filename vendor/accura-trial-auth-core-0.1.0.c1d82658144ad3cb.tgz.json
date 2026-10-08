@@ -1,0 +1,50 @@
+{
+  "contract": "accura-local-package-release/1",
+  "packageName": "@accura-trial/auth-core",
+  "version": "0.1.0",
+  "sourceRepository": "https://github.com/HamezGuy/accura-auth",
+  "sourceCommit": "d9758e5aebc66462a1a43b34784fb2ded0eb87a2",
+  "filename": "accura-trial-auth-core-0.1.0.c1d82658144ad3cb.tgz",
+  "byteLength": 30435,
+  "sha256": "c1d82658144ad3cb4cfebb2ffa6f2eac1306f675794340f4e9ba6c0ae7eca56e",
+  "integrity": "sha512-/wKH0PK86HgM86FR9Pc7sD5vdaAQImTZnlA29aTX3gpnRw9AQgxbTU/LEKACrNItKn8sCsFcUHZ2SkAl5C1eKQ==",
+  "build": "Clean primary main at sourceCommit; node --max-old-space-size=256 node_modules/typescript/bin/tsc; npm pack --ignore-scripts",
+  "sourceFiles": [
+    {
+      "path": "package-lock.json",
+      "sha256": "5e120932c315e624c2fb114058b2d718a8b1f7745e0786cc6d78d0cc31bdcaf3"
+    },
+    {
+      "path": "package.json",
+      "sha256": "d3028449440e0f7eba9c512189fb83fb2323bfb6a4c85ad24dca14eefc20c76b"
+    },
+    {
+      "path": "src/auth-client.ts",
+      "sha256": "d2e4cb1cb12f9f2a9e34e310c7e29eb3ebde70a5b4de1fe7fb80d605dad28841"
+    },
+    {
+      "path": "src/index.ts",
+      "sha256": "aec24cc05ec75215b54f38ef6a9a97a7cc6a6819ee061f48b9391614400a3954"
+    },
+    {
+      "path": "src/jwt.core.ts",
+      "sha256": "75157e47bf68bd01492d874d0eafc9e1b607117449b18677b5cf2b6729ad1e9e"
+    },
+    {
+      "path": "src/password.core.ts",
+      "sha256": "ca5552c1c0d1265e276d6554560b7fa0a0f320d08aea515b892d0fc48ffd714f"
+    },
+    {
+      "path": "src/roles.core.ts",
+      "sha256": "10e1e9e62fda5cc961cccc82f05483ee0494d20a5445091947c6fea25ef228c6"
+    },
+    {
+      "path": "src/types.ts",
+      "sha256": "1aa30bbb3400754af37785e6d23597659b19ee30f0b9f72c7ff137ae63a84895"
+    },
+    {
+      "path": "tsconfig.json",
+      "sha256": "08c7c9dad6647f3e75d908c0929e237e0c3e5b653b1df80d111bffceba72dcc4"
+    }
+  ]
+}
