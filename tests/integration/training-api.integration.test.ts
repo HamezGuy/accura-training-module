@@ -87,7 +87,7 @@ describe('Training API Integration', () => {
     mockGetUserRecords.mockResolvedValue([]);
     const response = await request(app).get('/api/training/user/2/records').set('Authorization', `Bearer ${generateToken()}`);
     expect(response.status).toBe(200);
-    expect(mockGetUserRecords).toHaveBeenCalledWith(2, 1);
+    expect(mockGetUserRecords).toHaveBeenCalledWith(2, expect.objectContaining({ actorUserId: 1, accessToken: expect.any(String), signal: expect.any(AbortSignal) }));
   });
 
   test.each(['0', '01', '1junk', '1.5', '9007199254740992'])('malformed user/record ID %s cannot reach a training service', async id => {
@@ -350,7 +350,7 @@ describe('Training API Integration', () => {
   test('preserves exact explicit user and study scope at the DTO boundary', async () => {
     mockGetComplianceStatus.mockResolvedValue([]);
     expect((await request(app).get('/api/training/compliance?studyId=5&userId=7').set('Authorization', `Bearer ${generateToken()}`)).status).toBe(200);
-    expect(mockGetComplianceStatus).toHaveBeenCalledWith(1, { studyId: 5, userId: 7 });
+    expect(mockGetComplianceStatus).toHaveBeenCalledWith(expect.objectContaining({ actorUserId: 1 }), { studyId: 5, userId: 7 });
   });
 
   test.each(['data_manager', 'study_director'])('actual course route accepts governed management role %s', async role => {
@@ -401,11 +401,11 @@ describe('Training API Integration', () => {
         const bearer = generateToken({ role });
         expect((await request(app).get('/api/training/compliance?userId=1&studyId=5')
           .set('Authorization', `Bearer ${bearer}`)).status).toBe(200);
-        expect(mockGetComplianceStatus).toHaveBeenCalledWith(1, { userId: 1, studyId: 5 });
+        expect(mockGetComplianceStatus).toHaveBeenCalledWith(expect.objectContaining({ actorUserId: 1 }), { userId: 1, studyId: 5 });
         const response = await request(app).get('/api/training/user/1/is-compliant').set('Authorization', `Bearer ${bearer}`);
         expect(response.status).toBe(200);
         expect(response.body.data).toEqual({ userId: 1, isCompliant: false, missingCount: 1, expiredCount: 0 });
-        expect(mockCheckUserCompliance).toHaveBeenCalledWith(1, 1);
+        expect(mockCheckUserCompliance).toHaveBeenCalledWith(1, expect.objectContaining({ actorUserId: 1 }));
         expect(mockGetExpiringTraining).not.toHaveBeenCalled();
       });
     test.each(['admin', 'data_manager', 'monitor', 'study_director'])(
@@ -415,11 +415,11 @@ describe('Training API Integration', () => {
             .set('Authorization', `Bearer ${generateToken({ role })}`);
           expect(response.status).toBe(200);
         }
-        expect(mockGetComplianceStatus).toHaveBeenNthCalledWith(1, 1, { userId: undefined, studyId: undefined });
-        expect(mockGetComplianceStatus).toHaveBeenNthCalledWith(2, 1, { userId: undefined, studyId: 5 });
-        expect(mockGetComplianceStatus).toHaveBeenNthCalledWith(3, 1, { userId: 2, studyId: undefined });
-        expect(mockCheckUserCompliance).toHaveBeenCalledWith(2, 1);
-        expect(mockGetExpiringTraining).toHaveBeenCalledWith(1, 30);
+        expect(mockGetComplianceStatus).toHaveBeenNthCalledWith(1, expect.objectContaining({ actorUserId: 1 }), { userId: undefined, studyId: undefined });
+        expect(mockGetComplianceStatus).toHaveBeenNthCalledWith(2, expect.objectContaining({ actorUserId: 1 }), { userId: undefined, studyId: 5 });
+        expect(mockGetComplianceStatus).toHaveBeenNthCalledWith(3, expect.objectContaining({ actorUserId: 1 }), { userId: 2, studyId: undefined });
+        expect(mockCheckUserCompliance).toHaveBeenCalledWith(2, expect.objectContaining({ actorUserId: 1 }));
+        expect(mockGetExpiringTraining).toHaveBeenCalledWith(expect.objectContaining({ actorUserId: 1 }), 30);
       });
     test.each(['0', '-1', '1.5', '1abc', '01', '0x1', '1e0', '9007199254740992'])(
       'refuses malformed target %s even for an oversight actor without reading data', async target => {

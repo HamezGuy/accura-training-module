@@ -1,8 +1,9 @@
-import { ADMIN_USER_TYPE_IDS, getRoleByName, getHighestRole, ROLES } from '@accura-trial/auth-core';
+import { getRoleByName, ROLES } from '@accura-trial/auth-core';
 import { query, queryOne, transaction, TransactionClient } from '../config/database';
 import { logger } from '../config/logger';
 import { logAudit } from './audit.service';
 import { generateCertificateNumber, calculateExpirationDate } from './certificate.service';
+import { authorizeTrainingTargets, readTrainingDirectory, revalidateTrainingDirectory, TrainingAuthorityContext } from './training-authority.service';
 import {
   TrainingCourse,
   TrainingRecord,
@@ -22,71 +23,6 @@ function requireUserId(value: number): void {
   if (!Number.isSafeInteger(value) || value < 1) {
     throw Object.assign(new Error('An exact positive user ID is required'), { statusCode: 400 });
   }
-}
-
-interface TrainingReadScope { callerUserId: number; organizationIds: number[] | null }
-
-// Native API constants/roles.ts isAdminIdentity contract. Generic auth-core
-// aliases include additional study-role names and must not widen this exception.
-const NATIVE_PLATFORM_ADMIN_IDENTITIES = new Set([
-  'admin', 'sysadmin', 'tech-admin', 'tech_admin',
-  'system_administrator', 'technical administrator', 'system administrator',
-]);
-
-// Match the native audit/user-reader exception: only an authoritative platform
-// administrator with a successful empty membership lookup has global scope.
-// A study-derived admin role, token claims, and lookup failures cannot grant it.
-async function trainingReadScope(callerUserId: number, client: TransactionClient = database): Promise<TrainingReadScope> {
-  requireUserId(callerUserId);
-  try {
-    const identity = await client.queryOne<{ userId: number; statusId: number; userTypeId: number | null; platformRole: string | null }>(
-      `SELECT ua.user_id, ua.status_id, ua.user_type_id, extended.platform_role
-       FROM user_account ua LEFT JOIN user_account_extended extended ON extended.user_id = ua.user_id
-       WHERE ua.user_id = $1`, [callerUserId]
-    );
-    if (!identity || identity.userId !== callerUserId || identity.statusId !== 1) {
-      throw Object.assign(new Error('Training oversight identity is unavailable'), { statusCode: 403 });
-    }
-    const { rows } = await client.query<{ organizationId: number }>(
-      `SELECT DISTINCT organization_id FROM acc_organization_member
-       WHERE user_id = $1 AND status = 'active'`, [callerUserId]
-    );
-    if (rows.some(row => !Number.isSafeInteger(row.organizationId) || row.organizationId < 1)) {
-      throw new Error('Invalid organization membership');
-    }
-    const organizationIds = rows.map(row => row.organizationId);
-    const platformAdmin = ADMIN_USER_TYPE_IDS.includes(identity.userTypeId as number)
-      || (typeof identity.platformRole === 'string' && NATIVE_PLATFORM_ADMIN_IDENTITIES.has(identity.platformRole.toLowerCase().trim()));
-    return { callerUserId, organizationIds: platformAdmin && organizationIds.length === 0 ? null : organizationIds };
-  } catch (error) {
-    if ((error as { statusCode?: number }).statusCode === 403) throw error;
-    throw Object.assign(new Error('Training organization scope could not be verified'), { statusCode: 503, cause: error });
-  }
-}
-
-function trainingScopePredicate(scope: TrainingReadScope, params: unknown[], userColumn: string): string {
-  if (scope.organizationIds === null) return 'TRUE';
-  params.push(scope.callerUserId, scope.organizationIds);
-  return `(${userColumn} = $${params.length - 1} OR EXISTS (
-    SELECT 1 FROM acc_organization_member training_scope
-    WHERE training_scope.user_id = ${userColumn} AND training_scope.status = 'active'
-      AND training_scope.organization_id = ANY($${params.length}::integer[])))`;
-}
-
-async function requireTrainingTarget(callerUserId: number, userId: number): Promise<void> {
-  requireUserId(callerUserId); requireUserId(userId);
-  if (callerUserId === userId) return;
-  const scope = await trainingReadScope(callerUserId);
-  if (scope.organizationIds === null) return;
-  let member: { userId: number } | null;
-  try {
-    member = await queryOne<{ userId: number }>(`SELECT user_id FROM acc_organization_member
-      WHERE user_id = $1 AND status = 'active' AND organization_id = ANY($2::integer[]) LIMIT 1`,
-    [userId, scope.organizationIds]);
-  } catch (error) {
-    throw Object.assign(new Error('Training organization scope could not be verified'), { statusCode: 503, cause: error });
-  }
-  if (!member || member.userId !== userId) throw Object.assign(new Error('Training user is outside your organization scope'), { statusCode: 403 });
 }
 
 /** Course configuration retains the legacy manager alias; token authority does not. */
@@ -284,9 +220,14 @@ export async function getMyRecords(userId: number): Promise<TrainingRecord[]> {
   return rows;
 }
 
-export async function getUserRecords(userId: number, callerUserId: number): Promise<TrainingRecord[]> {
-  await requireTrainingTarget(callerUserId, userId);
-  return getMyRecords(userId);
+export async function getUserRecords(userId: number, authority: TrainingAuthorityContext): Promise<TrainingRecord[]> {
+  requireUserId(userId);
+  const admission = await authorizeTrainingTargets(authority, 'records:read', [userId]);
+  if (!admission.decisions[0].allowed) throw Object.assign(new Error('Training user is outside your organization scope'), { statusCode: 403 });
+  const records = await getMyRecords(userId);
+  const current = await authorizeTrainingTargets(authority, 'records:read', [userId], { scopeFingerprint: admission.scopeFingerprint });
+  if (!current.decisions[0].allowed) throw Object.assign(new Error('Training user is outside your organization scope'), { statusCode: 403 });
+  return records;
 }
 
 export async function startTraining(userId: number, courseId: number, client: TransactionClient = database): Promise<TrainingRecord> {
@@ -443,30 +384,37 @@ export async function submitQuiz(
 
 export async function verifyTraining(
   recordId: number,
-  verifierId: number,
+  authority: TrainingAuthorityContext,
   notes?: string,
   client: TransactionClient = database
 ): Promise<{ verified: boolean }> {
   if (!Number.isSafeInteger(recordId) || recordId < 1) {
     throw Object.assign(new Error('An exact positive training record ID is required'), { statusCode: 400 });
   }
-  const scope = await trainingReadScope(verifierId, client);
-  const params: unknown[] = [recordId];
-  const predicate = trainingScopePredicate(scope, params, 'r.user_id');
+  const admission = await authorizeTrainingTargets(authority, 'records:verify', []);
+  const owner = await client.queryOne<{ userId: number }>('SELECT user_id FROM acc_training_records WHERE id = $1', [recordId]);
+  if (!owner) throw Object.assign(new Error('Training record not found'), { statusCode: 404 });
+  const initialTarget = await authorizeTrainingTargets(authority, 'records:verify', [owner.userId], { scopeFingerprint: admission.scopeFingerprint });
+  if (!initialTarget.decisions[0].allowed) throw Object.assign(new Error('Training record not found'), { statusCode: 404 });
   const record = await client.queryOne<TrainingRecord>(
-    `SELECT r.* FROM acc_training_records r WHERE r.id = $1 AND ${predicate} FOR UPDATE`,
-    params
+    'SELECT r.* FROM acc_training_records r WHERE r.id = $1 AND r.user_id = $2 FOR UPDATE',
+    [recordId, owner.userId]
   );
 
   if (!record) {
     throw Object.assign(new Error('Training record not found'), { statusCode: 404 });
   }
 
+  // Authorization is a remote observation while this record is locked. Only
+  // the training update and its caller's audit share the local transaction.
+  const target = await authorizeTrainingTargets(authority, 'records:verify', [record.userId], { scopeFingerprint: admission.scopeFingerprint });
+  if (!target.decisions[0].allowed) throw Object.assign(new Error('Training record not found'), { statusCode: 404 });
+
   if (record.status !== 'completed') {
     throw Object.assign(new Error('Can only verify completed training'), { statusCode: 400 });
   }
 
-  if (record.userId === verifierId) {
+  if (record.userId === authority.actorUserId) {
     throw Object.assign(new Error('Cannot verify your own training'), { statusCode: 403 });
   }
 
@@ -474,7 +422,7 @@ export async function verifyTraining(
     `UPDATE acc_training_records 
      SET verified_by = $1, verified_at = NOW(), notes = $2, updated_at = NOW()
      WHERE id = $3`,
-    [verifierId, notes ?? null, recordId]
+    [authority.actorUserId, notes ?? null, recordId]
   );
 
   return { verified: true };
@@ -484,44 +432,17 @@ export async function verifyTraining(
 // Compliance Operations
 // ============================================================================
 
-export async function getComplianceStatus(callerUserId: number, options?: {
+export async function getComplianceStatus(authority: TrainingAuthorityContext, options?: {
   userId?: number;
   studyId?: number;
 }): Promise<TrainingComplianceStatus[]> {
-  requireUserId(callerUserId);
-  const params: unknown[] = [];
-  const filters = ['u.status_id = 1'];
   for (const [field, value] of Object.entries(options ?? {})) {
     if (value !== undefined && (!Number.isSafeInteger(value) || value < 1)) {
       throw Object.assign(new Error(`An exact positive ${field} is required`), { statusCode: 400 });
     }
   }
-  if (options?.userId !== undefined) await requireTrainingTarget(callerUserId, options.userId);
-  else filters.push(trainingScopePredicate(await trainingReadScope(callerUserId), params, 'u.user_id'));
-  if (options?.studyId !== undefined) {
-    const study = await queryOne<{ studyId: number }>('SELECT study_id FROM study WHERE study_id = $1', [options.studyId]);
-    if (!study || study.studyId !== options.studyId) {
-      throw Object.assign(new Error('Study not found for training compliance'), { statusCode: 404 });
-    }
-    params.push(options.studyId);
-    // Same native parent/site membership scope as EDC notification audiences.
-    filters.push(`EXISTS (SELECT 1 FROM study_user_role scoped WHERE scoped.user_name = u.user_name
-      AND scoped.status_id = 1 AND (scoped.study_id = $${params.length}
-      OR scoped.study_id IN (SELECT study_id FROM study WHERE parent_study_id = $${params.length})))`);
-  }
-  if (options?.userId !== undefined) {
-    params.push(options.userId);
-    filters.push(`u.user_id = $${params.length}`);
-  }
-  const { rows: users } = await query<{
-    userId: number; username: string; firstName: string; lastName: string;
-    userTypeId: number | null; platformRole: string | null; studyRoles: string[];
-  }>(`SELECT u.user_id, u.user_name AS username, u.first_name, u.last_name, u.user_type_id,
-      extended.platform_role,
-      ARRAY(SELECT DISTINCT sur.role_name FROM study_user_role sur
-        WHERE sur.user_name = u.user_name AND sur.status_id = 1 AND sur.role_name IS NOT NULL) AS study_roles
-    FROM user_account u LEFT JOIN user_account_extended extended ON extended.user_id = u.user_id
-    WHERE ${filters.join(' AND ')} ORDER BY u.user_name`, params);
+  const directory = await readTrainingDirectory(authority, options);
+  const users = directory.users;
 
   const { rows: activeCourses } = users.length
     ? await query<TrainingCourse>('SELECT * FROM acc_training_courses WHERE active = true')
@@ -532,11 +453,8 @@ export async function getComplianceStatus(callerUserId: number, options?: {
   const statuses: TrainingComplianceStatus[] = [];
   const now = Date.now();
   for (const user of users) {
-    // Match native resolvePrimaryRole precedence; DB failures remain failures.
-    const role = ADMIN_USER_TYPE_IDS.includes(user.userTypeId as number) ? ROLES.ADMIN
-      : user.platformRole?.trim() ? getRoleByName(user.platformRole)
-      : getHighestRole(user.studyRoles ?? []).id !== ROLES.INVALID.id ? getHighestRole(user.studyRoles ?? [])
-      : ROLES.COORDINATOR;
+    // Native account/membership and primary-role resolution remain with EDC.
+    const role = getRoleByName(user.role);
     if (role.id === ROLES.INVALID.id) {
       throw Object.assign(new Error('Unknown native platform role for training compliance'), { statusCode: 409 });
     }
@@ -577,35 +495,71 @@ export async function getComplianceStatus(callerUserId: number, options?: {
     });
   }
 
+  await revalidateTrainingDirectory(authority, directory);
   return statuses;
 }
 
-export async function getExpiringTraining(callerUserId: number, daysAhead: number = 30): Promise<TrainingRecord[]> {
+export async function getExpiringTraining(authority: TrainingAuthorityContext, daysAhead: number = 30): Promise<TrainingRecord[]> {
   if (!Number.isSafeInteger(daysAhead) || daysAhead < 1) {
     throw Object.assign(new Error('An exact positive number of days is required'), { statusCode: 400 });
   }
-  const params: unknown[] = [daysAhead];
-  const predicate = trainingScopePredicate(await trainingReadScope(callerUserId), params, 'r.user_id');
-  const { rows } = await query<TrainingRecord>(
-    `SELECT r.*, c.course_name, c.course_code
-     FROM acc_training_records r
-     JOIN acc_training_courses c ON c.id = r.course_id
-     WHERE r.status = 'completed'
-       AND ${predicate}
-       AND r.expiration_date IS NOT NULL
-       AND r.expiration_date <= NOW() + INTERVAL '1 day' * $1
-       AND r.expiration_date > NOW()
-     ORDER BY r.expiration_date ASC`,
-    params
-  );
-  return rows;
+  const admission = await authorizeTrainingTargets(authority, 'records:expiring', []);
+  return transaction(async client => {
+    // Local rows share one snapshot even if expiry/status changes while remote
+    // authorization is checked between pages. EDC observations are still remote.
+    await client.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
+    const bounds = await client.queryOne<{ referenceTime: string; upperRecordId: number }>(
+      'SELECT CURRENT_TIMESTAMP::text AS reference_time, COALESCE(MAX(id), 0) AS upper_record_id FROM acc_training_records');
+    if (!bounds || typeof bounds.referenceTime !== 'string' || !Number.isFinite(Date.parse(bounds.referenceTime))
+      || !Number.isSafeInteger(bounds.upperRecordId) || bounds.upperRecordId < 0) {
+      throw Object.assign(new Error('Training expiry bounds are unavailable'), { statusCode: 503 });
+    }
+    const visible: TrainingRecord[] = [];
+    const permitted = new Set<number>();
+    let afterExpiration: string | null = null;
+    let afterId = 0;
+    while (true) {
+      const page: { rows: Array<TrainingRecord & { authorityCursorExpiration: string }> } = await client.query<TrainingRecord & { authorityCursorExpiration: string }>(
+        `SELECT r.*, c.course_name, c.course_code, r.expiration_date::text AS authority_cursor_expiration
+         FROM acc_training_records r JOIN acc_training_courses c ON c.id = r.course_id
+         WHERE r.status = 'completed' AND r.id <= $3
+           AND r.expiration_date <= $2::timestamptz + INTERVAL '1 day' * $1
+           AND r.expiration_date > $2::timestamptz
+           AND ($4::timestamptz IS NULL OR (r.expiration_date, r.id) > ($4::timestamptz, $5::integer))
+         ORDER BY r.expiration_date, r.id LIMIT 200`,
+        [daysAhead, bounds.referenceTime, bounds.upperRecordId, afterExpiration, afterId]);
+      const rows: Array<TrainingRecord & { authorityCursorExpiration: string }> = page.rows;
+      if (rows.length > 200 || rows.some(row => !Number.isSafeInteger(row.id) || row.id < 1 || row.id > bounds.upperRecordId
+        || typeof row.authorityCursorExpiration !== 'string' || !Number.isFinite(Date.parse(row.authorityCursorExpiration)))) {
+        throw Object.assign(new Error('Training expiry page is invalid'), { statusCode: 503 });
+      }
+      const checked = await authorizeTrainingTargets(authority, 'records:expiring', [...new Set(rows.map(row => row.userId))], { scopeFingerprint: admission.scopeFingerprint });
+      const pageAllowed = new Set(checked.decisions.filter(decision => decision.allowed).map(decision => decision.userId));
+      for (const row of rows) if (pageAllowed.has(row.userId)) {
+        const { authorityCursorExpiration: _cursor, ...record } = row;
+        visible.push(record); permitted.add(row.userId);
+      }
+      if (rows.length < 200) break;
+      const last: TrainingRecord & { authorityCursorExpiration: string } = rows[rows.length - 1];
+      if (last.authorityCursorExpiration === afterExpiration && last.id === afterId) {
+        throw Object.assign(new Error('Training expiry page did not advance'), { statusCode: 503 });
+      }
+      // Keep PostgreSQL's timestamp text: JavaScript Date would lose microseconds.
+      afterExpiration = last.authorityCursorExpiration; afterId = last.id;
+    }
+    const current = await authorizeTrainingTargets(authority, 'records:expiring', [...permitted], { scopeFingerprint: admission.scopeFingerprint });
+    if (current.decisions.some(decision => !decision.allowed)) {
+      throw Object.assign(new Error('Training authority changed during the request; retry the report'), { statusCode: 409 });
+    }
+    return visible;
+  });
 }
 
-export async function checkUserCompliance(userId: number, callerUserId: number = userId): Promise<TrainingComplianceCheck> {
+export async function checkUserCompliance(userId: number, authority: TrainingAuthorityContext): Promise<TrainingComplianceCheck> {
   if (!Number.isSafeInteger(userId) || userId < 1) {
     throw Object.assign(new Error('An exact positive user ID is required'), { statusCode: 400 });
   }
-  const statuses = await getComplianceStatus(callerUserId, { userId });
+  const statuses = await getComplianceStatus(authority, { userId });
   const status = statuses[0];
 
   if (!status) {

@@ -1,0 +1,13 @@
+# Send only the inputs used by this repository's Dockerfile.
+*
+!Dockerfile
+!package.json
+!package-lock.json
+!tsconfig.json
+!src/
+!src/**
+!seed/
+!seed/**
+!vendor/
+!vendor/*.tgz
+!vendor/*.tgz.json

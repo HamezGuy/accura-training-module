@@ -1,0 +1,47 @@
+name: Training service contracts
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: training-service-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  service:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      NODE_OPTIONS: --max-old-space-size=3072
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Compile runtime and check source and test types
+        run: |
+          npm run build
+          node node_modules/typescript/bin/tsc --noEmit -p tsconfig.test.json
+      - name: Run offline service contracts
+        # Native cross-owner PostgreSQL qualification needs explicit owned
+        # databases and the pinned API checkout; skips remain visible in JSON.
+        run: npm test -- --json --outputFile=training-service-results.json
+      - name: Build the independent image from repository inputs
+        run: docker build --tag training-service:${{ github.sha }} .
+      - name: Retain exact test outcomes, including skips
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: training-service-results-${{ github.sha }}
+          path: training-service-results.json
+          if-no-files-found: error
+          retention-days: 14

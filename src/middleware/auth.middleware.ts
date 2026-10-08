@@ -3,6 +3,7 @@ import { AccuraAuthClient, extractTokenFromHeader, getRoleByName, ROLES } from '
 import { decode } from 'jsonwebtoken';
 import { config } from '../config/environment';
 import { logger } from '../config/logger';
+import type { TrainingAuthorityContext } from '../services/training-authority.service';
 
 export interface AuthUser {
   userId: number;
@@ -13,11 +14,13 @@ export interface AuthUser {
 
 export interface AuthRequest extends Request {
   user?: AuthUser;
+  trainingAuthority?: TrainingAuthorityContext;
 }
 
 const authorityClient = new AccuraAuthClient(config.authority, logger);
 
 export async function authMiddleware(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
+  if (req.aborted || res.destroyed) return;
   const token = extractTokenFromHeader(req.headers.authorization);
 
   if (!token) {
@@ -44,6 +47,9 @@ export async function authMiddleware(req: AuthRequest, res: Response, next: Next
     // sessions, active accounts and role/membership grants. Never authorize
     // from decoded claims, or distribute the authority's signing secret here.
     const result = await authorityClient.verify(token);
+    // Verification has its own bounded timeout. A client may disconnect while
+    // it is pending; never start a training read/write after that late answer.
+    if (req.aborted || res.destroyed) return;
     if (result.httpStatus === 401 || result.httpStatus === 403) {
       const code = typeof result.error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,79}$/.test(result.error.code)
         ? result.error.code : 'AUTHORITY_REFUSED';
@@ -73,7 +79,24 @@ export async function authMiddleware(req: AuthRequest, res: Response, next: Next
       role: currentRole.name,
       organizationIds: [...current.organizationIds],
     };
+    const cancellation = new AbortController();
+    const abort = () => cancellation.abort();
+    const close = () => { if (!res.writableEnded) abort(); cleanup(); };
+    const cleanup = () => {
+      req.removeListener('aborted', abort);
+      res.removeListener('close', close);
+      res.removeListener('finish', cleanup);
+    };
+    req.once('aborted', abort);
+    res.once('close', close);
+    res.once('finish', cleanup);
+    if (req.aborted || res.destroyed) abort();
+    // Non-enumerable request-local credentials avoid accidental request logging.
+    Object.defineProperty(req, 'trainingAuthority', { configurable: true, value: Object.freeze({
+      actorUserId: current.userId, accessToken: token, signal: cancellation.signal,
+    }) });
   } catch {
+    if (req.aborted || res.destroyed) return;
     // Never log the bearer, upstream body or exception text; a transport error
     // may contain request details. There is no local-only fallback or cache.
     logger.warn('Native authority verification unavailable', { ip: req.ip });

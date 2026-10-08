@@ -1,131 +1,81 @@
-import { getUserRecords, getComplianceStatus, getExpiringTraining, checkUserCompliance, verifyTraining } from '../../src/services/training.service';
-
-const mockQuery = jest.fn(), mockQueryOne = jest.fn();
-jest.mock('../../src/config/database', () => ({ query: (...args: unknown[]) => mockQuery(...args), queryOne: (...args: unknown[]) => mockQueryOne(...args) }));
+import { getUserRecords, getComplianceStatus, getExpiringTraining, verifyTraining } from '../../src/services/training.service';
+const mockQuery = jest.fn(), mockQueryOne = jest.fn(), mockTargets = jest.fn(), mockDirectory = jest.fn(), mockRevalidate = jest.fn();
+jest.mock('../../src/config/database', () => ({ query: (...args: unknown[]) => mockQuery(...args), queryOne: (...args: unknown[]) => mockQueryOne(...args),
+  transaction: (fn: any) => fn({ query: (sql: string, ...args: unknown[]) => sql.startsWith('SET TRANSACTION') ? Promise.resolve({ rows: [] }) : mockQuery(sql, ...args),
+    queryOne: (...args: unknown[]) => mockQueryOne(...args) }),
+}));
 jest.mock('../../src/config/logger', () => ({ logger: { error: jest.fn(), warn: jest.fn(), info: jest.fn() } }));
 jest.mock('../../src/services/certificate.service', () => ({}));
-
-const identity = { userId: 7, statusId: 1, userTypeId: 2, platformRole: 'monitor' };
-const membership = (organizationId: number) => ({ organizationId });
-beforeEach(() => { mockQuery.mockReset(); mockQueryOne.mockReset(); });
-
-test('self records remain available without an organization lookup', async () => {
-  mockQuery.mockResolvedValue({ rows: [{ id: 20, userId: 7 }] });
-  expect(await getUserRecords(7, 7)).toEqual([{ id: 20, userId: 7 }]);
-  expect(mockQueryOne).not.toHaveBeenCalled();
-  expect(mockQuery).toHaveBeenCalledWith(expect.stringContaining('r.user_id = $1'), [7]);
+jest.mock('../../src/services/training-authority.service', () => ({
+  authorizeTrainingTargets: (...args: unknown[]) => mockTargets(...args), readTrainingDirectory: (...args: unknown[]) => mockDirectory(...args),
+  revalidateTrainingDirectory: (...args: unknown[]) => mockRevalidate(...args),
+}));
+const authority = { actorUserId: 7, accessToken: 'request-local-token' }, scope = 'owned-scope';
+beforeEach(() => {
+  for (const mock of [mockQuery, mockQueryOne, mockTargets, mockDirectory, mockRevalidate]) mock.mockReset();
+  mockTargets.mockImplementation(async (_context, _action, ids: number[]) => ({ scopeFingerprint: scope, decisions: ids.map(userId => ({ userId, allowed: true })) }));
+  mockRevalidate.mockResolvedValue(undefined);
 });
-
-test.each([0, -1, NaN, 1.5, Number.MAX_SAFE_INTEGER + 1])('refuses an invalid caller or target %s before SQL', async value => {
-  await expect(getUserRecords(7, value)).rejects.toMatchObject({ statusCode: 400 });
-  await expect(getUserRecords(value, 7)).rejects.toMatchObject({ statusCode: 400 });
+test('target records preserve native actor identity and recheck after the local read', async () => {
+  mockQuery.mockResolvedValue({ rows: [{ id: 20, userId: 8 }] });
+  expect(await getUserRecords(8, authority)).toEqual([{ id: 20, userId: 8 }]);
+  expect(mockTargets.mock.calls).toEqual([[authority, 'records:read', [8]], [authority, 'records:read', [8], { scopeFingerprint: scope }]]);
+  expect(mockQuery.mock.calls[0][0]).toContain('acc_training_records'); expect(mockQueryOne).not.toHaveBeenCalled();
+});
+test('native cross-organization refusal precedes local records', async () => {
+  mockTargets.mockResolvedValue({ scopeFingerprint: scope, decisions: [{ userId: 8, allowed: false }] });
+  await expect(getUserRecords(8, authority)).rejects.toMatchObject({ statusCode: 403 }); expect(mockQuery).not.toHaveBeenCalled();
+});
+test('revocation during the local read refuses the entire result', async () => {
+  mockQuery.mockResolvedValue({ rows: [{ id: 20, userId: 8 }] });
+  mockTargets.mockResolvedValueOnce({ scopeFingerprint: scope, decisions: [{ userId: 8, allowed: true }] })
+    .mockResolvedValueOnce({ scopeFingerprint: scope, decisions: [{ userId: 8, allowed: false }] });
+  await expect(getUserRecords(8, authority)).rejects.toMatchObject({ statusCode: 403 });
+});
+test.each([401, 403, 409, 503])('authority refusal %s never falls back to native SQL', async statusCode => {
+  const failure = Object.assign(new Error('Authority refused'), { statusCode }); mockTargets.mockRejectedValue(failure);
+  await expect(getUserRecords(8, authority)).rejects.toBe(failure); expect(mockQuery).not.toHaveBeenCalled(); expect(mockQueryOne).not.toHaveBeenCalled();
+});
+test('empty compliance still has final authority validation', async () => {
+  const directory = { users: [], filter: {}, scopeFingerprint: scope, upperUserId: 0 }; mockDirectory.mockResolvedValue(directory);
+  expect(await getComplianceStatus(authority)).toEqual([]); expect(mockRevalidate).toHaveBeenCalledWith(authority, directory); expect(mockQuery).not.toHaveBeenCalled();
+});
+test('expiry pages keep only authorized peers and preserve requested horizon', async () => {
+  mockQueryOne.mockResolvedValue({ referenceTime: '2026-10-07 00:00:00.000001+00', upperRecordId: 20 });
+  mockQuery.mockResolvedValue({ rows: [{ id: 11, userId: 8, authorityCursorExpiration: '2026-10-08 00:00:00.000001+00' },
+    { id: 12, userId: 9, authorityCursorExpiration: '2026-10-08 00:00:00.000002+00' }] });
+  mockTargets.mockImplementation(async (_context, _action, ids: number[]) => ({ scopeFingerprint: scope, decisions: ids.map(userId => ({ userId, allowed: userId === 8 })) }));
+  expect(await getExpiringTraining(authority, 14)).toEqual([{ id: 11, userId: 8 }]);
+  expect(mockQuery.mock.calls[0][1]).toEqual([14, '2026-10-07 00:00:00.000001+00', 20, null, 0]);
+  expect(mockQuery.mock.calls[0][0]).toContain('LIMIT 200');
+  expect(mockTargets).toHaveBeenLastCalledWith(authority, 'records:expiring', [8], { scopeFingerprint: scope });
+});
+test('expiry keyset retains PostgreSQL microsecond text while discarding excluded rows', async () => {
+  mockQueryOne.mockResolvedValue({ referenceTime: '2026-10-07 00:00:00+00', upperRecordId: 201 });
+  mockQuery.mockResolvedValueOnce({ rows: Array.from({ length: 200 }, (_, index) => ({ id: index + 1, userId: 9,
+    authorityCursorExpiration: `2026-10-08 00:00:00.${String(index + 1).padStart(6, '0')}+00` })) }).mockResolvedValueOnce({ rows: [] });
+  mockTargets.mockImplementation(async (_context, _action, ids: number[]) => ({ scopeFingerprint: scope, decisions: ids.map(userId => ({ userId, allowed: false })) }));
+  expect(await getExpiringTraining(authority)).toEqual([]);
+  expect(mockQuery.mock.calls[1][1].slice(3)).toEqual(['2026-10-08 00:00:00.000200+00', 200]);
+});
+test('foreign sign-off is refused before locking or updating', async () => {
+  const client = { queryOne: jest.fn().mockResolvedValue({ userId: 8 }), query: jest.fn() };
+  mockTargets.mockImplementation(async (_context, _action, ids: number[]) => ({ scopeFingerprint: scope, decisions: ids.map(userId => ({ userId, allowed: false })) }));
+  await expect(verifyTraining(80, authority, 'reviewed', client)).rejects.toMatchObject({ statusCode: 404 });
+  expect(client.queryOne).toHaveBeenCalledTimes(1); expect(client.queryOne.mock.calls[0][0]).not.toContain('FOR UPDATE'); expect(client.query).not.toHaveBeenCalled();
+});
+test('sign-off pins locked owner and rechecks before local mutation', async () => {
+  const client = { queryOne: jest.fn().mockResolvedValueOnce({ userId: 8 }).mockResolvedValueOnce({ id: 80, userId: 8, status: 'completed' }),
+    query: jest.fn().mockResolvedValue({ rows: [], rowCount: 1 }) };
+  expect(await verifyTraining(80, authority, 'reviewed', client)).toEqual({ verified: true });
+  expect(client.queryOne.mock.calls[1]).toEqual([expect.stringContaining('r.user_id = $2 FOR UPDATE'), [80, 8]]);
+  expect(mockTargets).toHaveBeenCalledTimes(3); expect(client.query).toHaveBeenCalledWith(expect.stringContaining('UPDATE acc_training_records'), [7, 'reviewed', 80]);
   expect(mockQuery).not.toHaveBeenCalled(); expect(mockQueryOne).not.toHaveBeenCalled();
 });
-
-test('cross-organization target is refused before its records are read', async () => {
-  mockQueryOne.mockResolvedValueOnce(identity).mockResolvedValueOnce(null);
-  mockQuery.mockResolvedValueOnce({ rows: [membership(11)] });
-  await expect(getUserRecords(8, 7)).rejects.toMatchObject({ statusCode: 403 });
-  expect(mockQuery).toHaveBeenCalledTimes(1);
-  expect(mockQueryOne.mock.calls[1][1]).toEqual([8, [11]]);
-});
-
-test('an exact active shared membership permits the target read', async () => {
-  mockQueryOne.mockResolvedValueOnce(identity).mockResolvedValueOnce({ userId: 8 });
-  mockQuery.mockResolvedValueOnce({ rows: [membership(11)] }).mockResolvedValueOnce({ rows: [{ userId: 8 }] });
-  expect(await getUserRecords(8, 7)).toEqual([{ userId: 8 }]);
-  expect(mockQueryOne.mock.calls[1][0]).toContain("status = 'active'");
-});
-
-test.each([0, 1, 3, 4])('native administrator type %s is global only after a successful empty membership read', async userTypeId => {
-  mockQueryOne.mockResolvedValueOnce({ ...identity, userTypeId });
-  mockQuery.mockResolvedValueOnce({ rows: [] }).mockResolvedValueOnce({ rows: [{ userId: 8 }] });
-  expect(await getUserRecords(8, 7)).toEqual([{ userId: 8 }]);
-  expect(mockQueryOne).toHaveBeenCalledTimes(1);
-  expect(mockQuery.mock.calls[0][0]).toContain('acc_organization_member');
-});
-
-test.each(['admin', 'sysadmin', 'tech-admin', 'tech_admin', 'system_administrator', 'technical administrator', 'system administrator', ' ADMIN '])('explicit platform identity %s supports the native organization-less exception', async platformRole => {
-  mockQueryOne.mockResolvedValueOnce({ ...identity, platformRole });
-  mockQuery.mockResolvedValueOnce({ rows: [] }).mockResolvedValueOnce({ rows: [] });
-  await expect(getUserRecords(8, 7)).resolves.toEqual([]);
-  expect(mockQueryOne).toHaveBeenCalledTimes(1);
-});
-
-test.each(['root', 'techadmin', 'site_admin_assistant', 'constructor', '__proto__'])('generic or forged alias %s cannot widen the native platform exception', async platformRole => {
-  mockQueryOne.mockResolvedValueOnce({ ...identity, platformRole }).mockResolvedValueOnce(null);
-  mockQuery.mockResolvedValueOnce({ rows: [] });
-  await expect(getUserRecords(8, 7)).rejects.toMatchObject({ statusCode: 403 });
-  expect(mockQuery).toHaveBeenCalledTimes(1);
-});
-
-test('an administrator with an organization cannot read a foreign target', async () => {
-  mockQueryOne.mockResolvedValueOnce({ ...identity, userTypeId: 1, platformRole: 'admin' }).mockResolvedValueOnce(null);
-  mockQuery.mockResolvedValueOnce({ rows: [membership(11)] });
-  await expect(checkUserCompliance(8, 7)).rejects.toMatchObject({ statusCode: 403 });
-  expect(mockQuery).toHaveBeenCalledTimes(1);
-});
-
-test.each([2, null])('study-derived admin claims cannot turn native type %s and empty memberships into global scope', async userTypeId => {
-  mockQueryOne.mockResolvedValueOnce({ ...identity, userTypeId, platformRole: null, studyRoles: ['admin'] }).mockResolvedValueOnce(null);
-  mockQuery.mockResolvedValueOnce({ rows: [] });
-  await expect(getUserRecords(8, 7)).rejects.toMatchObject({ statusCode: 403 });
-  expect(mockQueryOne.mock.calls[1][1]).toEqual([8, []]);
-});
-
-test.each(['identity', 'memberships', 'target'])('%s lookup failure is unavailable, never an empty/global successful response', async phase => {
-  const failure = new Error('private SQL details');
-  if (phase === 'identity') mockQueryOne.mockRejectedValueOnce(failure);
-  else {
-    mockQueryOne.mockResolvedValueOnce({ ...identity, userTypeId: 1 });
-    if (phase === 'memberships') mockQuery.mockRejectedValueOnce(failure);
-    else { mockQuery.mockResolvedValueOnce({ rows: [membership(11)] }); mockQueryOne.mockRejectedValueOnce(failure); }
-  }
-  const error = await getUserRecords(8, 7).then(() => null, value => value);
-  expect(error).toMatchObject({ statusCode: 503, cause: failure });
-  expect(error.message).not.toContain('private SQL');
-});
-
-test.each([null, { ...identity, userId: 8 }, { ...identity, statusId: 0 }])('missing, mismatched or inactive actor cannot obtain oversight (%j)', async actor => {
-  mockQueryOne.mockResolvedValueOnce(actor);
-  await expect(getExpiringTraining(7)).rejects.toMatchObject({ statusCode: 403 });
-  expect(mockQuery).not.toHaveBeenCalled();
-});
-
-test.each([0, -1, null, '11'])('malformed membership %s cannot become global or be coerced', async organizationId => {
-  mockQueryOne.mockResolvedValueOnce({ ...identity, userTypeId: 1 });
-  mockQuery.mockResolvedValueOnce({ rows: [{ organizationId }] });
-  await expect(getExpiringTraining(7)).rejects.toMatchObject({ statusCode: 503 });
-  expect(mockQuery).toHaveBeenCalledTimes(1);
-});
-
-test('unfiltered compliance applies actor/organization scope in its native user query', async () => {
-  mockQueryOne.mockResolvedValueOnce(identity);
-  mockQuery.mockResolvedValueOnce({ rows: [membership(11), membership(12)] }).mockResolvedValueOnce({ rows: [] });
-  expect(await getComplianceStatus(7)).toEqual([]);
-  const [sql, params] = mockQuery.mock.calls[1];
-  expect(sql).toContain('u.user_id = $1 OR EXISTS');
-  expect(sql).toContain('training_scope.organization_id = ANY($2::integer[])');
-  expect(params).toEqual([7, [11, 12]]);
-});
-
-test('expiry list applies the same scope while preserving the requested horizon', async () => {
-  mockQueryOne.mockResolvedValueOnce(identity);
-  mockQuery.mockResolvedValueOnce({ rows: [] }).mockResolvedValueOnce({ rows: [] });
-  await getExpiringTraining(7, 14);
-  const [sql, params] = mockQuery.mock.calls[1];
-  expect(sql).toContain('r.user_id = $2 OR EXISTS');
-  expect(sql).toContain('training_scope.organization_id = ANY($3::integer[])');
-  expect(params).toEqual([14, 7, []]);
-});
-
-test('sign-off scopes its locked record read through the supplied transaction and never updates an excluded row', async () => {
-  const client = { queryOne: jest.fn().mockResolvedValueOnce(identity).mockResolvedValueOnce(null),
-    query: jest.fn().mockResolvedValueOnce({ rows: [membership(11)], rowCount: 1 }) };
-  await expect(verifyTraining(80, 7, 'reviewed', client)).rejects.toMatchObject({ statusCode: 404 });
-  const [sql, params] = client.queryOne.mock.calls[1];
-  expect(sql).toContain('FOR UPDATE'); expect(sql).toContain('r.user_id = $2 OR EXISTS');
-  expect(params).toEqual([80, 7, [11]]);
-  expect(client.query).toHaveBeenCalledTimes(1);
-  expect(mockQuery).not.toHaveBeenCalled(); expect(mockQueryOne).not.toHaveBeenCalled();
+test('target revoked after locking cannot be updated', async () => {
+  const client = { queryOne: jest.fn().mockResolvedValueOnce({ userId: 8 }).mockResolvedValueOnce({ id: 80, userId: 8, status: 'completed' }), query: jest.fn() };
+  mockTargets.mockResolvedValueOnce({ scopeFingerprint: scope, decisions: [] })
+    .mockResolvedValueOnce({ scopeFingerprint: scope, decisions: [{ userId: 8, allowed: true }] })
+    .mockResolvedValueOnce({ scopeFingerprint: scope, decisions: [{ userId: 8, allowed: false }] });
+  await expect(verifyTraining(80, authority, 'reviewed', client)).rejects.toMatchObject({ statusCode: 404 }); expect(client.query).not.toHaveBeenCalled();
 });

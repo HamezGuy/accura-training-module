@@ -42,6 +42,20 @@ describe('canonical EDC authority token boundary', () => {
     authorityFetch = jest.spyOn(globalThis, 'fetch').mockImplementation(nativeResponse());
   });
   afterEach(() => jest.restoreAllMocks());
+  test.each(['success', 'failure'])('a delayed authority %s after disconnect never enters training', async outcome => {
+    let resolve!: (value: Response) => void, reject!: (error: Error) => void;
+    authorityFetch.mockImplementation(() => new Promise<Response>((accept, refuse) => { resolve = accept; reject = refuse; }));
+    const req = { headers: { authorization: `Bearer ${token()}` }, aborted: false } as AuthRequest;
+    const res = { destroyed: false, status: jest.fn(), json: jest.fn() };
+    const next = jest.fn();
+    const pending = authMiddleware(req, res as unknown as express.Response, next);
+    res.destroyed = true;
+    if (outcome === 'success') resolve(authorityResponse({ success: true, data: fresh }));
+    else reject(new Error('Transport ended after disconnect'));
+    await pending;
+    expect(next).not.toHaveBeenCalled(); expect(res.status).not.toHaveBeenCalled();
+    expect(req.trainingAuthority).toBeUndefined();
+  });
   test.each([
     ['refresh', { type: 'refresh' }], ['missing ID', { userId: undefined }], ['fractional ID', { userId: 1.5 }],
     ['negative ID', { userId: -1 }], ['blank username', { username: ' ' }], ['missing email', { email: undefined }],

@@ -3,6 +3,13 @@ import * as trainingService from '../../src/services/training.service';
 const mockQuery = jest.fn();
 const mockQueryOne = jest.fn();
 const mockTransaction = jest.fn();
+const mockTargets = jest.fn(), mockDirectory = jest.fn(), mockRevalidate = jest.fn();
+const authority = { actorUserId: 2, accessToken: 'fixture-native-token' };
+jest.mock('../../src/services/training-authority.service', () => ({
+  authorizeTrainingTargets: (...args: unknown[]) => mockTargets(...args),
+  readTrainingDirectory: (...args: unknown[]) => mockDirectory(...args),
+  revalidateTrainingDirectory: (...args: unknown[]) => mockRevalidate(...args),
+}));
 
 jest.mock('../../src/config/database', () => ({
   query: (...args: unknown[]) => mockQuery(...args),
@@ -28,7 +35,11 @@ describe('TrainingService', () => {
     mockQuery.mockReset();
     mockQueryOne.mockReset();
     mockTransaction.mockReset();
-    mockTransaction.mockImplementation(async (fn) => fn({ query: mockQuery, queryOne: mockQueryOne }));
+    mockTargets.mockReset(); mockDirectory.mockReset(); mockRevalidate.mockReset();
+    mockTargets.mockImplementation(async (_context, _action, ids: number[]) => ({ scopeFingerprint: 'fixture-scope', decisions: ids.map(userId => ({ userId, allowed: true })) }));
+    mockDirectory.mockResolvedValue({ users: [], filter: {}, scopeFingerprint: 'fixture-scope' });
+    mockRevalidate.mockResolvedValue(undefined);
+    mockTransaction.mockImplementation(async (fn) => fn({ query: (sql: string, ...args: unknown[]) => sql.startsWith('SET TRANSACTION') ? Promise.resolve({ rows: [] }) : mockQuery(sql, ...args), queryOne: mockQueryOne }));
   });
 
   describe('getCourses', () => {
@@ -195,14 +206,10 @@ describe('TrainingService', () => {
   });
 
   describe('verifyTraining', () => {
-    beforeEach(() => {
-      mockQueryOne.mockResolvedValueOnce({ userId: 2, statusId: 1, userTypeId: 1, platformRole: null });
-      mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
-    });
     it('should throw 404 if record not found', async () => {
       mockQueryOne.mockResolvedValue(null);
 
-      await expect(trainingService.verifyTraining(999, 2)).rejects.toMatchObject({
+      await expect(trainingService.verifyTraining(999, authority)).rejects.toMatchObject({
         statusCode: 404,
       });
     });
@@ -210,7 +217,7 @@ describe('TrainingService', () => {
     it('should throw 400 if training not completed', async () => {
       mockQueryOne.mockResolvedValue({ id: 1, userId: 3, status: 'in_progress' });
 
-      await expect(trainingService.verifyTraining(1, 2)).rejects.toMatchObject({
+      await expect(trainingService.verifyTraining(1, authority)).rejects.toMatchObject({
         statusCode: 400,
       });
     });
@@ -218,7 +225,7 @@ describe('TrainingService', () => {
     it('should throw 403 if user tries to verify own training', async () => {
       mockQueryOne.mockResolvedValue({ id: 1, userId: 2, status: 'completed' });
 
-      await expect(trainingService.verifyTraining(1, 2)).rejects.toMatchObject({
+      await expect(trainingService.verifyTraining(1, authority)).rejects.toMatchObject({
         statusCode: 403,
       });
     });
@@ -227,36 +234,33 @@ describe('TrainingService', () => {
       mockQueryOne.mockResolvedValue({ id: 1, userId: 3, status: 'completed' });
       mockQuery.mockResolvedValue({ rows: [], rowCount: 1 });
 
-      const result = await trainingService.verifyTraining(1, 2, 'Verified during audit');
+      const result = await trainingService.verifyTraining(1, authority, 'Verified during audit');
 
       expect(result.verified).toBe(true);
     });
   });
 
   describe('getExpiringTraining', () => {
-    beforeEach(() => {
-      mockQueryOne.mockResolvedValueOnce({ userId: 2, statusId: 1, userTypeId: 1, platformRole: null });
-      mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
-    });
+    beforeEach(() => mockQueryOne.mockResolvedValue({ referenceTime: '2026-10-07 00:00:00+00', upperRecordId: 0 }));
     it('should query for records expiring within specified days', async () => {
       mockQuery.mockResolvedValue({ rows: [], rowCount: 0 });
 
-      await trainingService.getExpiringTraining(2, 14);
+      await trainingService.getExpiringTraining(authority, 14);
 
       expect(mockQuery).toHaveBeenCalledWith(
         expect.stringContaining("INTERVAL '1 day' * $1"),
-        [14]
+        [14, '2026-10-07 00:00:00+00', 0, null, 0]
       );
     });
 
     it('should default to 30 days', async () => {
       mockQuery.mockResolvedValue({ rows: [], rowCount: 0 });
 
-      await trainingService.getExpiringTraining(2);
+      await trainingService.getExpiringTraining(authority);
 
       expect(mockQuery).toHaveBeenCalledWith(
         expect.any(String),
-        [30]
+        [30, '2026-10-07 00:00:00+00', 0, null, 0]
       );
     });
   });
@@ -277,39 +281,35 @@ describe('TrainingService', () => {
   describe('exact compliance identity', () => {
     it('cannot report an absent user as compliant', async () => {
       mockQuery.mockResolvedValue({ rows: [], rowCount: 0 });
-      await expect(trainingService.checkUserCompliance(77)).rejects.toMatchObject({ statusCode: 404 });
-      expect(mockQuery).toHaveBeenCalledTimes(1);
-      expect(mockQuery.mock.calls[0][1]).toEqual([77]);
+      await expect(trainingService.checkUserCompliance(77, authority)).rejects.toMatchObject({ statusCode: 404 });
+      expect(mockQuery).not.toHaveBeenCalled();
+      expect(mockDirectory).toHaveBeenCalledWith(authority, { userId: 77 });
     });
 
     it.each([0, -1, NaN, 1.5, Number.MAX_SAFE_INTEGER + 1])('rejects invalid user identity %s before reading records', async userId => {
-      await expect(trainingService.checkUserCompliance(userId)).rejects.toMatchObject({ statusCode: 400 });
+      await expect(trainingService.checkUserCompliance(userId, authority)).rejects.toMatchObject({ statusCode: 400 });
       expect(mockQuery).not.toHaveBeenCalled();
     });
 
     it('propagates a failed user read rather than manufacturing compliant empty state', async () => {
       const failure = new Error('Identity storage unavailable');
-      mockQuery.mockRejectedValue(failure);
-      await expect(trainingService.checkUserCompliance(77)).rejects.toBe(failure);
+      mockDirectory.mockRejectedValue(failure);
+      await expect(trainingService.checkUserCompliance(77, authority)).rejects.toBe(failure);
     });
 
     it('refuses a successful-looking compliance result for a different user', async () => {
-      mockQuery.mockResolvedValueOnce({
-        rows: [{ userId: 78, username: 'other', firstName: 'Other', lastName: 'Person', userTypeId: 2, platformRole: 'monitor', studyRoles: [] }],
-        rowCount: 1,
-      }).mockResolvedValue({ rows: [], rowCount: 0 });
-      await expect(trainingService.checkUserCompliance(77)).rejects.toMatchObject({ statusCode: 409 });
+      mockDirectory.mockResolvedValue({ users: [{ userId: 78, username: 'other', firstName: 'Other', lastName: 'Person', role: 'monitor' }], filter: {}, scopeFingerprint: 'fixture-scope' });
+      mockQuery.mockResolvedValue({ rows: [], rowCount: 0 });
+      await expect(trainingService.checkUserCompliance(77, authority)).rejects.toMatchObject({ statusCode: 409 });
     });
 
     it('keeps the existing required-course calculation for an exact known user', async () => {
+      mockDirectory.mockResolvedValue({ users: [{ userId: 77, username: 'known', firstName: 'Known', lastName: 'Person', role: 'monitor' }], filter: {}, scopeFingerprint: 'fixture-scope' });
       mockQuery.mockResolvedValueOnce({
-        rows: [{ userId: 77, username: 'known', firstName: 'Known', lastName: 'Person', userTypeId: 2, platformRole: 'monitor', studyRoles: [] }],
-        rowCount: 1,
-      }).mockResolvedValueOnce({
         rows: [{ id: 5, requiredForRoles: ['monitor'], courseCode: 'REQUIRED-1', courseName: 'Required course', regulatoryReference: null }],
         rowCount: 1,
       }).mockResolvedValueOnce({ rows: [], rowCount: 0 });
-      await expect(trainingService.checkUserCompliance(77)).resolves.toEqual({
+      await expect(trainingService.checkUserCompliance(77, authority)).resolves.toEqual({
         userId: 77, isCompliant: false, missingCount: 1, expiredCount: 0,
       });
     });

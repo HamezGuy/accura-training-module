@@ -40,7 +40,7 @@ const cases = [
   { name: 'failed quiz', method: 'post', route: '/submit-quiz/3', action: 'quiz_failed',
     body: { answers: [{ questionId: 7, selectedOptions: [1] }] }, responses: [rows(course), rows(question), rows(), rows()] },
   { name: 'verify training', method: 'post', route: '/verify/12', action: 'training_verified',
-    body: { notes: 'Owned test verification' }, responses: [rows({ user_id: 1, status_id: 1, user_type_id: 1, platform_role: null }), rows(), rows(record), rows()] },
+    body: { notes: 'Owned test verification' }, responses: [rows({ user_id: 2 }), rows(record), rows()] },
 ] as const;
 
 describe('training mutation and audit share the real database transaction boundary', () => {
@@ -54,9 +54,17 @@ describe('training mutation and audit share the real database transaction bounda
   beforeEach(() => {
     jest.clearAllMocks(); responses = []; active = false; stagedWrites = 0; committedWrites = 0;
     const verifier = createJwtService({ secret: 'training-audit-offline-test' });
-    jest.spyOn(globalThis, 'fetch').mockImplementation(async (_url, options) => {
+    jest.spyOn(globalThis, 'fetch').mockImplementation(async (url, options) => {
       const bearer = new Headers(options?.headers).get('Authorization')!.slice('Bearer '.length);
       const verified = verifier.verifyAccessToken(bearer);
+      if (verified && String(url).endsWith('/api/training-authority/resolve')) {
+        const input = JSON.parse(String(options?.body));
+        return new Response(JSON.stringify({ success: true, data: { schemaVersion: 'training-authority/1',
+          actorUserId: 1, op: input.op, action: input.action, observedAt: '2026-10-07T00:00:00.000Z',
+          scopeFingerprint: `sha256:${'a'.repeat(64)}`, consistency: 'current-page-observations-not-atomic', complete: true,
+          userIds: input.userIds, decisions: input.userIds.map((userId: number) => ({ userId, allowed: true })) } }),
+        { status: 200, headers: { 'content-type': 'application/json' } });
+      }
       return new Response(JSON.stringify(verified ? { success: true, data: {
         userId: 1, username: 'owned-test', email: '', role: 'admin', userType: 'user', studyIds: [], organizationIds: [],
       } } : { success: false }), { status: verified ? 200 : 401 });
