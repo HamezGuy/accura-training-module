@@ -12,7 +12,7 @@ jest.mock('../../src/services/certificate.service', () => ({}));
 
 describe('native compliance identity and required-course census', () => {
   const user = { userId: 7, username: 'owned', firstName: 'Owned', lastName: 'User', role: 'monitor' };
-  const course = (id: number, roles = ['monitor']) => ({ id, courseCode: `C-${id}`, courseName: `Course ${id}`, requiredForRoles: roles });
+  const course = (id: number, roles = ['monitor']) => ({ id, courseCode: `C-${id}`, courseName: `Course ${id}`, requiredForRoles: roles,version:'1',contentRevision:1 });
   function fixture(users: unknown[], courses: unknown[], records: unknown[]) {
     mockDirectory.mockResolvedValue({ users, filter: {}, scopeFingerprint: 'fixture-scope' });
     mockQuery.mockResolvedValueOnce({ rows: courses }).mockResolvedValueOnce({ rows: records });
@@ -20,7 +20,7 @@ describe('native compliance identity and required-course census', () => {
   beforeEach(() => { mockQuery.mockReset(); mockQueryOne.mockReset(); mockDirectory.mockReset(); mockRevalidate.mockReset(); mockRevalidate.mockResolvedValue(undefined); });
   test('optional, obsolete and same-code records cannot change a required ID census', async () => {
     fixture([user], [course(1), course(2)], [
-      { courseId: 1, status: 'completed', expirationDate: '2099-01-01' },
+      { courseId: 1, status: 'completed',courseVersion:'1',contentRevision:1, expirationDate: '2099-01-01' },
       { courseId: 9, courseCode: 'C-2', status: 'completed' },
       { courseId: 10, status: 'expired' },
     ]);
@@ -32,7 +32,7 @@ describe('native compliance identity and required-course census', () => {
     expect(mockQuery.mock.calls.every(([sql]) => !/user_account|study_user_role|acc_organization/.test(sql))).toBe(true);
   });
   test('unrelated expired records cannot invalidate completed required training', async () => {
-    fixture([user], [course(1)], [{ courseId: 1, status: 'completed' }, { courseId: 9, status: 'expired' }]);
+    fixture([user], [course(1)], [{ courseId: 1, status: 'completed',courseVersion:'1',contentRevision:1 }, { courseId: 9, status: 'expired' }]);
     expect((await getComplianceStatus(authority, { userId: 7 }))[0]).toMatchObject({ completed: 1, expired: 0, pending: 0, compliancePercentage: 100, isCompliant: true });
   });
   test.each(['admin', 'data_manager', 'coordinator'])('uses the native resolved role %s without reconstructing authority', async role => {
@@ -59,7 +59,7 @@ describe('native compliance identity and required-course census', () => {
     expect(mockDirectory).toHaveBeenCalledWith(authority, { studyId: 5, userId: 7 });
   });
   test('duplicate required records are an error, never double credit', async () => {
-    fixture([user], [course(1)], [{ courseId: 1, status: 'completed' }, { courseId: 1, status: 'completed' }]);
+    fixture([user], [course(1)], [{ courseId: 1, status: 'completed',courseVersion:'1',contentRevision:1 }, { courseId: 1, status: 'completed',courseVersion:'1',contentRevision:1 }]);
     await expect(getComplianceStatus(authority, { userId: 7 })).rejects.toMatchObject({ statusCode: 409 });
   });
   test.each(['data_manager', 'manager', 'study_director'])('course lists retain legacy and canonical requirements for %s', async role => {
@@ -74,6 +74,14 @@ describe('native compliance identity and required-course census', () => {
     await expect(createCourse({ requiredForRoles: roles } as any, 7)).rejects.toMatchObject({ statusCode:400 });
     await expect(updateCourse(1, { requiredForRoles: roles } as any)).rejects.toMatchObject({ statusCode:400 });
     expect(mockQuery).not.toHaveBeenCalled(); expect(mockQueryOne).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    {courseVersion:'0',contentRevision:1}, {courseVersion:'1',contentRevision:0},
+    {courseVersion:null,contentRevision:null}, {courseVersion:'1',contentRevision:2}
+  ])('obsolete or unbound completion is missing required training: %j', async binding => {
+    fixture([user],[course(1)],[{courseId:1,status:'completed',...binding}]);
+    expect((await getComplianceStatus(authority,{userId:7}))[0]).toMatchObject({completed:0,pending:1,isCompliant:false});
   });
 
 });

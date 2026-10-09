@@ -252,7 +252,7 @@ describe('Training API Integration', () => {
       const res = await request(app)
         .post('/api/training/submit-quiz/1')
         .set('Authorization', `Bearer ${token}`)
-        .send({ answers: [] });
+        .send({ contentRevision:1, answers: [] });
 
       expect(res.status).toBe(400);
     });
@@ -272,7 +272,7 @@ describe('Training API Integration', () => {
         .post('/api/training/submit-quiz/1')
         .set('Authorization', `Bearer ${token}`)
         .send({
-          answers: [
+          contentRevision:1, answers: [
             { questionId: 1, selectedOptions: [0] },
             { questionId: 2, selectedOptions: [1] },
           ],

@@ -11,6 +11,7 @@ export interface TrainingCourse {
   courseName: string;
   description: string | null;
   version: string;
+  contentRevision?: number;
   durationMinutes: number | null;
   passingScore: number;
   requiredForRoles: string[];
@@ -92,6 +93,10 @@ export interface TrainingRecord {
   courseId: number;
   courseName?: string;
   courseCode?: string;
+  courseVersion?: string | null;
+  contentRevision?: number | null;
+  /** Internal evidence only; controllers must never expose stored quiz answers. */
+  contentSnapshot?: unknown;
   status: TrainingRecordStatus;
   startedAt: string | null;
   completedAt: string | null;

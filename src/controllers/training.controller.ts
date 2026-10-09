@@ -140,7 +140,7 @@ export async function startTraining(req: AuthRequest, res: Response): Promise<vo
   const courseId = parseInt(req.params['courseId'], 10);
 
   const record = await transaction(async (client) => {
-    const started = await trainingService.startTraining(userId, courseId, client);
+    const started = await trainingService.startTraining(userId, courseId, client, req.body?.contentRevision);
     await logAudit({
       userId,
       action: 'training_started',
@@ -162,12 +162,12 @@ export async function submitQuiz(req: AuthRequest, res: Response): Promise<void>
   const { answers } = req.body;
 
   const result = await transaction(async (client) => {
-    const submitted = await trainingService.submitQuiz(userId, courseId, answers, client);
+    const submitted = await trainingService.submitQuiz(userId, courseId, answers, client, req.body.contentRevision);
     await logAudit({
       userId,
       action: submitted.passed ? 'quiz_passed' : 'quiz_failed',
       courseId,
-      details: { score: submitted.score, passed: submitted.passed, totalQuestions: submitted.totalQuestions },
+      details: { contentRevision: req.body.contentRevision, score: submitted.score, passed: submitted.passed, totalQuestions: submitted.totalQuestions },
       ipAddress: req.ip,
       userAgent: req.headers['user-agent'],
     }, client);
@@ -300,6 +300,7 @@ function mapCourseToDto(course: TrainingCourse): TrainingCourse {
     courseName: course.courseName,
     description: course.description,
     version: course.version,
+    contentRevision: course.contentRevision,
     durationMinutes: course.durationMinutes,
     passingScore: course.passingScore,
     requiredForRoles: course.requiredForRoles,
@@ -332,6 +333,8 @@ function mapRecordToDto(r: TrainingRecord): TrainingRecord {
     courseId: r.courseId,
     courseName: r.courseName,
     courseCode: r.courseCode,
+    courseVersion: r.courseVersion ?? null,
+    contentRevision: r.contentRevision ?? null,
     status: r.status,
     startedAt: r.startedAt,
     completedAt: r.completedAt,
@@ -344,6 +347,11 @@ function mapRecordToDto(r: TrainingRecord): TrainingRecord {
     verifiedAt: r.verifiedAt,
     notes: r.notes,
   };
+}
+
+export async function getMyRecordHistory(req: AuthRequest, res: Response): Promise<void> {
+  const history = await trainingService.getMyRecordHistory(req.user!.userId);
+  res.json({success: true, data: history.map(row => ({...row, record: mapRecordToDto(row.record)}))});
 }
 
 // ============================================================================

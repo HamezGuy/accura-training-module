@@ -63,6 +63,7 @@ const addQuestionsSchema = Joi.object({
 });
 
 const submitQuizSchema = Joi.object({
+  contentRevision: Joi.number().integer().positive().strict().required(),
   answers: Joi.array()
     .items(
       Joi.object({
@@ -114,6 +115,7 @@ router.post(
 // ============================================================================
 
 router.get('/my-records', asyncHandler<AuthRequest>(controller.getMyRecords));
+router.get('/my-record-history', asyncHandler<AuthRequest>(controller.getMyRecordHistory));
 
 router.get(
   '/user/:userId/records',
@@ -121,7 +123,7 @@ router.get(
   asyncHandler<AuthRequest>(controller.getUserRecords)
 );
 
-router.post('/start/:courseId', asyncHandler<AuthRequest>(controller.startTraining));
+router.post('/start/:courseId', validate(Joi.object({contentRevision: Joi.number().integer().positive().optional()})), asyncHandler<AuthRequest>(controller.startTraining));
 
 router.post(
   '/submit-quiz/:courseId',

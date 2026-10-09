@@ -20,9 +20,9 @@ jest.mock('../../src/config/environment', () => ({ config: {
 } }));
 jest.mock('../../src/config/logger', () => ({ logger: { error: jest.fn(), info: jest.fn(), warn: jest.fn(), debug: jest.fn() } }));
 
-const course = { id: 3, course_code: 'OWNED-AUDIT', course_name: 'Audit fixture', version: '1', active: true,
+const course = { id: 3, course_code: 'OWNED-AUDIT', course_name: 'Audit fixture', version: '1', content_revision:1, active: true,
   passing_score: 80, required_for_roles: ['admin'], validity_period_days: 365 };
-const record = { id: 12, user_id: 2, course_id: 3, status: 'completed' };
+const record = { id: 12, user_id: 2, course_id: 3, status: 'completed',course_version:'1',content_revision:1 };
 const question = { id: 7, course_id: 3, question_text: 'Fixture?', question_type: 'true_false',
   options: [{ text: 'yes', isCorrect: true }, { text: 'no', isCorrect: false }], order_index: 0 };
 const rows = (...values: Record<string, unknown>[]) => ({ rows: values, rowCount: values.length });
@@ -34,11 +34,11 @@ const cases = [
   { name: 'add questions', method: 'post', route: '/courses/3/questions', action: 'questions_added',
     body: { questions: [{ questionText: 'Fixture?', questionType: 'true_false', options: question.options, orderIndex: 0 }] }, responses: [rows(course), rows(question)] },
   { name: 'start training', method: 'post', route: '/start/3', action: 'training_started',
-    body: {}, responses: [rows(course), rows(), rows({ ...record, user_id: 1, status: 'in_progress' })] },
+    body: {}, responses: [rows(course), rows(), rows(), rows(), rows(question), rows({ ...record, user_id: 1, status: 'in_progress' })] },
   { name: 'passing quiz', method: 'post', route: '/submit-quiz/3', action: 'quiz_passed',
-    body: { answers: [{ questionId: 7, selectedOptions: [0] }] }, responses: [rows(course), rows(question), rows(), rows()] },
+    body: { contentRevision:1, answers: [{ questionId: 7, selectedOptions: [0] }] }, responses: [rows(course), rows(question), rows({...record,user_id:1,status:'in_progress'}), rows()] },
   { name: 'failed quiz', method: 'post', route: '/submit-quiz/3', action: 'quiz_failed',
-    body: { answers: [{ questionId: 7, selectedOptions: [1] }] }, responses: [rows(course), rows(question), rows(), rows()] },
+    body: { contentRevision:1, answers: [{ questionId: 7, selectedOptions: [1] }] }, responses: [rows(course), rows(question), rows({...record,user_id:1,status:'in_progress'}), rows()] },
   { name: 'verify training', method: 'post', route: '/verify/12', action: 'training_verified',
     body: { notes: 'Owned test verification' }, responses: [rows({ user_id: 2 }), rows(record), rows()] },
 ] as const;

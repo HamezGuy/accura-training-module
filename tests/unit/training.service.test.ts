@@ -33,6 +33,7 @@ jest.mock('../../src/services/certificate.service', () => ({
 describe('TrainingService', () => {
   beforeEach(() => {
     mockQuery.mockReset();
+    mockQuery.mockResolvedValue({rows:[]});
     mockQueryOne.mockReset();
     mockTransaction.mockReset();
     mockTargets.mockReset(); mockDirectory.mockReset(); mockRevalidate.mockReset();
@@ -133,8 +134,8 @@ describe('TrainingService', () => {
 
     it('should throw 409 if training already completed', async () => {
       mockQueryOne
-        .mockResolvedValueOnce({ id: 1, courseCode: 'GCP-101', active: true })
-        .mockResolvedValueOnce({ id: 10, userId: 1, courseId: 1, status: 'completed' });
+        .mockResolvedValueOnce({ id: 1, courseCode: 'GCP-101', active: true, version:'1', contentRevision:1 })
+        .mockResolvedValueOnce({ id: 10, userId: 1, courseId: 1, status: 'completed', courseVersion:'1', contentRevision:1 });
 
       await expect(trainingService.startTraining(1, 1)).rejects.toMatchObject({
         statusCode: 409,
@@ -143,7 +144,7 @@ describe('TrainingService', () => {
 
     it('should create new record if none exists', async () => {
       mockQueryOne
-        .mockResolvedValueOnce({ id: 1, courseCode: 'GCP-101', active: true })
+        .mockResolvedValueOnce({ id: 1, courseCode: 'GCP-101', active: true, version:'1', contentRevision:1 })
         .mockResolvedValueOnce(null)
         .mockResolvedValueOnce({ id: 10, userId: 1, courseId: 1, status: 'in_progress', startedAt: new Date() });
 
@@ -173,7 +174,7 @@ describe('TrainingService', () => {
     });
 
     it('should grade quiz correctly and return result via transaction', async () => {
-      mockQueryOne.mockResolvedValue({ id: 1, courseCode: 'GCP-101', passingScore: 80, validityPeriodDays: 365 });
+      mockQueryOne.mockResolvedValueOnce({ id: 1, courseCode: 'GCP-101', passingScore: 80, validityPeriodDays: 365, version:'1', contentRevision:1 }).mockResolvedValueOnce({id:10,status:'in_progress',courseVersion:'1',contentRevision:1});
       mockQuery.mockResolvedValue({
         rows: [
           { id: 1, courseId: 1, options: [{ text: 'A', isCorrect: true }, { text: 'B', isCorrect: false }], questionType: 'multiple_choice', questionText: 'Q1', orderIndex: 1 },
@@ -182,22 +183,10 @@ describe('TrainingService', () => {
         rowCount: 2,
       });
 
-      const mockTxResult = {
-        passed: true,
-        score: 100,
-        totalQuestions: 2,
-        correctAnswers: 2,
-        certificateNumber: 'AT-CERT-GCP-101-1-TEST123-ABC456',
-        expirationDate: '2027-05-04T00:00:00.000Z',
-      };
-      mockTransaction.mockImplementation(async (_fn: Function) => {
-        return mockTxResult;
-      });
-
       const result = await trainingService.submitQuiz(1, 1, [
         { questionId: 1, selectedOptions: [0] },
         { questionId: 2, selectedOptions: [0] },
-      ]);
+      ], undefined, 1);
 
       expect(result.passed).toBe(true);
       expect(result.score).toBe(100);

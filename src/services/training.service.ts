@@ -230,9 +230,12 @@ export async function getUserRecords(userId: number, authority: TrainingAuthorit
   return records;
 }
 
-export async function startTraining(userId: number, courseId: number, client: TransactionClient = database): Promise<TrainingRecord> {
+export async function startTraining(userId: number, courseId: number, client?: TransactionClient, expectedRevision?: number): Promise<TrainingRecord> {
+  if (!client) return transaction(tx => startTraining(userId, courseId, tx, expectedRevision));
+  requireUserId(userId);
+  requireUserId(courseId);
   const course = await client.queryOne<TrainingCourse>(
-    'SELECT * FROM acc_training_courses WHERE id = $1 AND active = true',
+    'SELECT * FROM acc_training_courses WHERE id = $1 AND active = true FOR SHARE',
     [courseId]
   );
 
@@ -240,31 +243,54 @@ export async function startTraining(userId: number, courseId: number, client: Tr
     throw Object.assign(new Error('Course not found or inactive'), { statusCode: 404 });
   }
 
+  if (!Number.isSafeInteger(course.contentRevision) || Number(course.contentRevision) < 1) {
+    throw Object.assign(new Error('Training content revision is unavailable'), { statusCode: 409 });
+  }
+  if (expectedRevision !== undefined && expectedRevision !== course.contentRevision) {
+    throw Object.assign(new Error('Training content changed; reload it before starting'), { statusCode: 409 });
+  }
+  await client.query('SELECT pg_advisory_xact_lock($1::integer, $2::integer)', [userId, courseId]);
+
   const existing = await client.queryOne<TrainingRecord>(
-    'SELECT * FROM acc_training_records WHERE user_id = $1 AND course_id = $2',
+    'SELECT * FROM acc_training_records WHERE user_id = $1 AND course_id = $2 FOR UPDATE',
     [userId, courseId]
   );
 
-  if (existing && existing.status === 'completed') {
+  const current = existing?.contentRevision === course.contentRevision && existing?.courseVersion === course.version;
+  const expired = existing?.expirationDate != null && Date.parse(existing.expirationDate) <= Date.now();
+  if (existing && existing.status === 'completed' && current && !expired) {
     throw Object.assign(new Error('Training already completed'), { statusCode: 409 });
   }
 
+  if (existing?.status === 'in_progress' && current) return existing;
+  const {rows: slides} = await client.query<SlideContent>(
+    'SELECT * FROM acc_training_slides WHERE course_id = $1 ORDER BY order_index, id', [courseId]);
+  const {rows: questions} = await client.query<TrainingQuizQuestion>(
+    'SELECT * FROM acc_training_questions WHERE course_id = $1 AND active = true ORDER BY order_index, id', [courseId]);
+  const snapshot = JSON.stringify({ course, slides, questions });
+
   if (existing) {
+    await client.query(
+      `INSERT INTO acc_training_record_history (record_id, user_id, course_id, record_snapshot)
+       VALUES ($1, $2, $3, $4::jsonb)`, [existing.id, userId, courseId, JSON.stringify(existing)]);
     const updated = await client.queryOne<TrainingRecord>(
       `UPDATE acc_training_records 
-       SET status = 'in_progress', started_at = COALESCE(started_at, NOW()), updated_at = NOW()
+       SET status = 'in_progress', started_at = NOW(), updated_at = NOW(),
+           course_version = $2, content_revision = $3, content_snapshot = $4::jsonb,
+           completed_at = NULL, score = NULL, attempts = 0, certificate_number = NULL,
+           expiration_date = NULL, verified_by = NULL, verified_at = NULL, notes = NULL
        WHERE id = $1 RETURNING *`,
-      [existing.id]
+      [existing.id, course.version, course.contentRevision, snapshot]
     );
     if (!updated) throw new Error('Failed to update record');
     return updated;
   }
 
   const record = await client.queryOne<TrainingRecord>(
-    `INSERT INTO acc_training_records (user_id, course_id, status, started_at)
-     VALUES ($1, $2, 'in_progress', NOW())
+    `INSERT INTO acc_training_records (user_id, course_id, status, started_at, course_version, content_revision, content_snapshot)
+     VALUES ($1, $2, 'in_progress', NOW(), $3, $4, $5::jsonb)
      RETURNING *`,
-    [userId, courseId]
+    [userId, courseId, course.version, course.contentRevision, snapshot]
   );
 
   if (!record) throw new Error('Failed to create training record');
@@ -275,10 +301,12 @@ export async function submitQuiz(
   userId: number,
   courseId: number,
   answers: TrainingQuizAnswer[],
-  client?: TransactionClient
+  client?: TransactionClient,
+  expectedRevision?: number
 ): Promise<TrainingQuizResult> {
+  if (!client) return transaction(tx => submitQuiz(userId, courseId, answers, tx, expectedRevision));
   const course = await (client ?? database).queryOne<TrainingCourse>(
-    'SELECT * FROM acc_training_courses WHERE id = $1',
+    'SELECT * FROM acc_training_courses WHERE id = $1 AND active = true FOR SHARE',
     [courseId]
   );
 
@@ -327,6 +355,12 @@ export async function submitQuiz(
       [userId, courseId]
     );
 
+    if (!record || record.status !== 'in_progress' || !Number.isSafeInteger(course.contentRevision)
+        || expectedRevision !== course.contentRevision
+        || record.contentRevision !== course.contentRevision || record.courseVersion !== course.version) {
+      throw Object.assign(new Error('Start or restart the current training content before submitting this quiz'), { statusCode: 409 });
+    }
+
     let certificateNumber: string | undefined;
     let expirationDate: string | undefined;
 
@@ -335,38 +369,15 @@ export async function submitQuiz(
       const expDate = calculateExpirationDate(course.validityPeriodDays);
       expirationDate = expDate.toISOString();
 
-      if (record) {
-        await client.query(
-          `UPDATE acc_training_records 
-           SET status = 'completed', score = $1, attempts = attempts + 1,
-               completed_at = NOW(), certificate_number = $2, expiration_date = $3, updated_at = NOW()
-           WHERE id = $4`,
-          [score, certificateNumber, expDate, record.id]
-        );
-      } else {
-        await client.query(
-          `INSERT INTO acc_training_records 
-           (user_id, course_id, status, started_at, completed_at, score, attempts, certificate_number, expiration_date)
-           VALUES ($1, $2, 'completed', NOW(), NOW(), $3, 1, $4, $5)`,
-          [userId, courseId, score, certificateNumber, expDate]
-        );
-      }
+      await client.query(
+        `UPDATE acc_training_records
+         SET status = 'completed', score = $1, attempts = attempts + 1,
+             completed_at = NOW(), certificate_number = $2, expiration_date = $3, updated_at = NOW()
+         WHERE id = $4`, [score, certificateNumber, expDate, record.id]);
     } else {
-      if (record) {
-        await client.query(
-          `UPDATE acc_training_records 
-           SET score = $1, attempts = attempts + 1, updated_at = NOW()
-           WHERE id = $2`,
-          [score, record.id]
-        );
-      } else {
-        await client.query(
-          `INSERT INTO acc_training_records 
-           (user_id, course_id, status, started_at, score, attempts)
-           VALUES ($1, $2, 'in_progress', NOW(), $3, 1)`,
-          [userId, courseId, score]
-        );
-      }
+      await client.query(
+        `UPDATE acc_training_records SET score = $1, attempts = attempts + 1, updated_at = NOW()
+         WHERE id = $2`, [score, record.id]);
     }
 
     return {
@@ -379,7 +390,7 @@ export async function submitQuiz(
     } satisfies TrainingQuizResult;
   };
 
-  return client ? updateRecord(client) : transaction(updateRecord);
+  return updateRecord(client);
 }
 
 export async function verifyTraining(
@@ -475,6 +486,9 @@ export async function getComplianceStatus(authority: TrainingAuthorityContext, o
     for (const course of requiredCourses) {
       const record = byCourse.get(course.id);
       if (!record) continue;
+      // An old, unbound or changed-content completion cannot satisfy today's requirement.
+      if (!Number.isSafeInteger(course.contentRevision) || Number(course.contentRevision) < 1
+          || record.contentRevision !== course.contentRevision || record.courseVersion !== course.version) continue;
       const expiration = record.expirationDate ? new Date(record.expirationDate).getTime() : null;
       if (expiration !== null && !Number.isFinite(expiration)) {
         throw Object.assign(new Error('Invalid training expiration date'), { statusCode: 409 });
@@ -621,15 +635,16 @@ export interface CourseContentResponse {
   questions: TrainingQuizQuestion[];
 }
 
-export async function getCourseContent(courseId: number): Promise<CourseContentResponse | null> {
-  const course = await queryOne<TrainingCourse>(
-    'SELECT * FROM acc_training_courses WHERE id = $1 AND active = true',
+export async function getCourseContent(courseId: number, client?: TransactionClient): Promise<CourseContentResponse | null> {
+  if (!client) return transaction(tx => getCourseContent(courseId, tx));
+  const course = await client.queryOne<TrainingCourse>(
+    'SELECT * FROM acc_training_courses WHERE id = $1 AND active = true FOR SHARE',
     [courseId]
   );
 
   if (!course) return null;
 
-  const { rows: slides } = await query<SlideContent>(
+  const { rows: slides } = await client.query<SlideContent>(
     `SELECT id, course_id, title, content, slide_type, order_index, media_url, interactive_config
      FROM acc_training_slides
      WHERE course_id = $1
@@ -637,7 +652,7 @@ export async function getCourseContent(courseId: number): Promise<CourseContentR
     [courseId]
   );
 
-  const { rows: questions } = await query<TrainingQuizQuestion>(
+  const { rows: questions } = await client.query<TrainingQuizQuestion>(
     `SELECT id, course_id, question_text, question_type, options, explanation, order_index
      FROM acc_training_questions
      WHERE course_id = $1 AND active = true
@@ -654,4 +669,12 @@ export async function getCourseContent(courseId: number): Promise<CourseContentR
   }));
 
   return { course, slides, questions: safeQuestions };
+}
+
+/** Historical evidence is separate from the current user/course attempt. */
+export async function getMyRecordHistory(userId: number): Promise<Array<{historyId: number; archivedAt: string; record: TrainingRecord}>> {
+  requireUserId(userId);
+  const {rows} = await query<{historyId: number; archivedAt: string; record: TrainingRecord}>(
+    'SELECT history_id, archived_at, record_snapshot AS record FROM acc_training_record_history WHERE user_id = $1 ORDER BY archived_at DESC, history_id DESC', [userId]);
+  return rows;
 }

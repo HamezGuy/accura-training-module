@@ -105,8 +105,8 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
       (course_id, question_text, question_type, options, order_index) VALUES ($1, 'Owned fixture?', 'true_false', $2, 0) RETURNING id`, [courseId, JSON.stringify(options)]);
     questionId = question.rows[0].id;
     const record = await fixturePool.query(`INSERT INTO acc_training_records
-      (user_id, course_id, status, score, attempts, completed_at, expiration_date)
-      VALUES (222, $1, 'completed', 100, 1, NOW(), NOW() + INTERVAL '1 day') RETURNING id`, [courseId]);
+      (user_id, course_id, status, score, attempts, completed_at, expiration_date,course_version,content_revision)
+      VALUES (222, $1, 'completed', 100, 1, NOW(), NOW() + INTERVAL '1 day','1',(SELECT content_revision FROM acc_training_courses WHERE id=$1)) RETURNING id`, [courseId]);
     recordId = record.rows[0].id;
     // Native fixtures and producer use a distinct pool. Every query issued by
     // training (including its transaction connections) must remain local-owned.
@@ -151,17 +151,25 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
       : kind === 'questions' ? client.post(`/api/training/courses/${courseId}/questions`).send({ questions: [{ questionText: 'Second owned question', questionType: 'true_false', options, orderIndex: 1 }] })
       : kind === 'start' ? client.post(`/api/training/start/${courseId}`).send({})
       : kind === 'verify' ? client.post(`/api/training/verify/${recordId}`).send({ notes: 'Owned verification note' })
-      : client.post(`/api/training/submit-quiz/${courseId}`).send({ answers: [{ questionId, selectedOptions: [kind === 'quiz-pass' ? 0 : 1] }] });
+      : client.post(`/api/training/submit-quiz/${courseId}`).send({ contentRevision:2, answers: [{ questionId, selectedOptions: [kind === 'quiz-pass' ? 0 : 1] }] });
     return pending.set('Authorization', `Bearer ${token}`);
   }
 
+  async function prepareQuiz(kind: string) {
+    if (!kind.startsWith('quiz-')) return;
+    const response = await request(app).post(`/api/training/start/${courseId}`).set('Authorization',`Bearer ${token}`).send({});
+    expect(response.status).toBe(200);
+    await fixturePool.query('DELETE FROM acc_training_audit_log'); // isolate action under test
+  }
   test.each(cases)('%s leaves all business and audit rows unchanged when PostgreSQL rejects the audit insert', async kind => {
+    await prepareQuiz(kind);
     await refuseAudit(); const before = await snapshot();
     const response = await send(kind);
     expect(response.status).toBe(500); expect(response.body.success).toBe(false);
     expect(await snapshot()).toEqual(before);
   });
   test.each(cases)('%s commits the native rows and actor-bound audit together', async kind => {
+    await prepareQuiz(kind);
     const before = await snapshot(), response = await send(kind);
     expect(response.status).toBeLessThan(300); expect(response.body.success).toBe(true);
     expect(await snapshot()).not.toEqual(before);
@@ -350,6 +358,61 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
     const restored = await request(app).get('/api/training/user/222/records').set('Authorization', `Bearer ${token}`);
     expect(restored.status).toBe(200); expect(restored.body.data[0].id).toBe(recordId);
     expect(await snapshot()).toEqual(before);
+  });
+
+  test('material changes invalidate completion; retraining archives the exact certificate and content', async () => {
+    const start = await request(app).post(`/api/training/start/${courseId}`).set('Authorization',`Bearer ${token}`).send({});
+    expect(start.status).toBe(200); const revision = start.body.data.contentRevision;
+    expect(start.body.data).not.toHaveProperty('contentSnapshot');
+    const complete = await send('quiz-pass'); expect(complete.status).toBe(200);
+    const old = (await fixturePool.query('SELECT * FROM acc_training_records WHERE user_id=111')).rows[0];
+    expect(old.content_snapshot.questions).toHaveLength(1);
+    await fixturePool.query('UPDATE acc_training_questions SET question_text=$1 WHERE id=$2',['Changed material',questionId]);
+    const current = (await fixturePool.query('SELECT content_revision FROM acc_training_courses WHERE id=$1',[courseId])).rows[0];
+    expect(current.content_revision).toBe(revision+1);
+    const compliance = await request(app).get('/api/training/compliance?userId=111').set('Authorization',`Bearer ${token}`);
+    expect(compliance.body.data[0]).toMatchObject({completed:0,pending:1,isCompliant:false});
+    expect((await request(app).post(`/api/training/start/${courseId}`).set('Authorization',`Bearer ${token}`).send({contentRevision:revision})).status).toBe(409);
+    const restart = await request(app).post(`/api/training/start/${courseId}`).set('Authorization',`Bearer ${token}`).send({contentRevision:current.content_revision});
+    expect(restart.status).toBe(200); expect(restart.body.data.certificateNumber).toBeNull();
+    const history = (await fixturePool.query('SELECT record_snapshot FROM acc_training_record_history WHERE user_id=111')).rows;
+    expect(history).toHaveLength(1);
+    expect(history[0].record_snapshot.certificateNumber).toBe(old.certificate_number);
+    expect(history[0].record_snapshot.contentSnapshot.questions[0].questionText).toBe('Owned fixture?');
+    const response = await request(app).get('/api/training/my-record-history').set('Authorization',`Bearer ${token}`);
+    expect(response.status).toBe(200); expect(response.body.data[0].record).not.toHaveProperty('contentSnapshot');
+    expect(JSON.stringify(response.body)).not.toContain('isCorrect');
+  });
+  test('a revision changed during an attempt rejects its quiz before completion', async () => {
+    await prepareQuiz('quiz-pass');
+    await fixturePool.query('INSERT INTO acc_training_slides(course_id,title,content) VALUES($1,$2,$3)',[courseId,'New procedure','Updated content']);
+    expect((await send('quiz-pass')).status).toBe(409);
+    const record = (await fixturePool.query('SELECT status,certificate_number FROM acc_training_records WHERE user_id=111')).rows[0];
+    expect(record).toEqual({status:'in_progress',certificate_number:null});
+  });
+  test('failed retraining audit rolls back archival and reset together', async () => {
+    await prepareQuiz('quiz-pass'); expect((await send('quiz-pass')).status).toBe(200);
+    await fixturePool.query("UPDATE acc_training_courses SET version='2' WHERE id=$1",[courseId]);
+    const previous=(await fixturePool.query('SELECT * FROM acc_training_records WHERE user_id=111')).rows[0];
+    await refuseAudit(); expect((await send('start')).status).toBe(500);
+    expect((await fixturePool.query('SELECT * FROM acc_training_records WHERE user_id=111')).rows[0]).toEqual(previous);
+    expect((await fixturePool.query('SELECT * FROM acc_training_record_history')).rows).toHaveLength(0);
+  });
+
+  test('an older tab cannot submit after another tab starts the new revision', async () => {
+    await prepareQuiz('quiz-pass');
+    await fixturePool.query("UPDATE acc_training_questions SET question_text='Updated question' WHERE id=$1",[questionId]);
+    expect((await send('start')).status).toBe(200); // second tab binds current revision
+    expect((await send('quiz-pass')).status).toBe(409); // first tab still sends revision 2
+    expect((await fixturePool.query('SELECT status FROM acc_training_records WHERE user_id=111')).rows[0].status).toBe('in_progress');
+  });
+
+  test('concurrent startup migrations and course writes cannot bypass revision protection', async () => {
+    const before=(await fixturePool.query('SELECT content_revision FROM acc_training_courses WHERE id=$1',[courseId])).rows[0].content_revision;
+    await Promise.all([runMigrations(),runMigrations(),(async()=>{
+      for(let i=0;i<12;i++) await fixturePool.query('UPDATE acc_training_courses SET description=$1 WHERE id=$2',[`Concurrent material ${i}`,courseId]);
+    })()]);
+    expect((await fixturePool.query('SELECT content_revision FROM acc_training_courses WHERE id=$1',[courseId])).rows[0].content_revision).toBe(before+12);
   });
 
 });

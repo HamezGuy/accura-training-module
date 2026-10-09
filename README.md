@@ -115,3 +115,36 @@ The guard refuses a remote host, a nonmatching database name, URL parameters, or
 Startup runs the additive audit migration before listening. The atomic migration allows a null audit actor only for `training_expired` events carrying the scheduled-expiration actor marker and affected user ID; interactive actions still require a user ID. It is safe to run again. Scheduled events remain visible in the existing audit table.
 
 For recovery, retain the audit rows and the nullable column with its restrictive CHECK. Do not delete system events or restore NOT NULL over them when rolling application code back. Prefer a forward repair of the transactional audit path; old code that swallows audit insert errors does not provide atomic evidence.
+
+## Revision-bound learner workflow
+
+EDC now exposes an authenticated `/training` learner screen and an allowlisted
+`/api/training` integration. Set `TRAINING_SERVICE_URL` on the EDC API to this
+service's root (HTTPS, or HTTP on loopback); keep this service's `ACCURA_API_URL`
+pointing to the native EDC authority. An absent/unreachable service is reported
+as unavailable, never as successful completion or an invented compliance rate.
+No deployment configuration is changed automatically.
+
+Course content receives a database revision. Course material changes, quiz
+changes, and slide changes increment it. Start accepts the viewed revision;
+quiz submission requires `contentRevision` and refuses a stale revision even
+when another browser tab has restarted the current attempt. Completion binds
+both the version and revision and retains an internal content snapshot. Learner
+responses never include the snapshot's correct answers. Retraining archives the
+previous record (including certificate and verification) before resetting the
+current attempt, in the same transaction as its actor audit. History remains
+available through `/my-record-history`.
+
+Existing completion records retain NULL version/revision pins. They cannot be
+claimed as completion of today's material and appear as needing retraining;
+no historical evidence is fabricated during migration. Plan that operational
+retraining before rollout. Migration trigger replacement and schema changes run
+in one transaction under an advisory lock. Keep the new columns, snapshots,
+history and triggers if reverting application code; prefer a forward repair.
+Old quiz clients must send the required revision field before rollout.
+
+The compliance percentage is completed current required courses divided by
+required courses across the authorized user census. An empty census or zero
+requirements is unavailable/not applicable, not 100%. The training features and
+tests do not establish protocol-specific curriculum approval, verified learner
+identity in a deployed environment, or clinical training qualification.
