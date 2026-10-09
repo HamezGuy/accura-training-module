@@ -262,6 +262,9 @@ export async function getComplianceStatus(req: AuthRequest, res: Response): Prom
     compliancePercentage: s.compliancePercentage,
     isCompliant: s.isCompliant,
     missingCourses: s.missingCourses,
+    totalObligations: s.totalObligations,
+    completedObligations: s.completedObligations,
+    overdueObligations: s.overdueObligations,
   }));
 
   res.json({ success: true, data: dto });

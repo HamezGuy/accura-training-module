@@ -22,7 +22,7 @@ jest.mock('../../src/config/logger', () => ({ logger: { error: jest.fn(), info: 
 
 const course = { id: 3, course_code: 'OWNED-AUDIT', course_name: 'Audit fixture', version: '1', content_revision:1, active: true,
   passing_score: 80, required_for_roles: ['admin'], validity_period_days: 365 };
-const record = { id: 12, user_id: 2, course_id: 3, status: 'completed',course_version:'1',content_revision:1 };
+const record = { id: 12, user_id: 2, course_id: 3, status: 'completed',course_version:'1',content_revision:1,expiration_date:null };
 const question = { id: 7, course_id: 3, question_text: 'Fixture?', question_type: 'true_false',
   options: [{ text: 'yes', isCorrect: true }, { text: 'no', isCorrect: false }], order_index: 0 };
 const rows = (...values: Record<string, unknown>[]) => ({ rows: values, rowCount: values.length });
@@ -40,7 +40,7 @@ const cases = [
   { name: 'failed quiz', method: 'post', route: '/submit-quiz/3', action: 'quiz_failed',
     body: { contentRevision:1, answers: [{ questionId: 7, selectedOptions: [1] }] }, responses: [rows(course), rows(question), rows({...record,user_id:1,status:'in_progress'}), rows()] },
   { name: 'verify training', method: 'post', route: '/verify/12', action: 'training_verified',
-    body: { notes: 'Owned test verification' }, responses: [rows({ user_id: 2 }), rows(record), rows()] },
+    body: { notes: 'Owned test verification' }, responses: [rows({ user_id: 2,course_id:3 }),rows(course), rows(record), rows()] },
 ] as const;
 
 describe('training mutation and audit share the real database transaction boundary', () => {

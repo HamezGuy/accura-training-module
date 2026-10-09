@@ -1,6 +1,7 @@
 import { getRoleByName, ROLES } from '@accura-trial/auth-core';
 import { config } from '../config/environment';
 import type { ReadableStreamDefaultReader } from 'node:stream/web';
+import type { TrainingObligationScope } from '../types/training.types';
 
 /** Request-local native credentials; never persist or serialize this context. */
 export interface TrainingAuthorityContext {
@@ -116,6 +117,7 @@ export class TrainingAuthorityTransport {
           code === 'PASSWORD_EXPIRED' ? 'Password expired. Change your password before continuing.' : 'Authentication or training access refused by the account authority', code);
         if (response.status === 404 && code === 'TRAINING_AUTHORITY_STUDY_NOT_FOUND') fail(404, 'Study not found for training compliance', code);
         if (response.status === 409 && code === 'TRAINING_AUTHORITY_ROLE_INVALID') fail(409, 'Unknown native platform role for training compliance', code);
+        if (response.status === 409 && code === 'TRAINING_AUTHORITY_SCOPE_INVALID') fail(409, 'The study, site or arm is no longer an active native scope', code);
         if (response.status === 409 && ['TRAINING_AUTHORITY_SCOPE_CHANGED', 'TRAINING_AUTHORITY_SELECTION_CHANGED'].includes(code)) {
           fail(409, 'Training authority changed during the request; retry the report', code);
         }
@@ -144,6 +146,21 @@ export class TrainingAuthorityTransport {
 }
 
 const transport = new TrainingAuthorityTransport(config.authority);
+
+export interface ObligationScopeObservation {
+  scope: TrainingObligationScope; userId: number; eligible: boolean; roles: string[]; observationHash: string; scopeFingerprint: string;
+}
+export async function resolveObligationScope(context: TrainingAuthorityContext, action: 'obligations:read' | 'obligations:manage' | 'obligations:withdraw',
+  userId: number, scope: TrainingObligationScope, expected?: ObligationScopeObservation): Promise<ObligationScopeObservation> {
+  const data = await transport.resolve(context, { op: 'obligation', action, userId, scope,
+    ...(expected ? { expectedScopeFingerprint: expected.scopeFingerprint } : {}) });
+  if (data.complete !== true || data.userId !== userId || !isRecord(data.scope) || !same(data.scope, scope)
+    || typeof data.eligible !== 'boolean' || !Array.isArray(data.roles) || data.roles.some(role => typeof role !== 'string' || getRoleByName(role).name !== role || role === ROLES.INVALID.name)
+    || typeof data.observationHash !== 'string' || !HASH.test(data.observationHash)) invalid();
+  const result = data as unknown as ObligationScopeObservation;
+  if (expected && expected.observationHash !== result.observationHash) fail(409, 'Learner scope changed during the operation; refresh before retrying', 'TRAINING_AUTHORITY_SELECTION_CHANGED');
+  return result;
+}
 
 export async function readTrainingDirectory(context: TrainingAuthorityContext, requestedFilter: TrainingDirectoryFilter = {}): Promise<TrainingDirectory> {
   const filter = filterValue(requestedFilter);

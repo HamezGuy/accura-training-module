@@ -1,3 +1,4 @@
+jest.mock('../../src/services/training-obligations.service',()=>({getObligations:jest.fn(async()=>[])}));
 import { getUserRecords, getComplianceStatus, getExpiringTraining, verifyTraining } from '../../src/services/training.service';
 const mockQuery = jest.fn(), mockQueryOne = jest.fn(), mockTargets = jest.fn(), mockDirectory = jest.fn(), mockRevalidate = jest.fn();
 jest.mock('../../src/config/database', () => ({ query: (...args: unknown[]) => mockQuery(...args), queryOne: (...args: unknown[]) => mockQueryOne(...args),
@@ -65,15 +66,15 @@ test('foreign sign-off is refused before locking or updating', async () => {
   expect(client.queryOne).toHaveBeenCalledTimes(1); expect(client.queryOne.mock.calls[0][0]).not.toContain('FOR UPDATE'); expect(client.query).not.toHaveBeenCalled();
 });
 test('sign-off pins locked owner and rechecks before local mutation', async () => {
-  const client = { queryOne: jest.fn().mockResolvedValueOnce({ userId: 8 }).mockResolvedValueOnce({ id: 80, userId: 8, status: 'completed' }),
+  const client = { queryOne: jest.fn().mockResolvedValueOnce({ userId: 8,courseId:3 }).mockResolvedValueOnce({version:'1',contentRevision:1}).mockResolvedValueOnce({ id: 80, userId: 8, status: 'completed',courseVersion:'1',contentRevision:1,expirationDate:null }),
     query: jest.fn().mockResolvedValue({ rows: [], rowCount: 1 }) };
   expect(await verifyTraining(80, authority, 'reviewed', client)).toEqual({ verified: true });
-  expect(client.queryOne.mock.calls[1]).toEqual([expect.stringContaining('r.user_id = $2 FOR UPDATE'), [80, 8]]);
+  expect(client.queryOne.mock.calls[2]).toEqual([expect.stringContaining('r.user_id = $2 FOR UPDATE'), [80, 8]]);
   expect(mockTargets).toHaveBeenCalledTimes(3); expect(client.query).toHaveBeenCalledWith(expect.stringContaining('UPDATE acc_training_records'), [7, 'reviewed', 80]);
   expect(mockQuery).not.toHaveBeenCalled(); expect(mockQueryOne).not.toHaveBeenCalled();
 });
 test('target revoked after locking cannot be updated', async () => {
-  const client = { queryOne: jest.fn().mockResolvedValueOnce({ userId: 8 }).mockResolvedValueOnce({ id: 80, userId: 8, status: 'completed' }), query: jest.fn() };
+  const client = { queryOne: jest.fn().mockResolvedValueOnce({ userId: 8,courseId:3 }).mockResolvedValueOnce({version:'1',contentRevision:1}).mockResolvedValueOnce({ id: 80, userId: 8, status: 'completed',courseVersion:'1',contentRevision:1,expirationDate:null }), query: jest.fn() };
   mockTargets.mockResolvedValueOnce({ scopeFingerprint: scope, decisions: [] })
     .mockResolvedValueOnce({ scopeFingerprint: scope, decisions: [{ userId: 8, allowed: true }] })
     .mockResolvedValueOnce({ scopeFingerprint: scope, decisions: [{ userId: 8, allowed: false }] });

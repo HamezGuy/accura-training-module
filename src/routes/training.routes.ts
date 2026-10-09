@@ -5,6 +5,8 @@ import { authorize } from '../middleware/authorization.middleware';
 import { validate } from '../middleware/validation.middleware';
 import { asyncHandler } from '../middleware/errorHandler.middleware';
 import * as controller from '../controllers/training.controller';
+import * as obligations from '../services/training-obligations.service';
+import { exactPositiveId } from '../middleware/validation.middleware';
 
 const router = Router();
 
@@ -116,6 +118,31 @@ router.post(
 
 router.get('/my-records', asyncHandler<AuthRequest>(controller.getMyRecords));
 router.get('/my-record-history', asyncHandler<AuthRequest>(controller.getMyRecordHistory));
+
+const obligationSchema = Joi.object({
+  userId:Joi.number().integer().positive().strict().required(), courseId:Joi.number().integer().positive().strict().required(),
+  contentRevision:Joi.number().integer().positive().strict().required(), role:Joi.string().required(),
+  scope:Joi.object({studyId:Joi.number().integer().positive().strict().required(),siteId:Joi.number().integer().positive().strict(),armId:Joi.number().integer().positive().strict()}).required(),
+  dueAt:Joi.string().required(),reason:Joi.string().trim().min(1).max(2000).required(),
+});
+router.get('/obligations', authorize(['admin','data_manager','monitor'], req => req.query['userId'] ?? String(req.user!.userId)), asyncHandler<AuthRequest>(async (req,res) => {
+  const userId=exactPositiveId(req.query['userId'],'learner ID') ?? req.user!.userId;
+  res.json({success:true,data:await obligations.getObligations(req.trainingAuthority!,userId)});
+}));
+router.get('/obligation-history', authorize(['admin','data_manager','monitor'], req => req.query['userId'] ?? String(req.user!.userId)), asyncHandler<AuthRequest>(async (req,res) => {
+  const userId=exactPositiveId(req.query['userId'],'learner ID') ?? req.user!.userId;
+  res.json({success:true,data:await obligations.getObligationHistory(req.trainingAuthority!,userId)});
+}));
+router.post('/obligations',authorize(['admin','data_manager']),validate(obligationSchema),asyncHandler<AuthRequest>(async(req,res)=>{
+  res.status(201).json({success:true,data:await obligations.assignObligation(req.trainingAuthority!,req.body)});
+}));
+router.post('/obligations/:id/revise',authorize(['admin','data_manager']),validate(obligationSchema.append({expectedRevision:Joi.number().integer().positive().strict().required()})),asyncHandler<AuthRequest>(async(req,res)=>{
+  const {expectedRevision,...body}=req.body;
+  res.json({success:true,data:await obligations.assignObligation(req.trainingAuthority!,body,{id:exactPositiveId(req.params['id'],'obligation ID')!,expectedRevision})});
+}));
+router.post('/obligations/:id/withdraw',authorize(['admin','data_manager']),validate(Joi.object({expectedRevision:Joi.number().integer().positive().strict().required(),reason:Joi.string().trim().min(1).max(2000).required()})),asyncHandler<AuthRequest>(async(req,res)=>{
+  res.json({success:true,data:await obligations.withdrawObligation(req.trainingAuthority!,exactPositiveId(req.params['id'],'obligation ID')!,req.body.expectedRevision,req.body.reason)});
+}));
 
 router.get(
   '/user/:userId/records',

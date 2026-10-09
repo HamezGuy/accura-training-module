@@ -148,3 +148,66 @@ required courses across the authorized user census. An empty census or zero
 requirements is unavailable/not applicable, not 100%. The training features and
 tests do not establish protocol-specific curriculum approval, verified learner
 identity in a deployed environment, or clinical training qualification.
+# Study, site and arm obligations
+
+The existing Training page now supports explicit obligations in addition to global
+role courses. Managers select a native learner, parent study, optional exact site
+and optional native Arm group, current course, native scope role and due time.
+Assignments are checked by the EDC authority, persisted with their course version
+and content revision, and included in the existing compliance reports. Assignment
+is explicit per learner; it does not silently enroll every future member of a role.
+
+The selected site must be an active child of the selected active parent study.
+The learner must have the selected active native role at that exact site (or exact
+parent study when no site is specified). An arm is a native `study_group` in an
+active `study_group_class` of type `Arm` belonging to the parent study; arbitrary
+groups and arms from another study are refused. Native administrators or authorized
+data managers with membership at the exact scope can assign and revise training.
+Withdrawal permits a closed scope but still requires the same exact-scope management
+authority. Organization membership alone cannot remove another site's requirement.
+
+Native EDC has no staff-to-arm membership roster. Arm responsibility is therefore an
+explicit manager assignment to a verified study/site learner, with durable reason
+and history. It is not a claim that an independent arm roster was checked.
+
+An obligation is current only when the native scope remains valid, the course and
+completion match its exact revision, the certificate has not expired, and another
+authorized person has verified the completion. Course changes require revising the
+obligation and completing current training; original attempts and certificates
+remain archived. A previous verification cannot be overwritten. Due dates are
+evaluated on read, including pending, overdue, completion-after-due and
+verification-after-due indicators. The existing scheduled expiry job remains in
+use; this change does not send automatic reminders or contact staff.
+
+Managers can revise the course pin or due date with a reason, or withdraw an
+obligation with a reason. Learner, course and scope cannot be silently changed on
+an existing obligation. Changes require the expected revision and atomically write
+the obligation, append-only history and audit; concurrent or failed requests do
+not manufacture a successful assignment. Assignment and completion documentation
+can be exported from the page as JSON, including the selected learner's relevant
+audit history. Other learners' records and quiz answer keys are excluded.
+
+Deploy the matching EDC authority and training proxy changes before the training
+service/UI changes. The training service's existing startup migration runner adds
+the obligation tables and append-only history triggers; no shared EDC database
+tables, signing secrets or package dependency changes are required. Native accounts,
+organizations, study/site memberships, Arm groups and course materials must already
+be configured. An older or unavailable authority fails closed for scope readiness.
+
+Scope checks are current remote observations, not a distributed transaction with
+the training database. Reports do not prove every clinical duty has an assigned
+curriculum; the sponsor must approve and populate the study training plan and
+validate it in deployment. Independent review here uses the existing authenticated
+training verification workflow; it is not a new signature/re-authentication policy.
+This work does not activate clinical studies or enforce a clinical launch gate:
+the legacy `trainingGateMiddleware` has no runtime callers in the inspected EDC API.
+It does not by itself establish regulatory compliance or TA3 program performance.
+
+Focused qualification uses the actual training HTTP routes and native EDC authority
+source against disposable PostgreSQL. Run `npm test`, `npm run build`, and the
+opt-in `training-obligations.postgres.test.ts` with an explicitly owned empty
+loopback database named `training_obligation_test_*`,
+`TRAINING_OBLIGATION_TEST_DATABASE_URL`, `TRAINING_OBLIGATION_TEST_OWNED=yes`, and
+`TRAINING_NATIVE_AUTHORITY_ROOT` pointing at the matching primary EDC API checkout.
+The existing `training-audit-postgres.test.ts` uses its separately named empty
+`training_audit_test_*` database and documented `TRAINING_AUDIT_TEST_*` variables.

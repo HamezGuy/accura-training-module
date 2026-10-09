@@ -10,6 +10,9 @@ export type AuditAction =
   | 'quiz_failed'
   | 'training_verified'
   | 'training_expired'
+  | 'obligation_assigned'
+  | 'obligation_revised'
+  | 'obligation_withdrawn'
   | 'compliance_checked';
 
 interface AuditFields {

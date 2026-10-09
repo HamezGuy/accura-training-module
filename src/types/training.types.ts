@@ -122,6 +122,9 @@ export interface TrainingComplianceStatus {
   compliancePercentage: number;
   isCompliant: boolean;
   missingCourses: TrainingMissingCourse[];
+  totalObligations?: number;
+  completedObligations?: number;
+  overdueObligations?: number;
 }
 
 export interface TrainingMissingCourse {
@@ -143,4 +146,24 @@ export interface TrainingComplianceCheck {
   isCompliant: boolean;
   missingCount: number;
   expiredCount: number;
+}
+
+/** Native study/site/group IDs, never labels supplied as authorization evidence. */
+export interface TrainingObligationScope { studyId: number; siteId?: number; armId?: number }
+export interface TrainingObligationRequest {
+  userId: number; courseId: number; contentRevision: number; role: string;
+  scope: TrainingObligationScope; dueAt: string; reason: string;
+}
+export interface TrainingObligation {
+  id: number; userId: number; courseId: number; courseVersion: string; contentRevision: number;
+  role: string; scope: TrainingObligationScope; dueAt: string; reason: string;
+  revision: number; status: 'assigned' | 'withdrawn'; assignedBy: number; createdAt: string; updatedAt: string;
+  scopeObservation: unknown;
+}
+export interface TrainingObligationView extends TrainingObligation {
+  courseName: string; currentContentRevision: number;
+  readiness: 'withdrawn' | 'scope_changed' | 'scope_unavailable' | 'course_inactive' | 'retraining_required' | 'pending' | 'in_progress' | 'awaiting_verification' | 'complete';
+  overdue: boolean; recordId: number | null; certificateNumber: string | null;
+  completedLate: boolean; verifiedLate: boolean;
+  completedAt: string | null; verifiedAt: string | null; verifiedBy: number | null;
 }

@@ -147,6 +147,29 @@ const MIGRATIONS: string[] = [
   `DROP TRIGGER IF EXISTS acc_training_slide_revision_trigger ON acc_training_slides`,
   `CREATE TRIGGER acc_training_slide_revision_trigger AFTER INSERT OR UPDATE OR DELETE ON acc_training_slides
    FOR EACH ROW EXECUTE FUNCTION acc_training_material_revision()`,
+  `CREATE TABLE IF NOT EXISTS acc_training_obligations (
+    id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL CHECK(user_id>0),
+    course_id INTEGER NOT NULL REFERENCES acc_training_courses(id), course_version VARCHAR(20) NOT NULL,
+    content_revision INTEGER NOT NULL CHECK(content_revision>0), role TEXT NOT NULL,
+    scope JSONB NOT NULL, scope_observation JSONB NOT NULL, due_at TIMESTAMPTZ NOT NULL,
+    reason TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1 CHECK(revision>0),
+    status TEXT NOT NULL DEFAULT 'assigned' CHECK(status IN ('assigned','withdrawn')),
+    assigned_by INTEGER NOT NULL CHECK(assigned_by>0), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_training_obligation_scope ON acc_training_obligations
+    (user_id,course_id,scope,role) WHERE status='assigned'`,
+  `CREATE TABLE IF NOT EXISTS acc_training_obligation_events (
+    id BIGSERIAL PRIMARY KEY, obligation_id INTEGER NOT NULL REFERENCES acc_training_obligations(id),
+    revision INTEGER NOT NULL, actor_user_id INTEGER NOT NULL, action TEXT NOT NULL,
+    snapshot JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(obligation_id,revision))`,
+  `CREATE OR REPLACE FUNCTION acc_training_immutable_history() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN RAISE EXCEPTION 'Training history is append-only'; END; $$`,
+  `DROP TRIGGER IF EXISTS acc_training_obligation_history_guard ON acc_training_obligation_events`,
+  `CREATE TRIGGER acc_training_obligation_history_guard BEFORE UPDATE OR DELETE ON acc_training_obligation_events
+    FOR EACH ROW EXECUTE FUNCTION acc_training_immutable_history()`,
+  `DROP TRIGGER IF EXISTS acc_training_record_history_guard ON acc_training_record_history`,
+  `CREATE TRIGGER acc_training_record_history_guard BEFORE UPDATE OR DELETE ON acc_training_record_history
+    FOR EACH ROW EXECUTE FUNCTION acc_training_immutable_history()`,
 ];
 
 export async function runMigrations(): Promise<void> {

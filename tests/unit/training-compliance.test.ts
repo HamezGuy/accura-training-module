@@ -1,4 +1,6 @@
+jest.mock('../../src/services/training-obligations.service',()=>({getObligations:jest.fn(async()=>[])}));
 import { getComplianceStatus, getCourses, createCourse, updateCourse } from '../../src/services/training.service';
+import {getObligations} from '../../src/services/training-obligations.service';
 const mockQuery = jest.fn(), mockQueryOne = jest.fn();
 const mockDirectory = jest.fn(), mockRevalidate = jest.fn();
 const authority = { actorUserId: 7, accessToken: 'fixture-native-token' };
@@ -17,7 +19,16 @@ describe('native compliance identity and required-course census', () => {
     mockDirectory.mockResolvedValue({ users, filter: {}, scopeFingerprint: 'fixture-scope' });
     mockQuery.mockResolvedValueOnce({ rows: courses }).mockResolvedValueOnce({ rows: records });
   }
-  beforeEach(() => { mockQuery.mockReset(); mockQueryOne.mockReset(); mockDirectory.mockReset(); mockRevalidate.mockReset(); mockRevalidate.mockResolvedValue(undefined); });
+  beforeEach(() => { mockQuery.mockReset(); mockQueryOne.mockReset(); mockDirectory.mockReset(); mockRevalidate.mockReset(); mockRevalidate.mockResolvedValue(undefined); jest.mocked(getObligations).mockResolvedValue([]); });
+  test('complete role courses cannot hide a pending scoped obligation',async()=>{
+    fixture([user],[course(1)],[{courseId:1,status:'completed',courseVersion:'1',contentRevision:1}]);
+    jest.mocked(getObligations).mockResolvedValue([{status:'assigned',scope:{studyId:5},readiness:'awaiting_verification',overdue:true}] as any);
+    expect((await getComplianceStatus(authority,{userId:7}))[0]).toMatchObject({completed:1,totalObligations:1,completedObligations:0,overdueObligations:1,isCompliant:false,compliancePercentage:50});
+  });
+  test('withdrawn and unrelated-study obligations do not enter scoped requirement census',async()=>{
+    fixture([user],[],[]);jest.mocked(getObligations).mockResolvedValue([{status:'withdrawn',scope:{studyId:5}},{status:'assigned',scope:{studyId:6}}] as any);
+    expect((await getComplianceStatus(authority,{userId:7,studyId:5}))[0]).toMatchObject({totalObligations:0,isCompliant:true});
+  });
   test('optional, obsolete and same-code records cannot change a required ID census', async () => {
     fixture([user], [course(1), course(2)], [
       { courseId: 1, status: 'completed',courseVersion:'1',contentRevision:1, expirationDate: '2099-01-01' },

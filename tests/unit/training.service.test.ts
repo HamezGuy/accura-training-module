@@ -1,3 +1,4 @@
+jest.mock('../../src/services/training-obligations.service',()=>({getObligations:jest.fn(async()=>[])}));
 import * as trainingService from '../../src/services/training.service';
 
 const mockQuery = jest.fn();
@@ -220,7 +221,7 @@ describe('TrainingService', () => {
     });
 
     it('should verify completed training by another user', async () => {
-      mockQueryOne.mockResolvedValue({ id: 1, userId: 3, status: 'completed' });
+      mockQueryOne.mockResolvedValueOnce({userId:3,courseId:4}).mockResolvedValueOnce({version:'1',contentRevision:1}).mockResolvedValueOnce({ id: 1, userId: 3, status: 'completed',courseVersion:'1',contentRevision:1,expirationDate:null });
       mockQuery.mockResolvedValue({ rows: [], rowCount: 1 });
 
       const result = await trainingService.verifyTraining(1, authority, 'Verified during audit');

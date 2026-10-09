@@ -3,6 +3,7 @@ import { query, queryOne, transaction, TransactionClient } from '../config/datab
 import { logger } from '../config/logger';
 import { logAudit } from './audit.service';
 import { generateCertificateNumber, calculateExpirationDate } from './certificate.service';
+import { getObligations } from './training-obligations.service';
 import { authorizeTrainingTargets, readTrainingDirectory, revalidateTrainingDirectory, TrainingAuthorityContext } from './training-authority.service';
 import {
   TrainingCourse,
@@ -403,10 +404,11 @@ export async function verifyTraining(
     throw Object.assign(new Error('An exact positive training record ID is required'), { statusCode: 400 });
   }
   const admission = await authorizeTrainingTargets(authority, 'records:verify', []);
-  const owner = await client.queryOne<{ userId: number }>('SELECT user_id FROM acc_training_records WHERE id = $1', [recordId]);
+  const owner = await client.queryOne<{ userId: number; courseId: number }>('SELECT user_id,course_id FROM acc_training_records WHERE id = $1', [recordId]);
   if (!owner) throw Object.assign(new Error('Training record not found'), { statusCode: 404 });
   const initialTarget = await authorizeTrainingTargets(authority, 'records:verify', [owner.userId], { scopeFingerprint: admission.scopeFingerprint });
   if (!initialTarget.decisions[0].allowed) throw Object.assign(new Error('Training record not found'), { statusCode: 404 });
+  const course = await client.queryOne<TrainingCourse>('SELECT * FROM acc_training_courses WHERE id=$1 AND active=true FOR SHARE', [owner.courseId]);
   const record = await client.queryOne<TrainingRecord>(
     'SELECT r.* FROM acc_training_records r WHERE r.id = $1 AND r.user_id = $2 FOR UPDATE',
     [recordId, owner.userId]
@@ -428,6 +430,12 @@ export async function verifyTraining(
   if (record.userId === authority.actorUserId) {
     throw Object.assign(new Error('Cannot verify your own training'), { statusCode: 403 });
   }
+
+  if (!course || record.courseVersion !== course.version || record.contentRevision !== course.contentRevision
+    || record.expirationDate !== null && (!Number.isFinite(new Date(record.expirationDate).getTime()) || new Date(record.expirationDate).getTime() <= Date.now())) {
+    throw Object.assign(new Error('Only current, unexpired course completion can be verified'), {statusCode:409});
+  }
+  if (record.verifiedAt || record.verifiedBy) throw Object.assign(new Error('This completion has already been verified; its evidence cannot be overwritten'), {statusCode:409});
 
   await client.query(
     `UPDATE acc_training_records 
@@ -501,11 +509,16 @@ export async function getComplianceStatus(authority: TrainingAuthorityContext, o
       requiredBy: course.regulatoryReference ?? 'Organization Policy',
     }));
     const totalRequired = requiredCourses.length, completed = completedIds.size, expired = expiredIds.size;
+    const obligations = (await getObligations(authority, user.userId)).filter(row => row.status === 'assigned'
+      && (options?.studyId === undefined || row.scope.studyId === options.studyId || row.scope.siteId === options.studyId));
+    const completedObligations = obligations.filter(row => row.readiness === 'complete').length;
+    const allRequired = totalRequired + obligations.length;
     statuses.push({
       userId: user.userId, username: user.username, userFullName: `${user.firstName} ${user.lastName}`.trim(),
       role: role.name, totalRequired, completed, expired, pending: totalRequired - completed - expired,
-      compliancePercentage: totalRequired ? Math.round(completed / totalRequired * 100) : 100,
-      isCompliant: completed === totalRequired, missingCourses,
+      compliancePercentage: allRequired ? Math.round((completed + completedObligations) / allRequired * 100) : 100,
+      isCompliant: completed === totalRequired && completedObligations === obligations.length, missingCourses,
+      totalObligations: obligations.length, completedObligations, overdueObligations: obligations.filter(row => row.overdue).length,
     });
   }
 
@@ -586,7 +599,7 @@ export async function checkUserCompliance(userId: number, authority: TrainingAut
   return {
     userId,
     isCompliant: status.isCompliant,
-    missingCount: status.missingCourses.length,
+    missingCount: status.missingCourses.length + (status.totalObligations ?? 0) - (status.completedObligations ?? 0),
     expiredCount: status.expired,
   };
 }
