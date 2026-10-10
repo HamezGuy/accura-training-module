@@ -4,6 +4,7 @@ import * as trainingService from '../services/training.service';
 import { logAudit } from '../services/audit.service';
 import { transaction } from '../config/database';
 import { exactPositiveId } from '../middleware/validation.middleware';
+import { mapRecordToDto } from '../services/training-record-dto';
 import {
   TrainingCourse,
   TrainingRecord,
@@ -21,7 +22,7 @@ export async function getCourses(req: AuthRequest, res: Response): Promise<void>
   const activeOnly = req.query['activeOnly'] !== 'false';
   const role = req.query['role'] as string | undefined;
 
-  const courses = await trainingService.getCourses({ activeOnly, role });
+  const courses = await trainingService.getCourses({ activeOnly, role },req.trainingAuthority!);
 
   const dto: TrainingCourse[] = courses.map(mapCourseToDto);
 
@@ -32,7 +33,7 @@ export async function getCourseById(req: AuthRequest, res: Response): Promise<vo
   const courseId = parseInt(req.params['id'], 10);
   const includeQuestions = req.query['includeQuestions'] === 'true';
 
-  const course = await trainingService.getCourseById(courseId, includeQuestions);
+  const course = await trainingService.getCourseById(courseId, includeQuestions,undefined,req.trainingAuthority!);
 
   if (!course) {
     res.status(404).json({ success: false, message: 'Course not found' });
@@ -140,7 +141,7 @@ export async function startTraining(req: AuthRequest, res: Response): Promise<vo
   const courseId = parseInt(req.params['courseId'], 10);
 
   const record = await transaction(async (client) => {
-    const started = await trainingService.startTraining(userId, courseId, client, req.body?.contentRevision);
+    const started = await trainingService.startTraining(userId, courseId, client, req.body?.contentRevision,req.trainingAuthority!);
     await logAudit({
       userId,
       action: 'training_started',
@@ -162,7 +163,7 @@ export async function submitQuiz(req: AuthRequest, res: Response): Promise<void>
   const { answers } = req.body;
 
   const result = await transaction(async (client) => {
-    const submitted = await trainingService.submitQuiz(userId, courseId, answers, client, req.body.contentRevision);
+    const submitted = await trainingService.submitQuiz(userId, courseId, answers, client, req.body.contentRevision,req.trainingAuthority!);
     await logAudit({
       userId,
       action: submitted.passed ? 'quiz_passed' : 'quiz_failed',
@@ -214,7 +215,7 @@ export async function verifyTraining(req: AuthRequest, res: Response): Promise<v
 export async function getCourseContent(req: AuthRequest, res: Response): Promise<void> {
   const courseId = parseInt(req.params['id'], 10);
 
-  const content = await trainingService.getCourseContent(courseId);
+  const content = await trainingService.getCourseContent(courseId,undefined,req.trainingAuthority!);
 
   if (!content) {
     res.status(404).json({ success: false, message: 'Course not found' });
@@ -313,6 +314,8 @@ function mapCourseToDto(course: TrainingCourse): TrainingCourse {
     createdBy: course.createdBy,
     createdAt: course.createdAt,
     updatedAt: course.updatedAt,
+    materialScope:course.materialScope??null,
+    materialPublicationId:course.materialPublicationId??null,
     ...(course.questions ? { questions: course.questions.map(mapQuestionToDto) } : {}),
   };
 }
@@ -326,29 +329,6 @@ function mapQuestionToDto(q: TrainingQuizQuestion): TrainingQuizQuestion {
     options: q.options,
     explanation: q.explanation,
     orderIndex: q.orderIndex,
-  };
-}
-
-function mapRecordToDto(r: TrainingRecord): TrainingRecord {
-  return {
-    id: r.id,
-    userId: r.userId,
-    courseId: r.courseId,
-    courseName: r.courseName,
-    courseCode: r.courseCode,
-    courseVersion: r.courseVersion ?? null,
-    contentRevision: r.contentRevision ?? null,
-    status: r.status,
-    startedAt: r.startedAt,
-    completedAt: r.completedAt,
-    score: r.score,
-    attempts: r.attempts,
-    certificateNumber: r.certificateNumber,
-    expirationDate: r.expirationDate,
-    verifiedBy: r.verifiedBy,
-    verifiedByName: r.verifiedByName,
-    verifiedAt: r.verifiedAt,
-    notes: r.notes,
   };
 }
 

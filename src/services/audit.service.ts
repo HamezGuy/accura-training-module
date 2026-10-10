@@ -1,4 +1,12 @@
 import { query, TransactionClient } from '../config/database';
+import {createHash} from 'node:crypto';
+
+export function canonicalTrainingEvidence(value:any):string {
+ if(Array.isArray(value))return `[${value.map(canonicalTrainingEvidence).join(',')}]`;
+ if(value&&typeof value==='object')return `{${Object.keys(value).sort().map(key=>`${JSON.stringify(key)}:${canonicalTrainingEvidence(value[key])}`).join(',')}}`;
+ return JSON.stringify(value);
+}
+export const trainingEvidenceHash=(value:unknown)=>createHash('sha256').update(canonicalTrainingEvidence(value)).digest('hex');
 
 export type AuditAction =
   | 'course_created'
@@ -18,6 +26,10 @@ export type AuditAction =
   | 'training_impact_rejected'
   | 'training_impact_applied'
   | 'training_impact_cancelled'
+  | 'training_material_drafted'
+  | 'training_material_reviewed'
+  | 'training_material_rejected'
+  | 'training_material_published'
   | 'compliance_checked';
 
 interface AuditFields {

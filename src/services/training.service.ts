@@ -4,7 +4,8 @@ import { logger } from '../config/logger';
 import { logAudit } from './audit.service';
 import { generateCertificateNumber, calculateExpirationDate } from './certificate.service';
 import { getObligations } from './training-obligations.service';
-import { authorizeTrainingTargets, readTrainingDirectory, revalidateTrainingDirectory, TrainingAuthorityContext } from './training-authority.service';
+import { authorizeTrainingTargets, readTrainingDirectory, revalidateTrainingDirectory, resolveObligationScope, TrainingAuthorityContext } from './training-authority.service';
+import {assertMaterialUse,materialCourseVisible} from './training-materials.service';
 import {
   TrainingCourse,
   TrainingRecord,
@@ -19,6 +20,12 @@ import {
 } from '../types/training.types';
 
 const database: TransactionClient = { query, queryOne };
+
+async function recheckMaterialUse(initial: string | undefined, authority: TrainingAuthorityContext | undefined, client: TransactionClient, course: TrainingCourse, learner?: {userId:number;scope:import('../types/training.types').TrainingObligationScope}) {
+  if (initial !== await assertMaterialUse(authority, client, course, learner)) {
+    throw Object.assign(new Error('Training material or current authority changed during the request; retry'), {statusCode:409});
+  }
+}
 
 function requireUserId(value: number): void {
   if (!Number.isSafeInteger(value) || value < 1) {
@@ -48,7 +55,7 @@ function canonicalCourseRoles(value: unknown, statusCode: number): string[] {
 export async function getCourses(options?: {
   activeOnly?: boolean;
   role?: string;
-}): Promise<TrainingCourse[]> {
+},authority?:TrainingAuthorityContext): Promise<TrainingCourse[]> {
   let sql = 'SELECT * FROM acc_training_courses WHERE 1=1';
   const params: unknown[] = [];
 
@@ -62,13 +69,15 @@ export async function getCourses(options?: {
   sql += ' ORDER BY course_code ASC';
 
   const { rows } = await query<TrainingCourse>(sql, params);
-  return role === undefined ? rows : rows.filter(course => canonicalCourseRoles(course.requiredForRoles, 409).includes(role));
+  const visible:TrainingCourse[]=[];for(const course of rows)if(await materialCourseVisible(authority,course))visible.push(course);
+  return role === undefined ? visible : visible.filter(course => canonicalCourseRoles(course.requiredForRoles, 409).includes(role));
 }
 
 export async function getCourseById(
   courseId: number,
   includeQuestions: boolean = false,
-  client: TransactionClient = database
+  client: TransactionClient = database,
+  authority?:TrainingAuthorityContext
 ): Promise<TrainingCourse | null> {
   const course = await client.queryOne<TrainingCourse>(
     'SELECT * FROM acc_training_courses WHERE id = $1',
@@ -76,6 +85,7 @@ export async function getCourseById(
   );
 
   if (!course) return null;
+  if(course.materialScope)await assertMaterialUse(authority,client,course);
 
   if (includeQuestions) {
     const { rows: questions } = await client.query<TrainingQuizQuestion>(
@@ -89,6 +99,7 @@ export async function getCourseById(
     // Strip isCorrect from options when returning to client
     course.questions = questions.map((q) => ({
       ...q,
+      explanation: null,
       options: (q.options as unknown as Array<{ text: string; isCorrect?: boolean }>).map(
         (opt) => ({ text: opt.text })
       ),
@@ -133,6 +144,10 @@ export async function updateCourse(
   dto: UpdateCourseRequest,
   client: TransactionClient = database
 ): Promise<TrainingCourse | null> {
+  if(dto.requiredForRoles!==undefined)canonicalCourseRoles(dto.requiredForRoles,400);
+  const retained=await client.queryOne<TrainingCourse>('SELECT * FROM acc_training_courses WHERE id=$1 FOR UPDATE',[courseId]);
+  if(!retained)return null;
+  if(retained?.materialScope)throw Object.assign(new Error('Governed material changes require a new independently reviewed draft'),{statusCode:409});
   const setClauses: string[] = [];
   const params: unknown[] = [];
   let paramIdx = 1;
@@ -158,7 +173,6 @@ export async function updateCourse(
     params.push(dto.passingScore);
   }
   if (dto.requiredForRoles !== undefined) {
-    canonicalCourseRoles(dto.requiredForRoles, 400);
     setClauses.push(`required_for_roles = $${paramIdx++}`);
     params.push(JSON.stringify(dto.requiredForRoles));
   }
@@ -189,6 +203,8 @@ export async function addQuestions(
   questions: CreateQuestionRequest[],
   client: TransactionClient = database
 ): Promise<TrainingQuizQuestion[]> {
+  const retained=await client.queryOne<TrainingCourse>('SELECT * FROM acc_training_courses WHERE id=$1 FOR UPDATE',[courseId]);
+  if(retained?.materialScope)throw Object.assign(new Error('Governed questions must be published from the reviewed material draft'),{statusCode:409});
   const results: TrainingQuizQuestion[] = [];
 
   for (const q of questions) {
@@ -231,8 +247,8 @@ export async function getUserRecords(userId: number, authority: TrainingAuthorit
   return records;
 }
 
-export async function startTraining(userId: number, courseId: number, client?: TransactionClient, expectedRevision?: number): Promise<TrainingRecord> {
-  if (!client) return transaction(tx => startTraining(userId, courseId, tx, expectedRevision));
+export async function startTraining(userId: number, courseId: number, client?: TransactionClient, expectedRevision?: number,authority?:TrainingAuthorityContext): Promise<TrainingRecord> {
+  if (!client) return transaction(tx => startTraining(userId, courseId, tx, expectedRevision,authority));
   requireUserId(userId);
   requireUserId(courseId);
   const course = await client.queryOne<TrainingCourse>(
@@ -243,6 +259,9 @@ export async function startTraining(userId: number, courseId: number, client?: T
   if (!course) {
     throw Object.assign(new Error('Course not found or inactive'), { statusCode: 404 });
   }
+  if(course.materialScope){if(authority?.actorUserId!==userId)throw Object.assign(new Error('Start governed training only for the authenticated learner'),{statusCode:403});
+    await client.query("SELECT id FROM acc_training_obligations WHERE user_id=$1 AND course_id=$2 AND status='assigned' ORDER BY id FOR SHARE",[userId,courseId]);}
+  const materialProof = await assertMaterialUse(authority,client,course);
 
   if (!Number.isSafeInteger(course.contentRevision) || Number(course.contentRevision) < 1) {
     throw Object.assign(new Error('Training content revision is unavailable'), { statusCode: 409 });
@@ -263,12 +282,16 @@ export async function startTraining(userId: number, courseId: number, client?: T
     throw Object.assign(new Error('Training already completed'), { statusCode: 409 });
   }
 
-  if (existing?.status === 'in_progress' && current) return existing;
+  if (existing?.status === 'in_progress' && current) {
+    await recheckMaterialUse(materialProof,authority,client,course);
+    return existing;
+  }
   const {rows: slides} = await client.query<SlideContent>(
     'SELECT * FROM acc_training_slides WHERE course_id = $1 ORDER BY order_index, id', [courseId]);
   const {rows: questions} = await client.query<TrainingQuizQuestion>(
     'SELECT * FROM acc_training_questions WHERE course_id = $1 AND active = true ORDER BY order_index, id', [courseId]);
-  const snapshot = JSON.stringify({ course, slides, questions });
+  const {materialReady:_requestLocalMaterialReadiness,...snapshotCourse}=course;
+  const snapshot = JSON.stringify({ course:snapshotCourse, slides, questions });
 
   if (existing) {
     await client.query(
@@ -284,6 +307,7 @@ export async function startTraining(userId: number, courseId: number, client?: T
       [existing.id, course.version, course.contentRevision, snapshot]
     );
     if (!updated) throw new Error('Failed to update record');
+    await recheckMaterialUse(materialProof,authority,client,course);
     return updated;
   }
 
@@ -295,6 +319,7 @@ export async function startTraining(userId: number, courseId: number, client?: T
   );
 
   if (!record) throw new Error('Failed to create training record');
+  await recheckMaterialUse(materialProof,authority,client,course);
   return record;
 }
 
@@ -303,9 +328,10 @@ export async function submitQuiz(
   courseId: number,
   answers: TrainingQuizAnswer[],
   client?: TransactionClient,
-  expectedRevision?: number
+  expectedRevision?: number,
+  authority?:TrainingAuthorityContext
 ): Promise<TrainingQuizResult> {
-  if (!client) return transaction(tx => submitQuiz(userId, courseId, answers, tx, expectedRevision));
+  if (!client) return transaction(tx => submitQuiz(userId, courseId, answers, tx, expectedRevision,authority));
   const course = await (client ?? database).queryOne<TrainingCourse>(
     'SELECT * FROM acc_training_courses WHERE id = $1 AND active = true FOR SHARE',
     [courseId]
@@ -314,6 +340,9 @@ export async function submitQuiz(
   if (!course) {
     throw Object.assign(new Error('Course not found'), { statusCode: 404 });
   }
+  if(course.materialScope){if(authority?.actorUserId!==userId)throw Object.assign(new Error('Submit governed training only for the authenticated learner'),{statusCode:403});
+    await client.query("SELECT id FROM acc_training_obligations WHERE user_id=$1 AND course_id=$2 AND status='assigned' ORDER BY id FOR SHARE",[userId,courseId]);}
+  const materialProof = await assertMaterialUse(authority,client,course);
 
   const { rows: questions } = await (client ?? database).query<TrainingQuizQuestion & { options: Array<{ text: string; isCorrect?: boolean }> }>(
     'SELECT * FROM acc_training_questions WHERE course_id = $1 AND active = true ORDER BY order_index',
@@ -381,6 +410,7 @@ export async function submitQuiz(
          WHERE id = $2`, [score, record.id]);
     }
 
+    await recheckMaterialUse(materialProof,authority,client,course);
     return {
       passed,
       score,
@@ -417,6 +447,12 @@ export async function verifyTraining(
   if (!record) {
     throw Object.assign(new Error('Training record not found'), { statusCode: 404 });
   }
+  const materialProofs:Array<{scope:import('../types/training.types').TrainingObligationScope;role:string;proof:string|undefined}>=[];
+  if(course?.materialScope){const obligations=(await client.query<any>("SELECT scope,role FROM acc_training_obligations WHERE user_id=$1 AND course_id=$2 AND status='assigned' ORDER BY id FOR SHARE",[record.userId,course.id])).rows;
+    if(!obligations.length)throw Object.assign(new Error('Current governed training obligation required'),{statusCode:409});
+    for(const obligation of obligations){const current=await resolveObligationScope(authority,'duties:read',record.userId,obligation.scope);
+      if(!current.eligible||!current.roles.includes(obligation.role))throw Object.assign(new Error('Current governed learner role required'),{statusCode:409});
+      materialProofs.push({...obligation,proof:await assertMaterialUse(authority,client,course,{userId:record.userId,scope:obligation.scope})});}}
 
   // Authorization is a remote observation while this record is locked. Only
   // the training update and its caller's audit share the local transaction.
@@ -443,6 +479,13 @@ export async function verifyTraining(
      WHERE id = $3`,
     [authority.actorUserId, notes ?? null, recordId]
   );
+
+  const finalTarget=await authorizeTrainingTargets(authority,'records:verify',[record.userId],{scopeFingerprint:admission.scopeFingerprint});
+  if(!finalTarget.decisions[0].allowed)throw Object.assign(new Error('Training verification authority changed'),{statusCode:409});
+  for(const proof of materialProofs){const current=await resolveObligationScope(authority,'duties:read',record.userId,proof.scope);
+    if(!current.eligible||!current.roles.includes(proof.role))throw Object.assign(new Error('Current governed learner role changed'),{statusCode:409});
+    await recheckMaterialUse(proof.proof,authority,client,course!,{userId:record.userId,scope:proof.scope});}
+  if(record.expirationDate!==null&&Date.parse(record.expirationDate)<=Date.now())throw Object.assign(new Error('Completion expired during verification'),{statusCode:409});
 
   return { verified: true };
 }
@@ -648,14 +691,15 @@ export interface CourseContentResponse {
   questions: TrainingQuizQuestion[];
 }
 
-export async function getCourseContent(courseId: number, client?: TransactionClient): Promise<CourseContentResponse | null> {
-  if (!client) return transaction(tx => getCourseContent(courseId, tx));
+export async function getCourseContent(courseId: number, client?: TransactionClient,authority?:TrainingAuthorityContext): Promise<CourseContentResponse | null> {
+  if (!client) return transaction(tx => getCourseContent(courseId, tx,authority));
   const course = await client.queryOne<TrainingCourse>(
     'SELECT * FROM acc_training_courses WHERE id = $1 AND active = true FOR SHARE',
     [courseId]
   );
 
   if (!course) return null;
+  await assertMaterialUse(authority,client,course);
 
   const { rows: slides } = await client.query<SlideContent>(
     `SELECT id, course_id, title, content, slide_type, order_index, media_url, interactive_config
@@ -676,6 +720,7 @@ export async function getCourseContent(courseId: number, client?: TransactionCli
   // Strip isCorrect from options for client delivery
   const safeQuestions = questions.map((q) => ({
     ...q,
+    explanation: null,
     options: (q.options as unknown as Array<{ text: string; isCorrect?: boolean }>).map(
       (opt) => ({ text: opt.text })
     ),

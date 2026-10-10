@@ -7,7 +7,8 @@ import { asyncHandler } from '../middleware/errorHandler.middleware';
 import * as controller from '../controllers/training.controller';
 import * as obligations from '../services/training-obligations.service';
 import * as impact from '../services/training-impact.service';
-import {inspectImpactSource} from '../services/training-authority.service';
+import {inspectImpactSource,observeMaterialSource} from '../services/training-authority.service';
+import * as materials from '../services/training-materials.service';
 import {getObligationDueSource} from '../services/training-due-source.service';
 import { exactPositiveId } from '../middleware/validation.middleware';
 
@@ -127,6 +128,27 @@ router.post('/duty-readiness', asyncHandler<AuthRequest>(async (req, res) => {
   res.json({ success: true, data: await obligations.getDutyReadiness(req.trainingAuthority!, req.body) });
 }));
 
+router.post('/material-source',authorize(['admin','data_manager']),asyncHandler<AuthRequest>(async(req,res)=>{
+  res.setHeader('Cache-Control','no-store');res.json({success:true,data:await observeMaterialSource(req.trainingAuthority!,req.body)});
+}));
+router.get('/material-drafts',authorize(['admin','data_manager']),asyncHandler<AuthRequest>(async(req,res)=>{
+  if(Object.keys(req.query).some(k=>!['studyId','siteId'].includes(k)))throw Object.assign(new Error('Exact material scope required'),{statusCode:400});
+  const studyId=exactPositiveId(req.query['studyId'],'study ID'),siteId=exactPositiveId(req.query['siteId'],'site ID');
+  if(!studyId)throw Object.assign(new Error('Study ID required'),{statusCode:400});
+  res.setHeader('Cache-Control','no-store');res.json({success:true,data:await materials.listMaterialDrafts(req.trainingAuthority!,{studyId,...(siteId?{siteId}:{})})});
+}));
+router.post('/material-drafts',authorize(['admin','data_manager']),asyncHandler<AuthRequest>(async(req,res)=>{
+  res.status(201).json({success:true,data:await materials.proposeMaterialDraft(req.trainingAuthority!,req.body)});
+}));
+router.get('/material-drafts/:id',authorize(['admin','data_manager']),asyncHandler<AuthRequest>(async(req,res)=>{
+  res.setHeader('Cache-Control','no-store');res.json({success:true,data:await materials.getMaterialDraft(req.trainingAuthority!,req.params['id'])});
+}));
+router.post('/material-drafts/:id/review',authorize(['admin','data_manager']),asyncHandler<AuthRequest>(async(req,res)=>{
+  res.json({success:true,data:await materials.reviewMaterialDraft(req.trainingAuthority!,req.params['id'],req.body)});
+}));
+router.post('/material-drafts/:id/publish',authorize(['admin','data_manager']),asyncHandler<AuthRequest>(async(req,res)=>{
+  res.json({success:true,data:await materials.publishMaterialDraft(req.trainingAuthority!,req.params['id'],req.body)});
+}));
 router.post('/impact-source',authorize(['admin','data_manager']),asyncHandler<AuthRequest>(async(req,res)=>{
   if(!req.body||Object.keys(req.body).some(key=>!['scope','originals'].includes(key)))throw Object.assign(new Error('Exact source selectors required'),{statusCode:400});
   res.setHeader('Cache-Control','no-store');res.json({success:true,data:await inspectImpactSource(req.trainingAuthority!,req.body.scope,req.body.originals)});

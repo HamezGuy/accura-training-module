@@ -22,6 +22,11 @@ export interface TrainingCourse {
   createdAt: string;
   updatedAt: string;
   questions?: TrainingQuizQuestion[];
+  materialScope?: {studyId:number;siteId?:number} | null;
+  materialDraftId?: string | null;
+  materialPublicationId?: string | null;
+  /** Request-local result; never a stored authorization flag. */
+  materialReady?: boolean;
 }
 
 export interface CreateCourseRequest {
@@ -211,4 +216,21 @@ export interface TrainingImpactPlanRequest {
   source:TrainingImpactSource;
   reason:string;
   actions:TrainingImpactAction[];
+}
+
+/** Text lessons and assessed questions use the existing learner runtime. Citation
+ * locators are author declarations; custody checks do not validate medical meaning. */
+export interface TrainingMaterial {
+  courseCode:string;courseName:string;description:string;version:string;passingScore:number;
+  durationMinutes:number|null;validityPeriodDays:number;active:boolean;
+  intendedUse:'synthetic_qualification'|'operator_authored';
+  lessons:Array<{title:string;text:string;citations:Array<{fileId:string;locator:string}>}>;
+  questions:Array<{questionText:string;questionType:'multiple_choice'|'true_false'|'multi_select';options:Array<{text:string;isCorrect:boolean}>;explanation:string}>;
+}
+export interface TrainingMaterialSource {
+  scope:{studyId:number;siteId?:number};armIds:number[];originals:TrainingImpactSource['originals'];sourceHash:string;
+}
+export interface TrainingMaterialDraftRequest {
+  schemaVersion:'training-material-draft/1';idempotencyKey:string;courseId:number|null;
+  expectedContentRevision:number;expectedDraftId:string|null;source:TrainingMaterialSource;reason:string;material:TrainingMaterial;
 }

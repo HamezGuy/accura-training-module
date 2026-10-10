@@ -30,9 +30,9 @@ const cases = [
   { name: 'course create', method: 'post', route: '/courses', action: 'course_created',
     body: { courseCode: 'OWNED-AUDIT', courseName: 'Audit fixture', version: '1', passingScore: 80, requiredForRoles: ['admin'] }, responses: [rows(course)] },
   { name: 'course update', method: 'put', route: '/courses/3', action: 'course_updated',
-    body: { courseName: 'Updated fixture' }, responses: [rows(course)] },
+    body: { courseName: 'Updated fixture' }, responses: [rows(course),rows(course)] },
   { name: 'add questions', method: 'post', route: '/courses/3/questions', action: 'questions_added',
-    body: { questions: [{ questionText: 'Fixture?', questionType: 'true_false', options: question.options, orderIndex: 0 }] }, responses: [rows(course), rows(question)] },
+    body: { questions: [{ questionText: 'Fixture?', questionType: 'true_false', options: question.options, orderIndex: 0 }] }, responses: [rows(course), rows(course), rows(question)] },
   { name: 'start training', method: 'post', route: '/start/3', action: 'training_started',
     body: {}, responses: [rows(course), rows(), rows(), rows(), rows(question), rows({ ...record, user_id: 1, status: 'in_progress' })] },
   { name: 'passing quiz', method: 'post', route: '/submit-quiz/3', action: 'quiz_passed',
@@ -132,9 +132,10 @@ describe('training mutation and audit share the real database transaction bounda
   });
 
   test('a second question failure rolls back the first question and creates no success audit', async () => {
-    const spec = cases[2]; responses = [rows(course), rows(question)]; failBusinessAt = 2;
+    const spec = cases[2]; responses = [rows(course), rows(course), rows(question)]; failBusinessAt = 2;
     const response = await send(spec, { questions: [...spec.body.questions, ...spec.body.questions] });
     expect(response.status).toBe(500); expect(committedWrites).toBe(0); expect(auditAttempts).toBe(0);
+    expect(businessAttempts).toBe(2);
     assertTransaction('ROLLBACK');
   });
 

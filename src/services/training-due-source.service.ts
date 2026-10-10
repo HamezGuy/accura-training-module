@@ -2,6 +2,7 @@ import {transaction} from '../config/database';
 import {inspectImpactSource,resolveImpactSource,resolveObligationScope,TrainingAuthorityContext,ObligationScopeObservation} from './training-authority.service';
 import {obligationReadiness,trainingDutyHash} from './training-obligations.service';
 import {TrainingCourse,TrainingObligation,TrainingRecord,TrainingImpactSource} from '../types/training.types';
+import {assertMaterialUse} from './training-materials.service';
 
 /** Exact native training obligations for a future authenticated CC task adapter.
  * No worker token, external delivery, or completed clinical action is inferred. */
@@ -28,13 +29,18 @@ export async function getObligationDueSource(authority:TrainingAuthorityContext,
     observations.set(key,{userId:row.userId,scope:row.scope,observation,state:observation.eligible?state:'changed'});
   }
   for(const observed of observations.values())await resolveObligationScope(authority,'obligations:withdraw',observed.userId,observed.scope,observed.observation);
+  const materialReadiness=new Map<number,boolean>();
+  for(const row of snapshot.obligations){const course=snapshot.courses.get(row.courseId);if(course?.materialScope&&row.status!=='withdrawn'){
+    try{await transaction(client=>assertMaterialUse(authority,client,{...course},{userId:row.userId,scope:row.scope}));materialReadiness.set(row.id,true);}
+    catch(error){if(![403,404,409].includes((error as {statusCode?:number}).statusCode??0))throw error;materialReadiness.set(row.id,false);}
+  }}
   await resolveImpactSource(authority,scope,source.source,source);
   const cutoff=Date.now();
   const obligations=snapshot.obligations.map(row=>{
     const course=snapshot.courses.get(row.courseId);if(!course)throw Object.assign(new Error('Required course custody is missing'),{statusCode:409});
     const record=snapshot.records.get(`${row.userId}:${row.courseId}`)??null;
     const observation=observations.get(trainingDutyHash({userId:row.userId,scope:row.scope}))!;
-    const readiness=obligationReadiness(row,course,record,observation.state==='current'&&observation.observation.roles.includes(row.role)?'current':'changed',cutoff);
+    const readiness=obligationReadiness(row,{...course,materialReady:materialReadiness.get(row.id)},record,observation.state==='current'&&observation.observation.roles.includes(row.role)?'current':'changed',cutoff);
     const effectiveStatus=readiness==='withdrawn'?'inactive':readiness==='complete'?'satisfied':readiness==='scope_changed'||readiness==='course_inactive'?'blocked':'open';
     const body={occurrenceId:`training-obligation:${row.id}:${row.revision}`,obligationId:row.id,revision:row.revision,userId:row.userId,role:row.role,
       scope:row.scope,courseId:row.courseId,courseVersion:row.courseVersion,contentRevision:row.contentRevision,currentCourseVersion:course.version,currentContentRevision:course.contentRevision,

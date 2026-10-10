@@ -1,7 +1,7 @@
 import { getRoleByName, ROLES } from '@accura-trial/auth-core';
 import { config } from '../config/environment';
 import type { ReadableStreamDefaultReader } from 'node:stream/web';
-import type { TrainingObligationScope, TrainingImpactSource } from '../types/training.types';
+import type { TrainingObligationScope, TrainingImpactSource,TrainingMaterialSource } from '../types/training.types';
 
 /** Request-local native credentials; never persist or serialize this context. */
 export interface TrainingAuthorityContext {
@@ -149,6 +149,17 @@ export class TrainingAuthorityTransport {
 }
 
 const transport = new TrainingAuthorityTransport(config.authority);
+
+export async function observeMaterialSource(context:TrainingAuthorityContext,source:Omit<TrainingMaterialSource,'sourceHash'>&{sourceHash?:string},
+ options:{learner?:{userId:number;scope:TrainingObligationScope};reviewer?:{userId:number;authorityHash:string};authorityHash?:string}={}){
+ const data=await transport.resolve(context,{op:'material-source',action:options.learner?'duties:read':'obligations:manage',...source,
+  ...(options.learner?{userId:options.learner.userId,learnerScope:options.learner.scope}:{}),...(options.reviewer?{reviewer:options.reviewer}:{})});
+ if(data.complete!==true||!same(data.scope,source.scope)||!same(data.armIds,source.armIds)||!same(data.originals,source.originals)
+  ||typeof data.sourceHash!=='string'||!/^[a-f0-9]{64}$/.test(data.sourceHash)||source.sourceHash!==undefined&&data.sourceHash!==source.sourceHash
+  ||typeof data.actorAuthorityHash!=='string'||!HASH.test(data.actorAuthorityHash)
+  ||options.authorityHash!==undefined&&data.actorAuthorityHash!==options.authorityHash)invalid();
+ return {source:{scope:source.scope,armIds:source.armIds,originals:source.originals,sourceHash:data.sourceHash},authorityHash:data.actorAuthorityHash as string|undefined};
+}
 
 export interface ObligationScopeObservation {
   scope: TrainingObligationScope; userId: number; eligible: boolean; roles: string[]; observationHash: string; scopeFingerprint: string;

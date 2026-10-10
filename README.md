@@ -287,3 +287,49 @@ training HTTP routes and native authority against two isolated synthetic
 PostgreSQL databases, including review, exact source custody, concurrent retries,
 revocation, rollback, retained history and due-state transitions. Fixture session
 admission is synthetic; native authorization and database persistence are real.
+
+### Governed training material
+
+`training-material-draft/1` adds scoped material authoring to the existing course,
+slide, quiz and completion model. Authors retain ordered plain-text lessons, exact
+answer keys, course settings, declared applicability and citation locators against
+1–16 verified native original files. This profile preserves text and units verbatim
+and escapes markup for the existing learner renderer. It does not author embedded
+media or interactive exercises. Source locators are author declarations, not an
+automated check that the cited text supports the lesson.
+
+A different current exact-scope manager reviews the immutable draft hash. The
+current author can publish only that current reviewed head, against its original
+course revision and unchanged source/author/reviewer observations. Publication
+replaces the existing live slides and questions in one transaction and retains
+the full material, live projection, revision, original pins and review receipt.
+Drafting a successor does not alter the current learner content. Legacy generic
+courses retain their existing behavior; their previous material gains no invented
+approval. Legacy course/question edits refuse governed courses.
+
+Published material is available to currently assigned learners in its exact
+study/site and common or selected arm scope, or current exact-scope managers.
+Learner content and record DTOs omit answer keys, answer explanations and retained
+whole-content snapshots. Governed start, grading and independent verification
+recheck publication integrity, source and current authority before returning from
+their local write transaction. Applicable obligation rows remain locked through
+that transaction. Native callbacks and the local commit are not a distributed
+atomic transaction; a subsequent native change can still occur after observation.
+
+Selected protocol/definition, effective amendment, original-byte or arm changes
+hold current governed material use pending reassessment. Unrelated staff changes
+do not invalidate published clinical text. Pending authors/reviewers pin native
+account and exact-scope authority generations, including role removal/restoration.
+Publishing a successor advances the existing content revision: previous attempts
+remain in history, old completions cannot satisfy the new revision, and the
+existing reviewed impact-plan path can revise affected obligations. Publication
+does not itself declare which learners need training or that the curriculum is
+clinically adequate; those remain explicit human applicability/content decisions.
+
+Deploy the matching EDC material-source authority/proxy before the training
+service and UI. Existing serialized training startup migrations add the draft,
+publication and event stores and their retention triggers. No EDC schema upgrade
+or new signing secret is needed. The opt-in EDC
+`training-material.native.postgres.test.ts` uses the actual training HTTP routes,
+native source authority and isolated PostgreSQL stores. Its synthetic material is
+software qualification content, never clinical instruction or regulatory approval.

@@ -70,7 +70,8 @@ test('sign-off pins locked owner and rechecks before local mutation', async () =
     query: jest.fn().mockResolvedValue({ rows: [], rowCount: 1 }) };
   expect(await verifyTraining(80, authority, 'reviewed', client)).toEqual({ verified: true });
   expect(client.queryOne.mock.calls[2]).toEqual([expect.stringContaining('r.user_id = $2 FOR UPDATE'), [80, 8]]);
-  expect(mockTargets).toHaveBeenCalledTimes(3); expect(client.query).toHaveBeenCalledWith(expect.stringContaining('UPDATE acc_training_records'), [7, 'reviewed', 80]);
+  expect(mockTargets).toHaveBeenCalledTimes(4); expect(client.query).toHaveBeenCalledWith(expect.stringContaining('UPDATE acc_training_records'), [7, 'reviewed', 80]);
+  expect(mockTargets.mock.invocationCallOrder[3]).toBeGreaterThan(client.query.mock.invocationCallOrder[0]);
   expect(mockQuery).not.toHaveBeenCalled(); expect(mockQueryOne).not.toHaveBeenCalled();
 });
 test('target revoked after locking cannot be updated', async () => {

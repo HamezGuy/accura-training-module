@@ -1,9 +1,10 @@
 import { getRoleByName, ROLES } from '@accura-trial/auth-core';
-import { createHash } from 'node:crypto';
 import { query, queryOne, transaction, TransactionClient } from '../config/database';
-import { logAudit } from './audit.service';
+import { logAudit,canonicalTrainingEvidence as canonical,trainingEvidenceHash } from './audit.service';
 import { authorizeTrainingTargets, resolveObligationScope, TrainingAuthorityContext, ObligationScopeObservation } from './training-authority.service';
 import { TrainingCourse, TrainingDutyPolicy, TrainingDutyReadinessRequest, TrainingObligation, TrainingObligationRequest, TrainingObligationScope, TrainingObligationView, TrainingRecord } from '../types/training.types';
+import {assertMaterialUse,publishedMaterial,observePublication} from './training-materials.service';
+import {mapRecordToDto} from './training-record-dto';
 
 function fail(message: string, statusCode = 409): never { throw Object.assign(new Error(message), { statusCode }); }
 const id = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) > 0 && Number(value) <= 2147483647;
@@ -54,6 +55,7 @@ export async function assignObligationInTransaction(client: TransactionClient, a
       if(!observed.eligible||!observed.roles.includes(request.role))fail('The learner no longer holds the declared role');
       const course = await client.queryOne<TrainingCourse>('SELECT * FROM acc_training_courses WHERE id=$1 AND active=true FOR SHARE', [request.courseId]);
       if (!course || course.contentRevision !== request.contentRevision) fail('Select the current active course revision before assigning training');
+      await assertMaterialUse(authority,client,course,{userId:request.userId,scope});
       let previous: TrainingObligation | null = null;
       if (revise) {
         previous = await client.queryOne<TrainingObligation>('SELECT * FROM acc_training_obligations WHERE id=$1 FOR UPDATE', [revise.id]);
@@ -103,6 +105,7 @@ export function obligationReadiness(obligation: TrainingObligation, course: Trai
   if (obligation.status === 'withdrawn') return 'withdrawn';
   if (scope !== 'current') return scope === 'changed' ? 'scope_changed' : 'scope_unavailable';
   if (!course.active) return 'course_inactive';
+  if(course.materialScope&&course.materialReady!==true)return 'retraining_required';
   if (course.version !== obligation.courseVersion || course.contentRevision !== obligation.contentRevision) return 'retraining_required';
   if (!record) return 'pending';
   if (record.courseVersion !== obligation.courseVersion || record.contentRevision !== obligation.contentRevision || record.status === 'expired'
@@ -133,6 +136,7 @@ export async function getObligations(authority: TrainingAuthorityContext, userId
       try {
         const observed = await resolveObligationScope(authority, 'obligations:read', userId, canonicalScope(row.scope));
         if (!observed.eligible || !observed.roles.includes(row.role)) scope = 'changed';
+        if(scope==='current')await assertMaterialUse(authority,{query,queryOne},course,{userId,scope:row.scope});
       } catch (error) {
         const code = (error as {statusCode?: number}).statusCode;
         if (code === 401 || code === 403) throw error;
@@ -157,9 +161,9 @@ export async function getObligationHistory(authority: TrainingAuthorityContext, 
   const admitted = await admitRead(authority, userId);
   const {rows} = await query(`SELECT e.id,e.obligation_id,e.revision,e.actor_user_id,e.action,e.snapshot,e.created_at
     FROM acc_training_obligation_events e JOIN acc_training_obligations o ON o.id=e.obligation_id WHERE o.user_id=$1 ORDER BY e.id`, [userId]);
-  const records = await query(`SELECT id,user_id,course_id,course_version,content_revision,status,started_at,completed_at,
+  const records = await query<TrainingRecord>(`SELECT id,user_id,course_id,course_version,content_revision,status,started_at,completed_at,
     score,attempts,certificate_number,expiration_date,verified_by,verified_at,notes FROM acc_training_records WHERE user_id=$1 ORDER BY id`, [userId]);
-  const history = await query(`SELECT history_id,archived_at,record_snapshot - 'contentSnapshot' AS record
+  const history = await query<{historyId:number;archivedAt:string;record:TrainingRecord}>(`SELECT history_id,archived_at,record_snapshot AS record
     FROM acc_training_record_history WHERE user_id=$1 ORDER BY history_id`, [userId]);
   const audit = await query(`SELECT id,user_id,action,record_id,course_id,details,created_at FROM acc_training_audit_log
     WHERE (user_id=$1 AND action IN('training_started','quiz_submitted','quiz_passed','quiz_failed'))
@@ -168,7 +172,8 @@ export async function getObligationHistory(authority: TrainingAuthorityContext, 
       OR (action='training_expired' AND details->>'affectedUserId'=$1::text) ORDER BY id`, [userId]);
   const checked = await authorizeTrainingTargets(authority, 'records:read', [userId], {scopeFingerprint: admitted.scopeFingerprint});
   if (!checked.decisions[0]?.allowed) fail('The learner is outside your current scope', 403);
-  return {schemaVersion: 'training-obligation-history/1', learnerId: userId, exportedAt: new Date().toISOString(), events: rows, records: records.rows, history: history.rows, audit: audit.rows};
+  return {schemaVersion: 'training-obligation-history/1', learnerId: userId, exportedAt: new Date().toISOString(), events: rows,
+    records: records.rows.map(mapRecordToDto), history: history.rows.map(row=>({...row,record:mapRecordToDto(row.record)})), audit: audit.rows};
 }
 
 const dutyNames = ['site_activation', 'participant_enrollment', 'arm_assignment'];
@@ -177,12 +182,7 @@ const isObject = (value: unknown): value is Record<string, any> => !!value && ty
 function exactObject(value: unknown, keys: string[]): asserts value is Record<string, any> {
   if (!isObject(value) || Object.keys(value).some(key => !keys.includes(key))) fail('An exact duty policy object is required', 400);
 }
-function canonical(value: any): string {
-  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
-  if (isObject(value)) return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}`;
-  return JSON.stringify(value);
-}
-export const trainingDutyHash = (value: unknown): string => createHash('sha256').update(canonical(value)).digest('hex');
+export const trainingDutyHash = trainingEvidenceHash;
 
 /** Strict, bounded source contract. Empty requirements never mean trained. */
 export function validateDutyPolicy(value: unknown): asserts value is TrainingDutyPolicy {
@@ -238,8 +238,10 @@ export async function getDutyReadiness(authority: TrainingAuthorityContext, valu
     const obligations=await client.query<TrainingObligation>('SELECT * FROM acc_training_obligations WHERE id=ANY($1::integer[])',[[...new Set(pins.map(pin=>pin.id))]]);
     const courses=await client.query<TrainingCourse>('SELECT * FROM acc_training_courses WHERE id=ANY($1::integer[])',[[...new Set(pins.map(pin=>pin.courseId))]]);
     const records=await client.query<TrainingRecord>('SELECT * FROM acc_training_records WHERE user_id=ANY($1::integer[]) AND course_id=ANY($2::integer[])',[[...new Set(selected.map(row=>row.userId))],[...new Set(pins.map(pin=>pin.courseId))]]);
-    return {obligations:new Map(obligations.rows.map(row=>[row.id,row])),courses:new Map(courses.rows.map(row=>[row.id,row])),records:new Map(records.rows.map(row=>[`${row.userId}:${row.courseId}`,row]))};
-  }):{obligations:new Map<number,TrainingObligation>(),courses:new Map<number,TrainingCourse>(),records:new Map<string,TrainingRecord>()};
+    const materials=new Map<number,NonNullable<Awaited<ReturnType<typeof publishedMaterial>>>>();for(const course of courses.rows){const pub=await publishedMaterial(client,course);if(pub)materials.set(course.id,pub);}
+    return {obligations:new Map(obligations.rows.map(row=>[row.id,row])),courses:new Map(courses.rows.map(row=>[row.id,row])),records:new Map(records.rows.map(row=>[`${row.userId}:${row.courseId}`,row])),materials};
+  }):{obligations:new Map<number,TrainingObligation>(),courses:new Map<number,TrainingCourse>(),records:new Map<string,TrainingRecord>(),materials:new Map<number,NonNullable<Awaited<ReturnType<typeof publishedMaterial>>>>()};
+  const materialObservations=new Map<string,{publication:NonNullable<Awaited<ReturnType<typeof publishedMaterial>>>;learner:{userId:number;scope:TrainingObligationScope};observationHash:string}>();
   // Resolve the retained obligation scope as well as its declared applicability.
   // A parent obligation does not remain valid after its parent's role is revoked.
   const observations=new Map<string,{userId:number;scope:TrainingObligationScope;value:Awaited<ReturnType<typeof resolveObligationScope>>}>();
@@ -259,6 +261,8 @@ export async function getDutyReadiness(authority: TrainingAuthorityContext, valu
       const retainedScope=exact?canonicalScope(row.scope):null;
       const retainedAuthority=retainedScope?await observe(assignment.userId,retainedScope):null;
       const course = exact ? local.courses.get(pin.courseId) : null;
+      if(course?.materialScope&&row){const publication=local.materials.get(course.id)!;const learner={userId:row.userId,scope:row.scope},key=canonical({courseId:course.id,learner});
+        if(!materialObservations.has(key)){const observed=await observePublication(authority,publication,learner);materialObservations.set(key,{publication,learner,observationHash:trainingDutyHash(observed)});}course.materialReady=true;}
       const record = exact ? local.records.get(`${assignment.userId}:${pin.courseId}`)??null : null;
       const result={ ...pin, readiness:'source_changed',retainedScope,retainedScopeObservationHash:retainedAuthority?.observationHash??null, recordId: record?.id ?? null,
         certificateNumber: record?.certificateNumber ?? null, completedAt: dutyTimestamp(record?.completedAt),
@@ -274,6 +278,7 @@ export async function getDutyReadiness(authority: TrainingAuthorityContext, valu
   }
   // Recheck every distinct source and applicability scope after all local reads.
   for(const observed of observations.values())await resolveObligationScope(authority,'duties:read',observed.userId,observed.scope,observed.value);
+  for(const observed of materialObservations.values())if(trainingDutyHash(await observePublication(authority,observed.publication,observed.learner))!==observed.observationHash)throw Object.assign(new Error('Material authority changed during readiness observation'),{statusCode:409});
   // Expiration is evaluated at the response cutoff, after potentially slow
   // native callbacks. A completion expiring during observation cannot be ready.
   const cutoff=Date.now();for(const evaluate of evaluateCompletions)evaluate(cutoff);

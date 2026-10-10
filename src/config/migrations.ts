@@ -196,6 +196,32 @@ const MIGRATIONS: string[] = [
   `DROP TRIGGER IF EXISTS acc_training_impact_history_guard ON acc_training_impact_events`,
   `CREATE TRIGGER acc_training_impact_history_guard BEFORE UPDATE OR DELETE ON acc_training_impact_events
    FOR EACH ROW EXECUTE FUNCTION acc_training_immutable_history()`,
+  `ALTER TABLE acc_training_courses ADD COLUMN IF NOT EXISTS material_scope JSONB`,
+  `ALTER TABLE acc_training_courses ADD COLUMN IF NOT EXISTS material_draft_id UUID`,
+  `ALTER TABLE acc_training_courses ADD COLUMN IF NOT EXISTS material_publication_id UUID`,
+  `CREATE TABLE IF NOT EXISTS acc_training_material_drafts (
+   id UUID PRIMARY KEY,course_id INTEGER NOT NULL REFERENCES acc_training_courses(id),created_by INTEGER NOT NULL,
+   idempotency_key UUID NOT NULL,request JSONB NOT NULL,request_hash TEXT NOT NULL,author_authority_hash TEXT NOT NULL,
+   status TEXT NOT NULL CHECK(status IN('draft','reviewed','rejected','published')),revision INTEGER NOT NULL DEFAULT 1,
+   reviewed_by INTEGER,review_authority_hash TEXT,review_reason TEXT,reviewed_at TIMESTAMPTZ,
+   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(created_by,idempotency_key))`,
+  `CREATE OR REPLACE FUNCTION acc_training_material_draft_guard() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+   IF TG_OP='DELETE' THEN RAISE EXCEPTION 'Training material drafts are retained'; END IF;
+   IF ROW(NEW.id,NEW.course_id,NEW.created_by,NEW.idempotency_key,NEW.request,NEW.request_hash,NEW.author_authority_hash,NEW.created_at)
+   IS DISTINCT FROM ROW(OLD.id,OLD.course_id,OLD.created_by,OLD.idempotency_key,OLD.request,OLD.request_hash,OLD.author_authority_hash,OLD.created_at)
+   THEN RAISE EXCEPTION 'Training material source is immutable'; END IF;RETURN NEW;END; $$`,
+  `DROP TRIGGER IF EXISTS acc_training_material_draft_guard ON acc_training_material_drafts`,
+  `CREATE TRIGGER acc_training_material_draft_guard BEFORE UPDATE OR DELETE ON acc_training_material_drafts FOR EACH ROW EXECUTE FUNCTION acc_training_material_draft_guard()`,
+  `CREATE TABLE IF NOT EXISTS acc_training_material_publications (
+   id UUID PRIMARY KEY,course_id INTEGER NOT NULL REFERENCES acc_training_courses(id),draft_id UUID NOT NULL UNIQUE REFERENCES acc_training_material_drafts(id),
+   content_revision INTEGER NOT NULL,runtime_hash TEXT NOT NULL,runtime_snapshot JSONB NOT NULL,receipt JSONB NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
+  `DROP TRIGGER IF EXISTS acc_training_material_publication_guard ON acc_training_material_publications`,
+  `CREATE TRIGGER acc_training_material_publication_guard BEFORE UPDATE OR DELETE ON acc_training_material_publications FOR EACH ROW EXECUTE FUNCTION acc_training_immutable_history()`,
+  `CREATE TABLE IF NOT EXISTS acc_training_material_events (
+   id BIGSERIAL PRIMARY KEY,draft_id UUID NOT NULL REFERENCES acc_training_material_drafts(id),revision INTEGER NOT NULL,actor_user_id INTEGER NOT NULL,
+   action TEXT NOT NULL,snapshot JSONB NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(draft_id,revision))`,
+  `DROP TRIGGER IF EXISTS acc_training_material_event_guard ON acc_training_material_events`,
+  `CREATE TRIGGER acc_training_material_event_guard BEFORE UPDATE OR DELETE ON acc_training_material_events FOR EACH ROW EXECUTE FUNCTION acc_training_immutable_history()`,
 ];
 
 export async function runMigrations(): Promise<void> {
