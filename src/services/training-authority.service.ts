@@ -150,7 +150,7 @@ const transport = new TrainingAuthorityTransport(config.authority);
 export interface ObligationScopeObservation {
   scope: TrainingObligationScope; userId: number; eligible: boolean; roles: string[]; observationHash: string; scopeFingerprint: string;
 }
-export async function resolveObligationScope(context: TrainingAuthorityContext, action: 'obligations:read' | 'obligations:manage' | 'obligations:withdraw',
+export async function resolveObligationScope(context: TrainingAuthorityContext, action: 'obligations:read' | 'obligations:manage' | 'obligations:withdraw' | 'duties:read',
   userId: number, scope: TrainingObligationScope, expected?: ObligationScopeObservation): Promise<ObligationScopeObservation> {
   const data = await transport.resolve(context, { op: 'obligation', action, userId, scope,
     ...(expected ? { expectedScopeFingerprint: expected.scopeFingerprint } : {}) });

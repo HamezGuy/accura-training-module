@@ -157,7 +157,9 @@ Assignments are checked by the EDC authority, persisted with their course versio
 and content revision, and included in the existing compliance reports. Assignment
 is explicit per learner; it does not silently enroll every future member of a role.
 
-The selected site must be an active child of the selected active parent study.
+The selected site must be a retained active, pending or suspended child of a
+retained active, pending or suspended parent study. Training preparation grants
+no clinical conduct permission; clinical activation and enrollment remain gated.
 The learner must have the selected active native role at that exact site (or exact
 parent study when no site is specified). An arm is a native `study_group` in an
 active `study_group_class` of type `Arm` belonging to the parent study; arbitrary
@@ -199,9 +201,33 @@ the training database. Reports do not prove every clinical duty has an assigned
 curriculum; the sponsor must approve and populate the study training plan and
 validate it in deployment. Independent review here uses the existing authenticated
 training verification workflow; it is not a new signature/re-authentication policy.
-This work does not activate clinical studies or enforce a clinical launch gate:
-the legacy `trainingGateMiddleware` has no runtime callers in the inspected EDC API.
-It does not by itself establish regulatory compliance or TA3 program performance.
+The matching native EDC lifecycle now consumes an independently reviewed,
+versioned `training-duty-policy/1` in its existing clinical decision packet.
+Structured authoring accounts for every active staff role and common plus each
+native intervention arm. Each declaration explicitly names delegated activities
+and exact obligation/course/content revisions, or gives a reviewed reason that
+no additional training is required. An empty assignment is never a completion.
+
+Authenticated `POST /api/training/duty-readiness` returns a nonce-bound, hashed
+current observation. The native actor may read their own duty evidence; an exact
+scope investigator or training manager may assess the minimal activation census.
+That purpose-specific census permission does not grant general training management.
+Retained obligation scope and declared policy scope are both reauthorized; an
+explicit common course can apply across arms without changing its custody.
+Obligations, courses and completions are read from one short local PostgreSQL
+snapshot, released before native HTTP callbacks. Native identity observations are
+rechecked and the clinical transaction refreshes the exact proof before audit and
+commit. The consumer has a 15-second deadline and four concurrent observations;
+unavailable, changed, malformed or incomplete evidence refuses the clinical action.
+Bearer credentials remain request-local and never enter the retained proof.
+
+The implemented duties are site activation, new participant enrollment and arm
+assignment. An approved historical activation receipt cannot authorize a new
+clinical action after its required course changes. Existing data entry, safety
+reporting, supply handling, reads and ongoing care do not receive a new blanket
+training gate. Cross-service observations are not a distributed atomic commit;
+the clinical receipt records this limitation. These controls do not by themselves
+establish clinical curriculum adequacy, regulatory compliance or TA3 performance.
 
 Focused qualification uses the actual training HTTP routes and native EDC authority
 source against disposable PostgreSQL. Run `npm test`, `npm run build`, and the

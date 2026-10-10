@@ -7,6 +7,7 @@ import {errorHandler} from '../../src/middleware/errorHandler.middleware';
 import {pool} from '../../src/config/database';
 import {runMigrations} from '../../src/config/migrations';
 import {nativeTrainingAuthority} from '../fixtures/native-training-authority';
+import {trainingDutyHash} from '../../src/services/training-obligations.service';
 
 jest.mock('../../src/config/environment',()=>({config:{database:{url:process.env['TRAINING_OBLIGATION_TEST_DATABASE_URL']??'postgresql://127.0.0.1:1/disabled',ssl:false},authority:{baseUrl:'https://authority.invalid',timeoutMs:1000},training:{certificateValidityDays:365}}}));
 jest.mock('../../src/config/logger',()=>({logger:{info:jest.fn(),error:jest.fn(),warn:jest.fn(),debug:jest.fn()}}));
@@ -153,5 +154,76 @@ owned('native obligation scope, durable assignment and completion evidence',()=>
     expect((await api(33).post(`/verify/${recordId}`,{notes:'Reviewed'})).status).toBe(200);
     expect((await api().post(`/verify/${recordId}`,{notes:'Overwrite'})).status).toBe(409);
     expect((await nativePool.query('SELECT notes FROM acc_training_records WHERE id=$1',[recordId])).rows[0].notes).toBe('Reviewed');
+  });
+  const dutyPolicy=(row:any)=>({schemaVersion:'training-duty-policy/1',scope:{studyId:100,siteId:101},assignments:[
+    {userId:22,role:'coordinator',duties:['participant_enrollment','arm_assignment'],disposition:'not_required',rationale:'Synthetic common activity needs no additional course',obligations:[]},
+    {userId:22,role:'coordinator',armId:5,duties:['participant_enrollment','arm_assignment'],disposition:'required',rationale:'Synthetic arm procedure requires assigned curriculum',
+      obligations:[{id:row.id,revision:row.revision,courseId:row.courseId,courseVersion:row.courseVersion,contentRevision:row.contentRevision}]}]});
+  const dutyRequest=(policy:any,extra:object={})=>({schemaVersion:'training-duty-readiness-request/1',nonce:'d'.repeat(32),policy,actorUserId:22,duty:'arm_assignment',armIds:[5],...extra});
+  test('actual duty route requires exact current independently verified course then immediately denies a content revision change',async()=>{
+    const row=await assign(),policy=dutyPolicy(row),req=dutyRequest(policy);
+    expect((await api(22).post('/duty-readiness',req)).body.data).toMatchObject({ready:false});
+    const recordId=await complete();expect((await api(22).post('/duty-readiness',req)).body.data.ready).toBe(false);
+    expect((await api(33).post(`/verify/${recordId}`,{notes:'Independent synthetic procedure review'})).status).toBe(200);
+    const observed=await api(22).post('/duty-readiness',req);expect(observed.status).toBe(200);expect(observed.headers['cache-control']).toBe('no-store');
+    expect(observed.body.data).toMatchObject({ready:true,nonce:req.nonce,policyHash:trainingDutyHash(policy),actorUserId:22,armIds:[5]});
+    const {schemaVersion,nonce,observedAt,consistency,evidenceHash,...exportedEvidence}=observed.body.data;expect(trainingDutyHash(exportedEvidence)).toBe(evidenceHash);
+    expect(observed.body.data.assignments[1].obligations[0]).toMatchObject({retainedScope:{studyId:100,siteId:101,armId:5},verifiedBy:33,recordId});
+    await nativePool.query("UPDATE acc_training_questions SET question_text='Revised procedure' WHERE id=$1",[questionId]);
+    const changed=await api(22).post('/duty-readiness',req);expect(changed.body.data.ready).toBe(false);expect(changed.body.data.assignments[1].obligations[0].readiness).toBe('retraining_required');
+    expect((await nativePool.query('SELECT COUNT(*) FROM acc_training_record_history')).rows[0].count).toBe('0');
+  });
+  test('three-arm declarations preserve modular applicability and an unrelated missing course does not block the selected arm',async()=>{
+    await nativePool.query("INSERT INTO study_group VALUES(8,1,'Arm B'),(9,1,'Arm C')");
+    const row=await assign(),recordId=await complete();await api(33).post(`/verify/${recordId}`,{notes:'Verified'});const policy=dutyPolicy(row);
+    policy.assignments.push({...policy.assignments[1],armId:8,obligations:[{...policy.assignments[1].obligations[0],id:999}]},
+      {...policy.assignments[0],armId:9} as any);
+    expect((await api(22).post('/duty-readiness',dutyRequest(policy))).body.data.ready).toBe(true);
+    const wrong=await api(22).post('/duty-readiness',dutyRequest(policy,{armIds:[8]}));expect(wrong.body.data.ready).toBe(false);
+    expect((await api(22).post('/duty-readiness',dutyRequest(policy,{armIds:[9]}))).body.data.ready).toBe(true);
+    expect((await api(22).post('/duty-readiness',dutyRequest(policy,{duty:'participant_enrollment',armIds:[]}))).body.data.assignments).toHaveLength(1);
+    expect((await api(22).post('/duty-readiness',dutyRequest(policy,{armIds:[999]}))).body.data.ready).toBe(false);
+  });
+  test('a verified completion expiring during final native callbacks cannot be ready at the response cutoff',async()=>{
+    const row=await assign(),recordId=await complete();expect((await api(33).post(`/verify/${recordId}`,{notes:'Independent synthetic review'})).status).toBe(200);
+    const expires=Date.now()+500;
+    await nativePool.query('UPDATE acc_training_records SET expiration_date=$1 WHERE id=$2',[new Date(expires),recordId]);
+    let scopes=0,crossed=false;intercept=async input=>{if(input.action==='duties:read'&&++scopes===3){expect(Date.now()).toBeLessThan(expires);await new Promise(resolve=>setTimeout(resolve,Math.max(1,expires-Date.now()+40)));crossed=true;}};
+    const observed=await api(22).post('/duty-readiness',dutyRequest(dutyPolicy(row)));intercept=undefined;
+    expect(observed.status).toBe(200);expect(crossed).toBe(true);expect(Date.parse(observed.body.data.observedAt)).toBeGreaterThanOrEqual(expires);
+    expect(observed.body.data.ready).toBe(false);expect(observed.body.data.assignments[1].obligations[0].readiness).toBe('retraining_required');
+    expect(observed.body.data.blockers).toContain(`Learner 22, obligation ${row.id}: retraining_required.`);
+  });
+  test('retained parent obligation loses readiness after parent role revocation even while child role remains current',async()=>{
+    await nativePool.query("INSERT INTO study_user_role VALUES('learner',100,'ra',1)");
+    const assigned=await api().post('/obligations',payload({scope:{studyId:100}}));expect(assigned.status).toBe(201);
+    const recordId=await complete();await api(33).post(`/verify/${recordId}`,{notes:'Verified'});const policy=dutyPolicy(assigned.body.data);
+    expect((await api(22).post('/duty-readiness',dutyRequest(policy))).body.data.ready).toBe(true);
+    await nativePool.query("UPDATE study_user_role SET status_id=5 WHERE user_name='learner' AND study_id=100");
+    const result=await api(22).post('/duty-readiness',dutyRequest(policy));expect(result.status).toBe(200);expect(result.body.data.ready).toBe(false);expect(result.body.data.assignments[1].obligations[0].readiness).toBe('scope_changed');
+  });
+  test('own census cannot escalate to other staff, cross-site manager scope or a claimed actor',async()=>{
+    const policy=dutyPolicy(await assign());
+    expect((await api(33).post('/duty-readiness',dutyRequest(policy))).status).toBe(403);
+    const census={schemaVersion:'training-duty-readiness-request/1',nonce:'a'.repeat(32),policy};
+    expect((await api(33).post('/duty-readiness',census)).status).toBe(403);
+    await nativePool.query("UPDATE user_account_extended SET platform_role='data_manager' WHERE user_id=33;DELETE FROM study_user_role WHERE user_name='reviewer';INSERT INTO study_user_role VALUES('reviewer',102,'study_director',1)");
+    expect((await api(33).post('/duty-readiness',census)).status).toBe(403);
+    policy.assignments[0].userId=33;expect((await api(22).post('/duty-readiness',{...census,policy})).status).toBe(403);
+  });
+  test('pending or suspended scope permits preparation, but removed scope and revoked role never qualify',async()=>{
+    await nativePool.query('UPDATE study SET status_id=4 WHERE study_id=101');const row=await assign();
+    await nativePool.query('UPDATE study SET status_id=2 WHERE study_id=100');const p=dutyPolicy(row);
+    const request=dutyRequest(p,{duty:'participant_enrollment',armIds:[]});expect((await api(22).post('/duty-readiness',request)).body.data.ready).toBe(true);
+    await nativePool.query("UPDATE study_user_role SET status_id=5 WHERE user_name='learner'");expect((await api(22).post('/duty-readiness',request)).body.data.ready).toBe(false);
+    await nativePool.query('UPDATE study SET status_id=5 WHERE study_id=101');expect((await api(22).post('/duty-readiness',request)).status).toBe(409);
+  });
+  test('mid-observation authority change, withdrawn obligation, wrong exact pin and malformed empty policy cannot produce readiness',async()=>{
+    const row=await assign(),recordId=await complete();await api(33).post(`/verify/${recordId}`,{notes:'Verified'});const p=dutyPolicy(row),req=dutyRequest(p);
+    let scopes=0;intercept=async input=>{if(input.action==='duties:read'&&++scopes===3)await nativePool.query("UPDATE study_user_role SET status_id=5 WHERE user_name='learner'");};
+    expect((await api(22).post('/duty-readiness',req)).status).toBe(409);intercept=undefined;await nativePool.query("UPDATE study_user_role SET status_id=1 WHERE user_name='learner'");
+    p.assignments[1].obligations[0].revision++;expect((await api(22).post('/duty-readiness',req)).body.data.ready).toBe(false);p.assignments[1].obligations[0].revision--;
+    expect((await api().post(`/obligations/${row.id}/withdraw`,{expectedRevision:1,reason:'Duty removed'})).status).toBe(200);expect((await api(22).post('/duty-readiness',req)).body.data.ready).toBe(false);
+    expect((await api(22).post('/duty-readiness',{...req,policy:{...p,assignments:[]}})).status).toBe(400);
   });
 });

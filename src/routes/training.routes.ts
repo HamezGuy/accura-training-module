@@ -119,6 +119,11 @@ router.post(
 router.get('/my-records', asyncHandler<AuthRequest>(controller.getMyRecords));
 router.get('/my-record-history', asyncHandler<AuthRequest>(controller.getMyRecordHistory));
 
+router.post('/duty-readiness', asyncHandler<AuthRequest>(async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ success: true, data: await obligations.getDutyReadiness(req.trainingAuthority!, req.body) });
+}));
+
 const obligationSchema = Joi.object({
   userId:Joi.number().integer().positive().strict().required(), courseId:Joi.number().integer().positive().strict().required(),
   contentRevision:Joi.number().integer().positive().strict().required(), role:Joi.string().required(),

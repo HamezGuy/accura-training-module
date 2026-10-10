@@ -167,3 +167,29 @@ export interface TrainingObligationView extends TrainingObligation {
   completedLate: boolean; verifiedLate: boolean;
   completedAt: string | null; verifiedAt: string | null; verifiedBy: number | null;
 }
+
+/** Proposed duty assignments are approved by the native clinical lifecycle,
+ * never by the training assessment endpoint itself. */
+export interface TrainingDutyPolicy {
+  schemaVersion: 'training-duty-policy/1';
+  scope: { studyId: number; siteId?: number };
+  assignments: Array<{
+    userId: number;
+    role: string;
+    armId?: number;
+    disposition: 'required' | 'not_required';
+    rationale: string;
+    duties: Array<'site_activation' | 'participant_enrollment' | 'arm_assignment'>;
+    obligations: Array<{ id: number; revision: number; courseId: number; courseVersion: string; contentRevision: number }>;
+  }>;
+}
+
+export interface TrainingDutyReadinessRequest {
+  schemaVersion: 'training-duty-readiness-request/1';
+  nonce: string;
+  policy: TrainingDutyPolicy;
+  /** Omitted only when evaluating the complete activation census. */
+  actorUserId?: number;
+  duty?: 'participant_enrollment' | 'arm_assignment';
+  armIds?: number[];
+}

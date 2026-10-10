@@ -1,8 +1,9 @@
 import { getRoleByName, ROLES } from '@accura-trial/auth-core';
+import { createHash } from 'node:crypto';
 import { query, queryOne, transaction, TransactionClient } from '../config/database';
 import { logAudit } from './audit.service';
 import { authorizeTrainingTargets, resolveObligationScope, TrainingAuthorityContext } from './training-authority.service';
-import { TrainingCourse, TrainingObligation, TrainingObligationRequest, TrainingObligationScope, TrainingObligationView, TrainingRecord } from '../types/training.types';
+import { TrainingCourse, TrainingDutyPolicy, TrainingDutyReadinessRequest, TrainingObligation, TrainingObligationRequest, TrainingObligationScope, TrainingObligationView, TrainingRecord } from '../types/training.types';
 
 function fail(message: string, statusCode = 409): never { throw Object.assign(new Error(message), { statusCode }); }
 const id = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) > 0 && Number(value) <= 2147483647;
@@ -97,7 +98,7 @@ export function obligationReadiness(obligation: TrainingObligation, course: Trai
   if (record.status !== 'completed') return record.status === 'in_progress' ? 'in_progress' : 'pending';
   if (!record.completedAt || !Number.isFinite(new Date(record.completedAt).getTime()) || !record.certificateNumber) return 'pending';
   if (!record.verifiedAt || !record.verifiedBy || record.verifiedBy === obligation.userId || !Number.isFinite(new Date(record.verifiedAt).getTime())
-    || new Date(record.verifiedAt).getTime() < new Date(record.completedAt).getTime()) return 'awaiting_verification';
+    || new Date(record.verifiedAt).getTime() < new Date(record.completedAt).getTime() || new Date(record.verifiedAt).getTime() > now) return 'awaiting_verification';
   return 'complete';
 }
 
@@ -156,4 +157,115 @@ export async function getObligationHistory(authority: TrainingAuthorityContext, 
   const checked = await authorizeTrainingTargets(authority, 'records:read', [userId], {scopeFingerprint: admitted.scopeFingerprint});
   if (!checked.decisions[0]?.allowed) fail('The learner is outside your current scope', 403);
   return {schemaVersion: 'training-obligation-history/1', learnerId: userId, exportedAt: new Date().toISOString(), events: rows, records: records.rows, history: history.rows, audit: audit.rows};
+}
+
+const dutyNames = ['site_activation', 'participant_enrollment', 'arm_assignment'];
+const dutyTimestamp=(value:unknown):string|null=>value===null||value===undefined||!Number.isFinite(new Date(value as string).getTime())?null:new Date(value as string).toISOString();
+const isObject = (value: unknown): value is Record<string, any> => !!value && typeof value === 'object' && !Array.isArray(value);
+function exactObject(value: unknown, keys: string[]): asserts value is Record<string, any> {
+  if (!isObject(value) || Object.keys(value).some(key => !keys.includes(key))) fail('An exact duty policy object is required', 400);
+}
+function canonical(value: any): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+  if (isObject(value)) return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}`;
+  return JSON.stringify(value);
+}
+export const trainingDutyHash = (value: unknown): string => createHash('sha256').update(canonical(value)).digest('hex');
+
+/** Strict, bounded source contract. Empty requirements never mean trained. */
+export function validateDutyPolicy(value: unknown): asserts value is TrainingDutyPolicy {
+  exactObject(value, ['schemaVersion', 'scope', 'assignments']);
+  if (value.schemaVersion !== 'training-duty-policy/1') fail('Unsupported training duty policy', 400);
+  exactObject(value.scope, ['studyId', 'siteId']);
+  if (!id(value.scope.studyId) || value.scope.siteId !== undefined && !id(value.scope.siteId)) fail('Exact native duty scope is required', 400);
+  if (!Array.isArray(value.assignments) || value.assignments.length < 1 || value.assignments.length > 1000) fail('A complete duty census of 1 to 1000 assignments is required', 400);
+  const assignments = new Set<string>();
+  let total = 0;
+  for (const assignment of value.assignments) {
+    exactObject(assignment, ['userId', 'role', 'armId', 'disposition', 'rationale', 'duties', 'obligations']);
+    if (!id(assignment.userId) || typeof assignment.role !== 'string' || getRoleByName(assignment.role).name !== assignment.role || assignment.role === ROLES.INVALID.name) fail('Each duty needs an exact learner and canonical native role', 400);
+    if(assignment.armId!==undefined&&!id(assignment.armId)||!['required','not_required'].includes(assignment.disposition))fail('Explicit native arm applicability and training disposition are required',400);
+    reason(assignment.rationale);
+    const key = `${assignment.userId}:${assignment.role}:${assignment.armId??'common'}`;
+    if (assignments.has(key)) fail('Duplicate learner/role duty assignment', 400);
+    assignments.add(key);
+    if (!Array.isArray(assignment.duties) || assignment.disposition==='required'&&!assignment.duties.length || assignment.duties.some((d: unknown) => typeof d !== 'string' || !dutyNames.includes(d)) || new Set(assignment.duties).size !== assignment.duties.length) fail('Explicit supported delegated duties are required', 400);
+    if (!Array.isArray(assignment.obligations) || assignment.obligations.length > 32 || (assignment.disposition==='required'?assignment.obligations.length<1:assignment.obligations.length!==0)) fail('Required training needs exact obligations; no-extra-training needs an explicit rationale and no obligation pins', 400);
+    const obligations = new Set<number>();
+    for (const pin of assignment.obligations) {
+      exactObject(pin, ['id', 'revision', 'courseId', 'courseVersion', 'contentRevision']);
+      if (![pin.id, pin.revision, pin.courseId, pin.contentRevision].every(id) || typeof pin.courseVersion !== 'string' || !pin.courseVersion.trim() || pin.courseVersion.length > 20 || obligations.has(pin.id)) fail('Unique exact obligation and course revision pins are required', 400);
+      obligations.add(pin.id);
+      if (++total > 1000) fail('Duty policy exceeds the qualified obligation census; no requirements were omitted', 400);
+    }
+  }
+}
+
+/** Assessment of an explicitly supplied policy, not approval of its adequacy.
+ * Native clinical decisions retain and independently approve that exact policy.
+ * Remote authority and training reads are current observations, not a distributed transaction. */
+export async function getDutyReadiness(authority: TrainingAuthorityContext, value: unknown) {
+  exactObject(value, ['schemaVersion', 'nonce', 'policy', 'actorUserId', 'duty', 'armIds']);
+  if (value.schemaVersion !== 'training-duty-readiness-request/1' || typeof value.nonce !== 'string' || !/^[a-f0-9]{32}$/.test(value.nonce)) fail('An exact duty request and fresh nonce are required', 400);
+  validateDutyPolicy(value.policy);
+  if ((value.actorUserId === undefined) !== (value.duty === undefined) || value.actorUserId !== undefined && (!id(value.actorUserId) || !['participant_enrollment', 'arm_assignment'].includes(value.duty))) fail('An actor-specific request requires an exact learner and delegated duty', 400);
+  if (value.actorUserId !== undefined && value.actorUserId !== authority.actorUserId) fail('A clinical duty assessment must identify the authenticated actor', 403);
+  if(value.armIds!==undefined&&(value.actorUserId===undefined||!Array.isArray(value.armIds)||value.armIds.length>100||value.armIds.some((n:unknown)=>!id(n))||new Set(value.armIds).size!==value.armIds.length))fail('Exact distinct native arm selection is required',400);
+  const request = value as unknown as TrainingDutyReadinessRequest;
+  const selected = request.policy.assignments.filter(row => request.actorUserId === undefined || row.userId === request.actorUserId && row.duties.includes(request.duty!)&&(row.armId===undefined||request.armIds?.includes(row.armId)));
+  const blockers: string[] = [];
+  if (!selected.length) blockers.push('The acting staff member has no approved assignment for this duty.');
+  if(request.actorUserId!==undefined){for(const arm of [undefined,...request.armIds??[]])if(!selected.some(a=>a.armId===arm))blockers.push(`The acting staff member has no delegated ${request.duty} assignment for ${arm===undefined?'common duties':`arm ${arm}`}.`);}
+  const assignments = [];
+  const evaluateCompletions:Array<(cutoff:number)=>void>=[];
+  // One short local MVCC snapshot, released before any native HTTP callback.
+  // A course and completion can never be assembled from different revisions.
+  const pins=selected.flatMap(assignment=>assignment.obligations);
+  const local=pins.length?await transaction(async client=>{
+    await client.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
+    const obligations=await client.query<TrainingObligation>('SELECT * FROM acc_training_obligations WHERE id=ANY($1::integer[])',[[...new Set(pins.map(pin=>pin.id))]]);
+    const courses=await client.query<TrainingCourse>('SELECT * FROM acc_training_courses WHERE id=ANY($1::integer[])',[[...new Set(pins.map(pin=>pin.courseId))]]);
+    const records=await client.query<TrainingRecord>('SELECT * FROM acc_training_records WHERE user_id=ANY($1::integer[]) AND course_id=ANY($2::integer[])',[[...new Set(selected.map(row=>row.userId))],[...new Set(pins.map(pin=>pin.courseId))]]);
+    return {obligations:new Map(obligations.rows.map(row=>[row.id,row])),courses:new Map(courses.rows.map(row=>[row.id,row])),records:new Map(records.rows.map(row=>[`${row.userId}:${row.courseId}`,row]))};
+  }):{obligations:new Map<number,TrainingObligation>(),courses:new Map<number,TrainingCourse>(),records:new Map<string,TrainingRecord>()};
+  // Resolve the retained obligation scope as well as its declared applicability.
+  // A parent obligation does not remain valid after its parent's role is revoked.
+  const observations=new Map<string,{userId:number;scope:TrainingObligationScope;value:Awaited<ReturnType<typeof resolveObligationScope>>}>();
+  const observe=async(userId:number,scope:TrainingObligationScope)=>{const key=canonical({userId,scope});const prior=observations.get(key);if(prior)return prior.value;
+    const value=await resolveObligationScope(authority,'duties:read',userId,scope);observations.set(key,{userId,scope,value});return value;};
+  for (const assignment of selected) {
+    const scope=canonicalScope({...request.policy.scope,...(assignment.armId===undefined?{}:{armId:assignment.armId})});
+    const observation = await observe(assignment.userId, scope);
+    if (!observation.eligible || !observation.roles.includes(assignment.role)) blockers.push(`Learner ${assignment.userId} no longer holds the assigned native role in this scope.`);
+    const evidence = [];
+    for (const pin of assignment.obligations) {
+      const row = local.obligations.get(pin.id);
+      const applicable = row && row.userId === assignment.userId && row.role === assignment.role && row.scope.studyId === request.policy.scope.studyId
+        && (row.scope.siteId === undefined || row.scope.siteId === request.policy.scope.siteId)
+        && (row.scope.armId === undefined || row.scope.armId === assignment.armId);
+      const exact = applicable && row.revision === pin.revision && row.courseId === pin.courseId && row.courseVersion === pin.courseVersion && row.contentRevision === pin.contentRevision;
+      const retainedScope=exact?canonicalScope(row.scope):null;
+      const retainedAuthority=retainedScope?await observe(assignment.userId,retainedScope):null;
+      const course = exact ? local.courses.get(pin.courseId) : null;
+      const record = exact ? local.records.get(`${assignment.userId}:${pin.courseId}`)??null : null;
+      const result={ ...pin, readiness:'source_changed',retainedScope,retainedScopeObservationHash:retainedAuthority?.observationHash??null, recordId: record?.id ?? null,
+        certificateNumber: record?.certificateNumber ?? null, completedAt: dutyTimestamp(record?.completedAt),
+        verifiedAt: dutyTimestamp(record?.verifiedAt), verifiedBy: record?.verifiedBy ?? null };
+      evaluateCompletions.push(cutoff=>{
+        result.readiness=exact&&course?obligationReadiness(row,course,record,observation.eligible&&observation.roles.includes(assignment.role)&&retainedAuthority?.eligible&&retainedAuthority.roles.includes(assignment.role)?'current':'changed',cutoff):'source_changed';
+        if(result.readiness!=='complete')blockers.push(`Learner ${assignment.userId}, obligation ${pin.id}: ${result.readiness}.`);
+      });
+      evidence.push(result);
+    }
+    assignments.push({ userId: assignment.userId, role: assignment.role, ...(assignment.armId===undefined?{}:{armId:assignment.armId}), disposition:assignment.disposition,rationale:assignment.rationale,duties: assignment.duties,
+      scopeObservationHash: observation.observationHash, scopeFingerprint: observation.scopeFingerprint, obligations: evidence });
+  }
+  // Recheck every distinct source and applicability scope after all local reads.
+  for(const observed of observations.values())await resolveObligationScope(authority,'duties:read',observed.userId,observed.scope,observed.value);
+  // Expiration is evaluated at the response cutoff, after potentially slow
+  // native callbacks. A completion expiring during observation cannot be ready.
+  const cutoff=Date.now();for(const evaluate of evaluateCompletions)evaluate(cutoff);
+  const evidence = { policyHash: trainingDutyHash(request.policy), actorUserId: request.actorUserId ?? null, duty: request.duty ?? 'complete_census',armIds:request.armIds??[], assignments, blockers, ready: !blockers.length };
+  return { schemaVersion: 'training-duty-readiness/1', nonce: request.nonce, observedAt: new Date(cutoff).toISOString(),
+    consistency: 'current-observations-not-atomic', ...evidence, evidenceHash: trainingDutyHash(evidence) };
 }
