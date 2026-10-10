@@ -1,4 +1,6 @@
 import {obligationReadiness,validateObligationRequest} from '../../src/services/training-obligations.service';
+import {verifyRecordAssessment} from '../../src/services/training-assessment-evidence';
+import {mapRecordToDto} from '../../src/services/training-record-dto';
 jest.mock('../../src/config/database',()=>({}));
 jest.mock('../../src/config/logger',()=>({logger:{}}));
 jest.mock('../../src/services/training-authority.service',()=>({}));
@@ -7,6 +9,17 @@ const obligation:any={userId:22,courseId:1,courseVersion:'2',contentRevision:8,s
 const course:any={active:true,version:'2',contentRevision:8};
 const record:any={userId:22,status:'completed',courseVersion:'2',contentRevision:8,expirationDate:'2027-01-01',completedAt:'2026-10-09T09:00:00Z',certificateNumber:'CERT',verifiedBy:33,verifiedAt:'2026-10-09T10:00:00Z'};
 test('only current independent evidence can satisfy an obligation',()=>{expect(obligationReadiness(obligation,course,record,'current',now)).toBe('complete');});
+test('legacy independent completion remains summary-only without fabricated assessment evidence',async()=>{
+ const legacy={...record,id:17,courseId:1};const query=jest.fn(async()=>({rows:[]}));
+ await verifyRecordAssessment({query} as any,legacy);
+ expect(legacy.assessmentEvidenceVerified).toBe(false);
+ expect(mapRecordToDto(legacy)).toMatchObject({assessmentEvidence:'legacy_summary_only',assessmentCycleId:null,assessmentReceipt:null});
+ expect(obligationReadiness(obligation,course,legacy,'current',now)).toBe('complete');
+ expect(query).toHaveBeenCalledTimes(1);
+});
+test('new assessment cycles require validated retained evidence before duty readiness',()=>{
+ expect(obligationReadiness(obligation,course,{...record,assessmentCycleId:'11111111-1111-4111-8111-111111111111',assessmentEvidenceVerified:false},'current',now)).toBe('pending');
+});
 test.each([
   ['expiry',{expirationDate:'2026-10-09T12:00:00Z'},'retraining_required'],['invalid expiry',{expirationDate:'bad'},'retraining_required'],
   ['old revision',{contentRevision:7},'retraining_required'],['missing pin',{courseVersion:null},'retraining_required'],

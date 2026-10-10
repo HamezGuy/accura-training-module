@@ -73,6 +73,8 @@ export interface TrainingQuizAnswer {
   selectedOptions: number[];
 }
 
+export interface TrainingAssessmentReference { id:string; hash:string; cycleId:string; attemptNumber:number }
+export interface TrainingQuizSubmission { recordId:number; cycleId:string; requestId:string }
 export interface TrainingQuizResult {
   passed: boolean;
   score: number;
@@ -80,7 +82,11 @@ export interface TrainingQuizResult {
   correctAnswers: number;
   certificateNumber?: string;
   expirationDate?: string;
+  receipt?:TrainingAssessmentReference;
+  replayed?:boolean;
+  evidenceStatus?:'recorded_assessment'|'historical_assessment';
 }
+
 
 export interface CreateQuestionRequest {
   questionText: string;
@@ -102,6 +108,12 @@ export interface TrainingRecord {
   contentRevision?: number | null;
   /** Internal evidence only; controllers must never expose stored quiz answers. */
   contentSnapshot?: unknown;
+  assessmentCycleId?: string | null;
+  assessmentReceipt?: TrainingAssessmentReference | null;
+  /** Evidence category only; retained-cycle presence is not current qualification. */
+  assessmentEvidence?: 'retained_assessment_cycle' | 'legacy_summary_only';
+  /** Request-local integrity classification; never a persisted authorization grant. */
+  assessmentEvidenceVerified?: boolean;
   status: TrainingRecordStatus;
   startedAt: string | null;
   completedAt: string | null;

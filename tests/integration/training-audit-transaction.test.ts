@@ -25,6 +25,7 @@ const course = { id: 3, course_code: 'OWNED-AUDIT', course_name: 'Audit fixture'
 const record = { id: 12, user_id: 2, course_id: 3, status: 'completed',course_version:'1',content_revision:1,expiration_date:null };
 const question = { id: 7, course_id: 3, question_text: 'Fixture?', question_type: 'true_false',
   options: [{ text: 'yes', isCorrect: true }, { text: 'no', isCorrect: false }], order_index: 0 };
+const cycleId='11111111-1111-4111-8111-111111111111',requestId='22222222-2222-4222-8222-222222222222';
 const rows = (...values: Record<string, unknown>[]) => ({ rows: values, rowCount: values.length });
 const cases = [
   { name: 'course create', method: 'post', route: '/courses', action: 'course_created',
@@ -34,13 +35,13 @@ const cases = [
   { name: 'add questions', method: 'post', route: '/courses/3/questions', action: 'questions_added',
     body: { questions: [{ questionText: 'Fixture?', questionType: 'true_false', options: question.options, orderIndex: 0 }] }, responses: [rows(course), rows(course), rows(question)] },
   { name: 'start training', method: 'post', route: '/start/3', action: 'training_started',
-    body: {}, responses: [rows(course), rows(), rows(), rows(), rows(question), rows({ ...record, user_id: 1, status: 'in_progress' })] },
+    body: {}, responses: [rows(course), rows(), rows(), rows(), rows(question), rows({ ...record, user_id: 1, status: 'in_progress' }),rows()] },
   { name: 'passing quiz', method: 'post', route: '/submit-quiz/3', action: 'quiz_passed',
-    body: { contentRevision:1, answers: [{ questionId: 7, selectedOptions: [0] }] }, responses: [rows(course), rows(question), rows({...record,user_id:1,status:'in_progress'}), rows()] },
+    body: { recordId:12,cycleId,requestId,contentRevision:1, answers: [{ questionId: 7, selectedOptions: [0] }] }, responses: [] },
   { name: 'failed quiz', method: 'post', route: '/submit-quiz/3', action: 'quiz_failed',
-    body: { contentRevision:1, answers: [{ questionId: 7, selectedOptions: [1] }] }, responses: [rows(course), rows(question), rows({...record,user_id:1,status:'in_progress'}), rows()] },
+    body: { recordId:12,cycleId,requestId,contentRevision:1, answers: [{ questionId: 7, selectedOptions: [1] }] }, responses: [] },
   { name: 'verify training', method: 'post', route: '/verify/12', action: 'training_verified',
-    body: { notes: 'Owned test verification' }, responses: [rows({ user_id: 2,course_id:3 }),rows(course), rows(record), rows()] },
+    body: { notes: 'Owned test verification' }, responses: [rows({ user_id: 2,course_id:3 }),rows(course), rows(record), rows(),rows()] },
 ] as const;
 
 describe('training mutation and audit share the real database transaction boundary', () => {
@@ -50,9 +51,11 @@ describe('training mutation and audit share the real database transaction bounda
   let active: boolean, stagedWrites: number, committedWrites: number, stagedAudits: unknown[][], committedAudits: unknown[][];
   let auditAttempts: number, failAuditAt: number, businessAttempts: number, failBusinessAt: number;
   let failure: Error, rollbackFailure: Error | null;
+  let quizMode=false,quizRecord:any,quizHistory:any[];
+  const camel=(value:any)=>Object.fromEntries(Object.entries(value).map(([key,item])=>[key.replace(/_([a-z])/g,(_,c)=>c.toUpperCase()),item]));
 
   beforeEach(() => {
-    jest.clearAllMocks(); responses = []; active = false; stagedWrites = 0; committedWrites = 0;
+    quizMode=false;quizHistory=[];jest.clearAllMocks(); responses = []; active = false; stagedWrites = 0; committedWrites = 0;
     const verifier = createJwtService({ secret: 'training-audit-offline-test' });
     jest.spyOn(globalThis, 'fetch').mockImplementation(async (url, options) => {
       const bearer = new Headers(options?.headers).get('Authorization')!.slice('Bearer '.length);
@@ -91,6 +94,15 @@ describe('training mutation and audit share the real database transaction bounda
         if (++businessAttempts === failBusinessAt) throw new Error('Injected second question refusal');
         stagedWrites++;
       }
+      if(quizMode){
+        if(sql.startsWith('SELECT * FROM acc_training_courses'))return rows(course);
+        if(sql.startsWith('SELECT * FROM acc_training_obligations')||sql.startsWith('SELECT * FROM acc_training_slides'))return rows();
+        if(sql.startsWith('SELECT * FROM acc_training_questions'))return rows(question);
+        if(sql.startsWith('SELECT * FROM acc_training_records'))return rows(quizRecord);
+        if(sql.startsWith('SELECT * FROM acc_training_record_history'))return rows(...quizHistory);
+        if(sql.startsWith('UPDATE acc_training_records')){const v=params!;Object.assign(quizRecord,{status:v[1],score:v[2],attempts:1,completed_at:v[3],certificate_number:v[4],expiration_date:v[5],assessment_receipt:JSON.parse(String(v[6]))});return rows(quizRecord);}
+        if(sql.startsWith('INSERT INTO acc_training_record_history')){const v=params!;quizHistory.push({record_id:12,user_id:1,course_id:3,record_snapshot:JSON.parse(String(v[3])),event_kind:'quiz_attempt',assessment_cycle_id:v[4],request_key:v[5],request_hash:v[6],assessment:JSON.parse(String(v[7]))});return rows();}
+      }
       const response = responses.shift();
       if (!response) throw new Error(`Unexpected query: ${sql}`);
       return response;
@@ -98,6 +110,11 @@ describe('training mutation and audit share the real database transaction bounda
   });
 
   async function send(spec: typeof cases[number], body: unknown = spec.body) {
+    quizMode=spec.route==='/submit-quiz/3';
+    if(quizMode){quizRecord={...record,user_id:1,status:'in_progress',started_at:'2026-01-01T00:00:00.000Z',attempts:0,score:null,completed_at:null,certificate_number:null,
+      assessment_cycle_id:cycleId,assessment_receipt:null,content_snapshot:{course:camel(course),slides:[],questions:[camel(question)]}};
+      quizHistory=[{record_id:12,user_id:1,course_id:3,event_kind:'cycle_started',assessment_cycle_id:cycleId,record_snapshot:structuredClone(camel(quizRecord))}];}
+
     return request(app)[spec.method](`/api/training${spec.route}`).set('Authorization', `Bearer ${token}`).send(body as object);
   }
   afterEach(() => jest.restoreAllMocks());

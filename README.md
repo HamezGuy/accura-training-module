@@ -391,3 +391,46 @@ slice does not implement IL TMF ingestion or prove foreign-producer authenticity
 from an uploaded JSON document. The opt-in native test
 `training-inspection.native.postgres.test.ts` exercises actual producer HTTP,
 two isolated PostgreSQL stores and encrypted native package custody.
+
+### Exact assessment attempts and safe retry
+
+New starts retain an immutable `cycle_started` entry in the existing
+`acc_training_record_history` store. Each submission requires the returned
+`recordId` and `assessmentCycleId` (sent as `cycleId`), a caller-generated UUID
+`requestId`, the displayed `contentRevision`, and answers. The request identity
+is scoped to the authenticated learner, record and cycle. Reusing that identity
+with different answers is refused; an exact retry returns the original result
+without another attempt, certificate or audit. A UUID reused in a different
+cycle is a different scoped request. Consumers must retain the original body
+while recovering an uncertain response.
+
+The sole exact-option-set grader compares the immutable started content against
+the ordered current definition, validates question/option identities, and retains
+the submitted answers, per-question grading, content hash, native authority and
+assignment observations, certificate/expiry and record outcome. Receipt,
+completion and companion audit commit together. Source/learner observations are
+rechecked before that local transaction returns; this remains a separate native
+observation, not a distributed transaction or authorization lease.
+
+Readiness, independent verification, due observations and inspection validate
+the complete retained cycle and attempts against the record's latest cycle,
+score, content, certificate and completion dates. Removing its receipt pins
+cannot turn an assessed record into a legacy completion. Record-history updates,
+deletes and truncation are refused. Administrative schema destruction remains
+outside the application workflow; qualification resets only explicitly owned
+disposable databases and does not disable the retention guards.
+
+Public learner/history DTOs expose only result summaries and receipt references,
+never submitted choices, solution keys or whole-content snapshots. Exact retry
+after a later revision or restart still requires present learner access and is
+labeled historical recovery; it does not make that receipt current. The existing
+privileged 13-table inspection copy retains full assessment originals and verifies
+their closure. Legacy completions with no original attempt receipts remain
+summary-only; no assessment evidence is invented and their existing completion
+semantics are preserved. This documents software assessment results, not clinical
+curriculum adequacy, demonstrated staff competence, or regulatory approval.
+
+Legacy summary-only records are explicitly not assessment-verified. Requiring
+exact historical assessment receipts for an existing staff qualification is a
+separate reviewed clinical policy decision; this upgrade does not manufacture
+past attempts or silently impose that new qualification hold.

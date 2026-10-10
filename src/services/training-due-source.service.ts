@@ -3,6 +3,7 @@ import {inspectImpactSource,resolveImpactSource,resolveObligationScope,TrainingA
 import {obligationReadiness,trainingDutyHash} from './training-obligations.service';
 import {TrainingCourse,TrainingObligation,TrainingRecord,TrainingImpactSource} from '../types/training.types';
 import {assertMaterialUse} from './training-materials.service';
+import {verifyRecordAssessment} from './training-assessment-evidence';
 
 /** Exact native training obligations for a future authenticated CC task adapter.
  * No worker token, external delivery, or completed clinical action is inferred. */
@@ -40,6 +41,7 @@ export async function observeObligationDueSource(scope:{studyId:number;siteId?:n
     const records=(await client.query<TrainingRecord>(`SELECT r.* FROM acc_training_records r JOIN
       jsonb_to_recordset($1::jsonb) AS selected(user_id integer,course_id integer)
       ON r.user_id=selected.user_id AND r.course_id=selected.course_id`,[JSON.stringify(pairs)])).rows;
+    for(const record of records)await verifyRecordAssessment(client,record);
     return {obligations,courses:new Map(courses.map(row=>[row.id,row])),records:new Map(records.map(row=>[`${row.userId}:${row.courseId}`,row]))};
   });
   const observations=new Map<string,{userId:number;scope:TrainingObligation['scope'];observation:ObligationScopeObservation;state:'current'|'changed'}>();

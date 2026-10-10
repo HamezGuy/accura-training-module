@@ -6,12 +6,16 @@ import { generateCertificateNumber, calculateExpirationDate } from './certificat
 import { getObligations } from './training-obligations.service';
 import { authorizeTrainingTargets, readTrainingDirectory, revalidateTrainingDirectory, resolveObligationScope, TrainingAuthorityContext } from './training-authority.service';
 import {assertMaterialUse,materialCourseVisible} from './training-materials.service';
+import {randomUUID} from 'node:crypto';
+import {assessmentContentHash,assessmentReference,assessmentRequestHash,assertStartedContent,canonicalAnswers,gradeAssessment,sealAssessment,validateSubmission,verifyAssessmentRows,verifyRecordAssessment,AssessmentHistoryRow} from './training-assessment-evidence';
 import {
   TrainingCourse,
   TrainingRecord,
   TrainingQuizQuestion,
   TrainingQuizAnswer,
   TrainingQuizResult,
+  TrainingQuizSubmission,
+  TrainingObligation,
   TrainingComplianceStatus,
   TrainingComplianceCheck,
   CreateCourseRequest,
@@ -92,7 +96,7 @@ export async function getCourseById(
       `SELECT id, course_id, question_text, question_type, options, explanation, order_index
        FROM acc_training_questions 
        WHERE course_id = $1 AND active = true 
-       ORDER BY order_index ASC`,
+       ORDER BY order_index ASC, id ASC`,
       [courseId]
     );
 
@@ -282,7 +286,8 @@ export async function startTraining(userId: number, courseId: number, client?: T
     throw Object.assign(new Error('Training already completed'), { statusCode: 409 });
   }
 
-  if (existing?.status === 'in_progress' && current) {
+  if (existing?.status === 'in_progress' && current && existing.assessmentCycleId) {
+    await verifyRecordAssessment(client,existing);
     await recheckMaterialUse(materialProof,authority,client,course);
     return existing;
   }
@@ -292,6 +297,10 @@ export async function startTraining(userId: number, courseId: number, client?: T
     'SELECT * FROM acc_training_questions WHERE course_id = $1 AND active = true ORDER BY order_index, id', [courseId]);
   const {materialReady:_requestLocalMaterialReadiness,...snapshotCourse}=course;
   const snapshot = JSON.stringify({ course:snapshotCourse, slides, questions });
+  const cycleId=randomUUID();
+  const retainStart=async(record:TrainingRecord)=>client.query(`INSERT INTO acc_training_record_history
+    (record_id,user_id,course_id,record_snapshot,event_kind,assessment_cycle_id)
+    VALUES($1,$2,$3,$4::jsonb,'cycle_started',$5)`,[record.id,userId,courseId,JSON.stringify(record),cycleId]);
 
   if (existing) {
     await client.query(
@@ -302,126 +311,91 @@ export async function startTraining(userId: number, courseId: number, client?: T
        SET status = 'in_progress', started_at = NOW(), updated_at = NOW(),
            course_version = $2, content_revision = $3, content_snapshot = $4::jsonb,
            completed_at = NULL, score = NULL, attempts = 0, certificate_number = NULL,
-           expiration_date = NULL, verified_by = NULL, verified_at = NULL, notes = NULL
+           expiration_date = NULL, verified_by = NULL, verified_at = NULL, notes = NULL,
+           assessment_cycle_id=$5,assessment_receipt=NULL
        WHERE id = $1 RETURNING *`,
-      [existing.id, course.version, course.contentRevision, snapshot]
+      [existing.id, course.version, course.contentRevision, snapshot,cycleId]
     );
     if (!updated) throw new Error('Failed to update record');
+    await retainStart(updated);
     await recheckMaterialUse(materialProof,authority,client,course);
     return updated;
   }
 
   const record = await client.queryOne<TrainingRecord>(
-    `INSERT INTO acc_training_records (user_id, course_id, status, started_at, course_version, content_revision, content_snapshot)
-     VALUES ($1, $2, 'in_progress', NOW(), $3, $4, $5::jsonb)
+    `INSERT INTO acc_training_records (user_id, course_id, status, started_at, course_version, content_revision, content_snapshot,assessment_cycle_id)
+     VALUES ($1, $2, 'in_progress', NOW(), $3, $4, $5::jsonb,$6)
      RETURNING *`,
-    [userId, courseId, course.version, course.contentRevision, snapshot]
+    [userId, courseId, course.version, course.contentRevision, snapshot,cycleId]
   );
 
   if (!record) throw new Error('Failed to create training record');
+  await retainStart(record);
   await recheckMaterialUse(materialProof,authority,client,course);
   return record;
 }
 
 export async function submitQuiz(
-  userId: number,
-  courseId: number,
-  answers: TrainingQuizAnswer[],
-  client?: TransactionClient,
-  expectedRevision?: number,
-  authority?:TrainingAuthorityContext
-): Promise<TrainingQuizResult> {
-  if (!client) return transaction(tx => submitQuiz(userId, courseId, answers, tx, expectedRevision,authority));
-  const course = await (client ?? database).queryOne<TrainingCourse>(
-    'SELECT * FROM acc_training_courses WHERE id = $1 AND active = true FOR SHARE',
-    [courseId]
-  );
-
-  if (!course) {
-    throw Object.assign(new Error('Course not found'), { statusCode: 404 });
+  userId:number, courseId:number, answers:TrainingQuizAnswer[], client?:TransactionClient,
+  expectedRevision?:number, authority?:TrainingAuthorityContext, submission?:TrainingQuizSubmission,
+  auditContext?:{ipAddress?:string;userAgent?:string}
+):Promise<TrainingQuizResult> {
+  if(!client)return transaction(tx=>submitQuiz(userId,courseId,answers,tx,expectedRevision,authority,submission,auditContext));
+  requireUserId(userId);requireUserId(courseId);validateSubmission(submission);
+  // PostgreSQL UUID identity is case-insensitive; keep request meaning and
+  // retained-key comparisons identical to its canonical representation.
+  submission={recordId:submission.recordId,cycleId:submission.cycleId.toLowerCase(),requestId:submission.requestId.toLowerCase()};
+  if(authority?.actorUserId!==userId)throw Object.assign(new Error('An authenticated learner must submit their own assessment'),{statusCode:403});
+  if(!Number.isSafeInteger(expectedRevision)||Number(expectedRevision)<1)throw Object.assign(new Error('An exact content revision is required'),{statusCode:400});
+  const admission=await authorizeTrainingTargets(authority,'records:read',[userId]);
+  if(!admission.decisions[0]?.allowed)throw Object.assign(new Error('Training record is outside current access'),{statusCode:403});
+  const finalAccess=async()=>{const current=await authorizeTrainingTargets(authority,'records:read',[userId],{scopeFingerprint:admission.scopeFingerprint});
+    if(!current.decisions[0]?.allowed)throw Object.assign(new Error('Training access changed during the request'),{statusCode:403});};
+  const requestHash=assessmentRequestHash(userId,courseId,expectedRevision!,submission,answers);
+  // Keep the existing course -> obligations -> record lock order. An exact
+  // historical retry needs present read authority, not obsolete course currency.
+  const course=await client.queryOne<TrainingCourse>('SELECT * FROM acc_training_courses WHERE id=$1 FOR SHARE',[courseId]);
+  const obligations=(await client.query<TrainingObligation>("SELECT * FROM acc_training_obligations WHERE user_id=$1 AND course_id=$2 AND status='assigned' ORDER BY id FOR SHARE",[userId,courseId])).rows;
+  const record=await client.queryOne<TrainingRecord>('SELECT * FROM acc_training_records WHERE id=$1 AND user_id=$2 AND course_id=$3 FOR UPDATE',[submission.recordId,userId,courseId]);
+  if(!record)throw Object.assign(new Error('Training record not found'),{statusCode:404});
+  const history=(await client.query<AssessmentHistoryRow>(`SELECT * FROM acc_training_record_history WHERE record_id=$1 AND user_id=$2 AND assessment_cycle_id=$3 ORDER BY history_id`,[record.id,userId,submission.cycleId])).rows;
+  const prior=history.find(row=>row.eventKind==='quiz_attempt'&&row.requestKey===submission.requestId);
+  if(prior){verifyAssessmentRows(history,record.assessmentCycleId===submission.cycleId?record:undefined);
+    if(prior.requestHash!==requestHash)throw Object.assign(new Error('This request key was already used with different assessment answers'),{statusCode:409});
+    await finalAccess();return {...prior.assessment!.result,receipt:assessmentReference(prior.assessment!),replayed:true,evidenceStatus:'historical_assessment'};
   }
-  if(course.materialScope){if(authority?.actorUserId!==userId)throw Object.assign(new Error('Submit governed training only for the authenticated learner'),{statusCode:403});
-    await client.query("SELECT id FROM acc_training_obligations WHERE user_id=$1 AND course_id=$2 AND status='assigned' ORDER BY id FOR SHARE",[userId,courseId]);}
-  const materialProof = await assertMaterialUse(authority,client,course);
-
-  const { rows: questions } = await (client ?? database).query<TrainingQuizQuestion & { options: Array<{ text: string; isCorrect?: boolean }> }>(
-    'SELECT * FROM acc_training_questions WHERE course_id = $1 AND active = true ORDER BY order_index',
-    [courseId]
-  );
-
-  if (questions.length === 0) {
-    throw Object.assign(new Error('No quiz questions found for this course'), { statusCode: 400 });
-  }
-
-  // Grade the quiz server-side
-  let correctCount = 0;
-  for (const question of questions) {
-    const answer = answers.find((a) => a.questionId === question.id);
-    if (!answer) continue;
-
-    const options = question.options;
-    const correctIndices = options
-      .map((opt, idx) => (opt.isCorrect ? idx : -1))
-      .filter((idx) => idx >= 0);
-
-    const selectedSorted = [...answer.selectedOptions].sort();
-    const correctSorted = [...correctIndices].sort();
-
-    if (
-      selectedSorted.length === correctSorted.length &&
-      selectedSorted.every((v, i) => v === correctSorted[i])
-    ) {
-      correctCount++;
-    }
-  }
-
-  const score = Math.round((correctCount / questions.length) * 100);
-  const passed = score >= course.passingScore;
-
-  // Update the training record in a transaction
-  const updateRecord = async (client: TransactionClient) => {
-    const record = await client.queryOne<TrainingRecord>(
-      'SELECT * FROM acc_training_records WHERE user_id = $1 AND course_id = $2 FOR UPDATE',
-      [userId, courseId]
-    );
-
-    if (!record || record.status !== 'in_progress' || !Number.isSafeInteger(course.contentRevision)
-        || expectedRevision !== course.contentRevision
-        || record.contentRevision !== course.contentRevision || record.courseVersion !== course.version) {
-      throw Object.assign(new Error('Start or restart the current training content before submitting this quiz'), { statusCode: 409 });
-    }
-
-    let certificateNumber: string | undefined;
-    let expirationDate: string | undefined;
-
-    if (passed) {
-      certificateNumber = generateCertificateNumber(course.courseCode, userId);
-      const expDate = calculateExpirationDate(course.validityPeriodDays);
-      expirationDate = expDate.toISOString();
-
-      await client.query(
-        `UPDATE acc_training_records
-         SET status = 'completed', score = $1, attempts = attempts + 1,
-             completed_at = NOW(), certificate_number = $2, expiration_date = $3, updated_at = NOW()
-         WHERE id = $4`, [score, certificateNumber, expDate, record.id]);
-    } else {
-      await client.query(
-        `UPDATE acc_training_records SET score = $1, attempts = attempts + 1, updated_at = NOW()
-         WHERE id = $2`, [score, record.id]);
-    }
-
-    await recheckMaterialUse(materialProof,authority,client,course);
-    return {
-      passed,
-      score,
-      totalQuestions: questions.length,
-      correctAnswers: correctCount,
-      certificateNumber,
-      expirationDate,
-    } satisfies TrainingQuizResult;
-  };
-
-  return updateRecord(client);
+  if(!course?.active||record.status!=='in_progress'||record.assessmentCycleId!==submission.cycleId||expectedRevision!==course.contentRevision
+    ||record.contentRevision!==course.contentRevision||record.courseVersion!==course.version)throw Object.assign(new Error('Start or restart the current training content before submitting this quiz'),{statusCode:409});
+  verifyAssessmentRows(history,record);
+  const materialProof=await assertMaterialUse(authority,client,course);
+  const assignments:Array<{obligation:TrainingObligation;observation:Awaited<ReturnType<typeof resolveObligationScope>>}>=[];
+  for(const obligation of obligations){const observation=await resolveObligationScope(authority,'obligations:read',userId,obligation.scope);
+    if(!observation.eligible||!observation.roles.includes(obligation.role))throw Object.assign(new Error('Current learner assignment authority is unavailable'),{statusCode:409});
+    assignments.push({obligation,observation});}
+  const slides=(await client.query<SlideContent>('SELECT * FROM acc_training_slides WHERE course_id=$1 ORDER BY order_index,id',[courseId])).rows;
+  const questions=(await client.query<TrainingQuizQuestion>('SELECT * FROM acc_training_questions WHERE course_id=$1 AND active=true ORDER BY order_index,id',[courseId])).rows;
+  const snapshot=assertStartedContent(record,{course,slides,questions});
+  const graded=gradeAssessment(snapshot,answers);
+  const assessedAt=new Date().toISOString();
+  const result:TrainingQuizResult={...graded.result,...(graded.result.passed?{
+    certificateNumber:generateCertificateNumber(course.courseCode,userId),expirationDate:calculateExpirationDate(course.validityPeriodDays).toISOString()}: {})};
+  const receipt=sealAssessment({schemaVersion:'training-assessment/1',id:randomUUID(),grader:'exact-option-set/1',actorUserId:userId,
+    recordId:record.id,courseId,cycleId:submission.cycleId,attemptNumber:record.attempts+1,requestId:submission.requestId,requestHash,
+    contentRevision:course.contentRevision!,courseVersion:course.version,contentHash:assessmentContentHash(snapshot),startedAt:new Date(record.startedAt!).toISOString(),assessedAt,
+    answers:canonicalAnswers(answers),grades:graded.grades,result,materialProof:materialProof??null,assignments,authorityFingerprint:admission.scopeFingerprint});
+  const updated=await client.queryOne<TrainingRecord>(`UPDATE acc_training_records SET status=$2,score=$3,attempts=attempts+1,
+    completed_at=$4,certificate_number=$5,expiration_date=$6,assessment_receipt=$7::jsonb,updated_at=NOW() WHERE id=$1 RETURNING *`,
+    [record.id,result.passed?'completed':'in_progress',result.score,result.passed?assessedAt:null,result.certificateNumber??null,result.expirationDate??null,JSON.stringify(assessmentReference(receipt))]);
+  if(!updated)throw new Error('Assessment record update failed');
+  await client.query(`INSERT INTO acc_training_record_history(record_id,user_id,course_id,record_snapshot,event_kind,assessment_cycle_id,request_key,request_hash,assessment)
+    VALUES($1,$2,$3,$4::jsonb,'quiz_attempt',$5,$6,$7,$8::jsonb)`,[record.id,userId,courseId,JSON.stringify(updated),submission.cycleId,submission.requestId,requestHash,JSON.stringify(receipt)]);
+  await logAudit({userId,action:result.passed?'quiz_passed':'quiz_failed',recordId:record.id,courseId,
+    details:{contentRevision:expectedRevision,score:result.score,passed:result.passed,totalQuestions:result.totalQuestions,assessment:assessmentReference(receipt)},...auditContext},client);
+  await verifyRecordAssessment(client,updated);
+  for(const assignment of assignments){const current=await resolveObligationScope(authority,'obligations:read',userId,assignment.obligation.scope,assignment.observation);
+    if(!current.eligible||!current.roles.includes(assignment.obligation.role))throw Object.assign(new Error('Learner assignment changed during assessment'),{statusCode:409});}
+  await recheckMaterialUse(materialProof,authority,client,course);await finalAccess();
+  return {...result,receipt:assessmentReference(receipt),replayed:false,evidenceStatus:'recorded_assessment'};
 }
 
 export async function verifyTraining(
@@ -459,6 +433,7 @@ export async function verifyTraining(
   const target = await authorizeTrainingTargets(authority, 'records:verify', [record.userId], { scopeFingerprint: admission.scopeFingerprint });
   if (!target.decisions[0].allowed) throw Object.assign(new Error('Training record not found'), { statusCode: 404 });
 
+  await verifyRecordAssessment(client,record);
   if (record.status !== 'completed') {
     throw Object.assign(new Error('Can only verify completed training'), { statusCode: 400 });
   }
@@ -521,10 +496,12 @@ export async function getComplianceStatus(authority: TrainingAuthorityContext, o
       throw Object.assign(new Error('Unknown native platform role for training compliance'), { statusCode: 409 });
     }
     const requiredCourses = activeCourses.filter(course => rolesByCourse.get(course.id)!.includes(role.name));
-    const { rows: records } = await query<TrainingRecord>(
-      'SELECT * FROM acc_training_records WHERE user_id = $1 AND course_id = ANY($2::integer[])',
-      [user.userId, requiredCourses.map(course => course.id)]
-    );
+    const records=await transaction(async client=>{
+      await client.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
+      const {rows}=await client.query<TrainingRecord>('SELECT * FROM acc_training_records WHERE user_id = $1 AND course_id = ANY($2::integer[])',
+        [user.userId,requiredCourses.map(course=>course.id)]);
+      for(const record of rows)await verifyRecordAssessment(client,record);return rows;
+    });
     const byCourse = new Map<number, TrainingRecord>();
     for (const record of records) {
       if (!requiredCourses.some(course => course.id === record.courseId)) continue;
@@ -705,7 +682,7 @@ export async function getCourseContent(courseId: number, client?: TransactionCli
     `SELECT id, course_id, title, content, slide_type, order_index, media_url, interactive_config
      FROM acc_training_slides
      WHERE course_id = $1
-     ORDER BY order_index ASC`,
+     ORDER BY order_index ASC, id ASC`,
     [courseId]
   );
 
@@ -713,7 +690,7 @@ export async function getCourseContent(courseId: number, client?: TransactionCli
     `SELECT id, course_id, question_text, question_type, options, explanation, order_index
      FROM acc_training_questions
      WHERE course_id = $1 AND active = true
-     ORDER BY order_index ASC`,
+     ORDER BY order_index ASC, id ASC`,
     [courseId]
   );
 
@@ -730,9 +707,9 @@ export async function getCourseContent(courseId: number, client?: TransactionCli
 }
 
 /** Historical evidence is separate from the current user/course attempt. */
-export async function getMyRecordHistory(userId: number): Promise<Array<{historyId: number; archivedAt: string; record: TrainingRecord}>> {
+export async function getMyRecordHistory(userId: number): Promise<Array<{historyId: number; archivedAt: string; eventKind:string; record: TrainingRecord}>> {
   requireUserId(userId);
-  const {rows} = await query<{historyId: number; archivedAt: string; record: TrainingRecord}>(
-    'SELECT history_id, archived_at, record_snapshot AS record FROM acc_training_record_history WHERE user_id = $1 ORDER BY archived_at DESC, history_id DESC', [userId]);
+  const {rows} = await query<{historyId: number; archivedAt: string; eventKind:string; record: TrainingRecord}>(
+    'SELECT history_id, archived_at,event_kind, record_snapshot AS record FROM acc_training_record_history WHERE user_id = $1 ORDER BY archived_at DESC, history_id DESC', [userId]);
   return rows;
 }

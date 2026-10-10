@@ -8,7 +8,8 @@ jest.mock('../../src/services/training-authority.service', () => ({
   readTrainingDirectory: (...args: unknown[]) => mockDirectory(...args),
   revalidateTrainingDirectory: (...args: unknown[]) => mockRevalidate(...args),
 }));
-jest.mock('../../src/config/database', () => ({ query: (...args: unknown[]) => mockQuery(...args), queryOne: (...args: unknown[]) => mockQueryOne(...args) }));
+jest.mock('../../src/config/database', () => ({ query: (...args: unknown[]) => mockQuery(...args), queryOne: (...args: unknown[]) => mockQueryOne(...args),
+ transaction:async(fn:any)=>fn({query:(sql:string,...args:unknown[])=>sql.startsWith('SET TRANSACTION')?Promise.resolve({rows:[]}):mockQuery(sql,...args),queryOne:(...args:unknown[])=>mockQueryOne(...args)}) }));
 jest.mock('../../src/config/logger', () => ({ logger: { error: jest.fn(), warn: jest.fn(), info: jest.fn() } }));
 jest.mock('../../src/services/certificate.service', () => ({}));
 
@@ -19,7 +20,7 @@ describe('native compliance identity and required-course census', () => {
     mockDirectory.mockResolvedValue({ users, filter: {}, scopeFingerprint: 'fixture-scope' });
     mockQuery.mockResolvedValueOnce({ rows: courses }).mockResolvedValueOnce({ rows: records });
   }
-  beforeEach(() => { mockQuery.mockReset(); mockQueryOne.mockReset(); mockDirectory.mockReset(); mockRevalidate.mockReset(); mockRevalidate.mockResolvedValue(undefined); jest.mocked(getObligations).mockResolvedValue([]); });
+  beforeEach(() => { mockQuery.mockReset();mockQuery.mockResolvedValue({rows:[]}); mockQueryOne.mockReset(); mockDirectory.mockReset(); mockRevalidate.mockReset(); mockRevalidate.mockResolvedValue(undefined); jest.mocked(getObligations).mockResolvedValue([]); });
   test('complete role courses cannot hide a pending scoped obligation',async()=>{
     fixture([user],[course(1)],[{courseId:1,status:'completed',courseVersion:'1',contentRevision:1}]);
     jest.mocked(getObligations).mockResolvedValue([{status:'assigned',scope:{studyId:5},readiness:'awaiting_verification',overdue:true}] as any);

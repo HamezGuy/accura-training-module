@@ -2,12 +2,14 @@ import express from 'express';
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
 import {Pool} from 'pg';
+import {randomUUID} from 'node:crypto';
 import trainingRoutes from '../../src/routes/training.routes';
 import {errorHandler} from '../../src/middleware/errorHandler.middleware';
 import {pool} from '../../src/config/database';
 import {runMigrations} from '../../src/config/migrations';
 import {nativeTrainingAuthority} from '../fixtures/native-training-authority';
 import {trainingDutyHash} from '../../src/services/training-obligations.service';
+import * as certificateService from '../../src/services/certificate.service';
 
 jest.mock('../../src/config/environment',()=>({config:{database:{url:process.env['TRAINING_OBLIGATION_TEST_DATABASE_URL']??'postgresql://127.0.0.1:1/disabled',ssl:false},authority:{baseUrl:'https://authority.invalid',timeoutMs:1000},training:{certificateValidityDays:365}}}));
 jest.mock('../../src/config/logger',()=>({logger:{info:jest.fn(),error:jest.fn(),warn:jest.fn(),debug:jest.fn()}}));
@@ -20,11 +22,7 @@ owned('native obligation scope, durable assignment and completion evidence',()=>
   const token=(userId:number)=>jwt.sign({userId},'synthetic-only-authority');
   const api=(userId=11)=>({get:(path:string)=>request(app).get(`/api/training${path}`).set('Authorization',`Bearer ${token(userId)}`),post:(path:string,body:object)=>request(app).post(`/api/training${path}`).set('Authorization',`Bearer ${token(userId)}`).send(body)});
   const payload=(extra:object={})=>({userId:22,courseId,contentRevision:revision,role:'coordinator',scope:{studyId:100,siteId:101,armId:5},dueAt:'2020-01-01T00:00:00Z',reason:'Protocol procedure for assigned arm responsibility',...extra});
-  beforeAll(async()=>{
-    const url=new URL(process.env['TRAINING_OBLIGATION_TEST_DATABASE_URL']!);
-    if(process.env['TRAINING_OBLIGATION_TEST_OWNED']!=='yes'||url.hostname!=='127.0.0.1'||!/^\/training_obligation_test_[a-z0-9_]+$/.test(url.pathname))throw new Error('An explicitly owned loopback training_obligation_test_* database is required');
-    if((await nativePool.query("SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE' LIMIT 1")).rowCount)throw new Error('Owned test database must be empty');
-    await runMigrations();await runMigrations();
+  async function initializeNative(){
     await nativePool.query(`CREATE TABLE user_account(user_id integer PRIMARY KEY,user_name text UNIQUE,first_name text,last_name text,user_type_id integer,status_id integer);
       CREATE TABLE user_account_extended(user_id integer PRIMARY KEY,platform_role text);
       CREATE TABLE acc_organization_member(organization_id integer,user_id integer,status text);
@@ -34,15 +32,23 @@ owned('native obligation scope, durable assignment and completion evidence',()=>
       CREATE TABLE study_group_class(study_group_class_id integer PRIMARY KEY,study_id integer,group_class_type_id integer,status_id integer);
       CREATE TABLE study_group(study_group_id integer PRIMARY KEY,study_group_class_id integer,name text);
       CREATE FUNCTION reject_obligation_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'Owned audit failure'; END; $$`);
+  }
+  beforeAll(async()=>{
+    const url=new URL(process.env['TRAINING_OBLIGATION_TEST_DATABASE_URL']!);
+    if(process.env['TRAINING_OBLIGATION_TEST_OWNED']!=='yes'||url.hostname!=='127.0.0.1'||!/^\/training_obligation_test_[a-z0-9_]+$/.test(url.pathname))throw new Error('An explicitly owned loopback training_obligation_test_* database is required');
+    if((await nativePool.query("SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE' LIMIT 1")).rowCount)throw new Error('Owned test database must be empty');
+    await runMigrations();await runMigrations();
     authority=nativeTrainingAuthority(process.env['TRAINING_NATIVE_AUTHORITY_ROOT']!,nativePool);
     console.info('TRAINING_NATIVE_OBLIGATION_SOURCE_HASHES',JSON.stringify(authority.sourceHashes));
   });
   afterAll(async()=>{await pool.end();await nativePool.end();});
   beforeEach(async()=>{
     intercept=undefined;
-    await nativePool.query(`DROP TRIGGER IF EXISTS reject_obligation_audit ON acc_training_audit_log;
-      TRUNCATE acc_training_obligation_events,acc_training_obligations,acc_training_record_history,acc_training_records,acc_training_questions,acc_training_slides,acc_training_courses,acc_training_audit_log RESTART IDENTITY CASCADE;
-      TRUNCATE user_account,user_account_extended,acc_organization_member,study,study_user_role,group_class_types,study_group_class,study_group;
+    // This entire database was created empty and validated as owned above.
+    // Recreate its disposable schema; never disable the production history guard.
+    await nativePool.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public');
+    await runMigrations();await initializeNative();
+    await nativePool.query(`
       INSERT INTO user_account VALUES(11,'manager','Site','Manager',1,1),(22,'learner','Site','Learner',2,1),(33,'reviewer','Other','Reviewer',2,1),(44,'outside','Outside','Org',2,1);
       INSERT INTO user_account_extended VALUES(11,'admin'),(22,'coordinator'),(33,'monitor'),(44,'data_manager');
       INSERT INTO acc_organization_member VALUES(10,11,'active'),(10,22,'active'),(10,33,'active'),(20,44,'active');
@@ -72,8 +78,8 @@ owned('native obligation scope, durable assignment and completion evidence',()=>
   afterEach(()=>jest.restoreAllMocks());
   async function assign(){const response=await api().post('/obligations',payload());expect(response.status).toBe(201);return response.body.data;}
   async function complete(){
-    expect((await api(22).post(`/start/${courseId}`,{contentRevision:revision})).status).toBe(200);
-    const submitted=await api(22).post(`/submit-quiz/${courseId}`,{contentRevision:revision,answers:[{questionId,selectedOptions:[0]}]});expect(submitted.body.data.passed).toBe(true);
+    const started=await api(22).post(`/start/${courseId}`,{contentRevision:revision});expect(started.status).toBe(200);
+    const submitted=await api(22).post(`/submit-quiz/${courseId}`,{recordId:started.body.data.id,cycleId:started.body.data.assessmentCycleId,requestId:randomUUID(),contentRevision:revision,answers:[{questionId,selectedOptions:[0]}]});expect(submitted.body.data.passed).toBe(true);
     return (await nativePool.query('SELECT id FROM acc_training_records WHERE user_id=22')).rows[0].id;
   }
   test('actual routes assign, require independent verification, retain native scope and export documentation without answers',async()=>{
@@ -115,7 +121,7 @@ owned('native obligation scope, durable assignment and completion evidence',()=>
     expect((await api(22).get('/obligations?userId=22')).body.data[0].readiness).toBe('retraining_required');
     expect((await api().post(`/obligations/${row.id}/revise`,{...payload(),expectedRevision:row.revision,reason:'Amendment retraining'})).status).toBe(200);
     expect((await api(22).post(`/start/${courseId}`,{contentRevision:revision})).status).toBe(200);
-    const exported=(await api().get('/obligation-history?userId=22')).body.data;expect(exported.events).toHaveLength(2);expect(exported.events[0].snapshot.courseVersion).toBe('1');expect(exported.history[0].record.verifiedBy).toBe(33);expect(JSON.stringify(exported)).not.toContain('isCorrect');
+    const exported=(await api().get('/obligation-history?userId=22')).body.data;expect(exported.events).toHaveLength(2);expect(exported.events[0].snapshot.courseVersion).toBe('1');expect(exported.history.find((r:any)=>r.eventKind==='restart').record.verifiedBy).toBe(33);expect(JSON.stringify(exported)).not.toContain('isCorrect');
   });
   test('lost scope cannot remain green; closed scope can be administratively withdrawn with retained history',async()=>{
     const row=await assign();await nativePool.query('UPDATE study SET status_id=5 WHERE study_id=101');
@@ -147,10 +153,11 @@ owned('native obligation scope, durable assignment and completion evidence',()=>
     expect((await api().post(`/obligations/${row.id}/withdraw`,{expectedRevision:1,reason:'Stale action'})).status).toBe(409);
     expect((await api().post(`/obligations/${row.id}/revise`,{...payload({scope:{studyId:100,siteId:101}}),expectedRevision:2})).status).toBe(409);
   });
-  test('verification refuses expired or stale completion and never overwrites a previous review',async()=>{
+  test('verification refuses altered expiry or stale completion and never overwrites a previous review',async()=>{
     const recordId=await complete();await nativePool.query("UPDATE acc_training_records SET expiration_date='2020-01-01' WHERE id=$1",[recordId]);
     expect((await api(33).post(`/verify/${recordId}`,{notes:'Invalid'})).status).toBe(409);
-    await nativePool.query("UPDATE acc_training_records SET expiration_date=NOW()+INTERVAL '1 day' WHERE id=$1",[recordId]);
+    await nativePool.query(`UPDATE acc_training_records r SET expiration_date=(h.assessment->'result'->>'expirationDate')::timestamptz
+      FROM acc_training_record_history h WHERE r.id=$1 AND h.record_id=r.id AND h.event_kind='quiz_attempt'`,[recordId]);
     expect((await api(33).post(`/verify/${recordId}`,{notes:'Reviewed'})).status).toBe(200);
     expect((await api().post(`/verify/${recordId}`,{notes:'Overwrite'})).status).toBe(409);
     expect((await nativePool.query('SELECT notes FROM acc_training_records WHERE id=$1',[recordId])).rows[0].notes).toBe('Reviewed');
@@ -183,9 +190,11 @@ owned('native obligation scope, durable assignment and completion evidence',()=>
     expect(observed.body.data).toMatchObject({ready:true,nonce:req.nonce,policyHash:trainingDutyHash(policy),actorUserId:22,armIds:[5]});
     const {schemaVersion,nonce,observedAt,consistency,evidenceHash,...exportedEvidence}=observed.body.data;expect(trainingDutyHash(exportedEvidence)).toBe(evidenceHash);
     expect(observed.body.data.assignments[1].obligations[0]).toMatchObject({retainedScope:{studyId:100,siteId:101,armId:5},verifiedBy:33,recordId});
+    const retained=(await nativePool.query('SELECT * FROM acc_training_record_history ORDER BY history_id')).rows;
+    expect(retained.map(r=>r.event_kind)).toEqual(['cycle_started','quiz_attempt']);
     await nativePool.query("UPDATE acc_training_questions SET question_text='Revised procedure' WHERE id=$1",[questionId]);
     const changed=await api(22).post('/duty-readiness',req);expect(changed.body.data.ready).toBe(false);expect(changed.body.data.assignments[1].obligations[0].readiness).toBe('retraining_required');
-    expect((await nativePool.query('SELECT COUNT(*) FROM acc_training_record_history')).rows[0].count).toBe('0');
+    expect((await nativePool.query('SELECT * FROM acc_training_record_history ORDER BY history_id')).rows).toEqual(retained);
   });
   test('three-arm declarations preserve modular applicability and an unrelated missing course does not block the selected arm',async()=>{
     await nativePool.query("INSERT INTO study_group VALUES(8,1,'Arm B'),(9,1,'Arm C')");
@@ -199,9 +208,11 @@ owned('native obligation scope, durable assignment and completion evidence',()=>
     expect((await api(22).post('/duty-readiness',dutyRequest(policy,{armIds:[999]}))).body.data.ready).toBe(false);
   });
   test('a verified completion expiring during final native callbacks cannot be ready at the response cutoff',async()=>{
-    const row=await assign(),recordId=await complete();expect((await api(33).post(`/verify/${recordId}`,{notes:'Independent synthetic review'})).status).toBe(200);
-    const expires=Date.now()+500;
-    await nativePool.query('UPDATE acc_training_records SET expiration_date=$1 WHERE id=$2',[new Date(expires),recordId]);
+    const row=await assign(),expires=Date.now()+900;
+    // Synthetic short certificate lifetime is supplied at grading, so both the
+    // immutable receipt and record retain it. Do not rewrite either afterward.
+    jest.spyOn(certificateService,'calculateExpirationDate').mockReturnValueOnce(new Date(expires));
+    const recordId=await complete();expect((await api(33).post(`/verify/${recordId}`,{notes:'Independent synthetic review'})).status).toBe(200);
     let scopes=0,crossed=false;intercept=async input=>{if(input.action==='duties:read'&&++scopes===3){expect(Date.now()).toBeLessThan(expires);await new Promise(resolve=>setTimeout(resolve,Math.max(1,expires-Date.now()+40)));crossed=true;}};
     const observed=await api(22).post('/duty-readiness',dutyRequest(dutyPolicy(row)));intercept=undefined;
     expect(observed.status).toBe(200);expect(crossed).toBe(true);expect(Date.parse(observed.body.data.observedAt)).toBeGreaterThanOrEqual(expires);

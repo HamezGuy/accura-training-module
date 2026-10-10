@@ -163,15 +163,9 @@ export async function submitQuiz(req: AuthRequest, res: Response): Promise<void>
   const { answers } = req.body;
 
   const result = await transaction(async (client) => {
-    const submitted = await trainingService.submitQuiz(userId, courseId, answers, client, req.body.contentRevision,req.trainingAuthority!);
-    await logAudit({
-      userId,
-      action: submitted.passed ? 'quiz_passed' : 'quiz_failed',
-      courseId,
-      details: { contentRevision: req.body.contentRevision, score: submitted.score, passed: submitted.passed, totalQuestions: submitted.totalQuestions },
-      ipAddress: req.ip,
-      userAgent: req.headers['user-agent'],
-    }, client);
+    const submitted = await trainingService.submitQuiz(userId, courseId, answers, client, req.body.contentRevision,req.trainingAuthority!,
+      {recordId:req.body.recordId,cycleId:req.body.cycleId,requestId:req.body.requestId},
+      {ipAddress:req.ip,userAgent:req.headers['user-agent']});
     return submitted;
   });
 
@@ -182,6 +176,9 @@ export async function submitQuiz(req: AuthRequest, res: Response): Promise<void>
     correctAnswers: result.correctAnswers,
     certificateNumber: result.certificateNumber,
     expirationDate: result.expirationDate,
+    receipt:result.receipt,
+    replayed:result.replayed,
+    evidenceStatus:result.evidenceStatus,
   };
 
   res.json({ success: true, data: dto });

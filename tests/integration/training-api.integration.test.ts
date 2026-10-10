@@ -272,6 +272,7 @@ describe('Training API Integration', () => {
         .post('/api/training/submit-quiz/1')
         .set('Authorization', `Bearer ${token}`)
         .send({
+          recordId:1,cycleId:'11111111-1111-4111-8111-111111111111',requestId:'22222222-2222-4222-8222-222222222222',
           contentRevision:1, answers: [
             { questionId: 1, selectedOptions: [0] },
             { questionId: 2, selectedOptions: [1] },

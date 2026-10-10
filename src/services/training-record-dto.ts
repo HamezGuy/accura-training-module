@@ -22,5 +22,8 @@ export function mapRecordToDto(r: TrainingRecord): TrainingRecord {
     verifiedByName: r.verifiedByName,
     verifiedAt: r.verifiedAt,
     notes: r.notes,
+    assessmentCycleId:r.assessmentCycleId??null,
+    assessmentEvidence:r.assessmentCycleId?'retained_assessment_cycle':'legacy_summary_only',
+    assessmentReceipt:r.assessmentReceipt?{id:r.assessmentReceipt.id,hash:r.assessmentReceipt.hash,cycleId:r.assessmentReceipt.cycleId,attemptNumber:r.assessmentReceipt.attemptNumber}:null,
   };
 }

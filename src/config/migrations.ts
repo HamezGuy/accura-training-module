@@ -120,6 +120,30 @@ const MIGRATIONS: string[] = [
     archived_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`,
   `CREATE INDEX IF NOT EXISTS idx_training_history_user ON acc_training_record_history(user_id, archived_at)`,
+  // Forward-only assessment receipts reuse the immutable record-history store.
+  // Old restart snapshots and completed records remain honestly summary-only.
+  `ALTER TABLE acc_training_records ADD COLUMN IF NOT EXISTS assessment_cycle_id UUID`,
+  `ALTER TABLE acc_training_records ADD COLUMN IF NOT EXISTS assessment_receipt JSONB`,
+  `ALTER TABLE acc_training_record_history ADD COLUMN IF NOT EXISTS event_kind TEXT NOT NULL DEFAULT 'restart'`,
+  `ALTER TABLE acc_training_record_history ADD COLUMN IF NOT EXISTS assessment_cycle_id UUID`,
+  `ALTER TABLE acc_training_record_history ADD COLUMN IF NOT EXISTS request_key UUID`,
+  `ALTER TABLE acc_training_record_history ADD COLUMN IF NOT EXISTS request_hash TEXT`,
+  `ALTER TABLE acc_training_record_history ADD COLUMN IF NOT EXISTS assessment JSONB`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_training_assessment_request ON acc_training_record_history
+   (user_id,record_id,assessment_cycle_id,request_key) WHERE event_kind='quiz_attempt'`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_training_assessment_receipt ON acc_training_record_history
+   ((assessment->>'id')) WHERE event_kind='quiz_attempt'`,
+  `DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='acc_training_record_history'::regclass AND conname='acc_training_assessment_shape') THEN
+   ALTER TABLE acc_training_record_history ADD CONSTRAINT acc_training_assessment_shape CHECK
+    (event_kind='restart' AND assessment IS NULL AND assessment_cycle_id IS NULL AND request_key IS NULL AND request_hash IS NULL
+     OR event_kind='cycle_started' AND assessment IS NULL AND assessment_cycle_id IS NOT NULL AND request_key IS NULL AND request_hash IS NULL
+     OR event_kind='quiz_attempt' AND assessment IS NOT NULL AND assessment_cycle_id IS NOT NULL AND request_key IS NOT NULL AND request_hash IS NOT NULL AND request_hash ~ '^[a-f0-9]{64}$');
+   END IF; END $$`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_training_assessment_cycle ON acc_training_record_history
+   (record_id,assessment_cycle_id) WHERE event_kind='cycle_started'`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_training_assessment_attempt ON acc_training_record_history
+   (record_id,assessment_cycle_id,(assessment->>'attemptNumber')) WHERE event_kind='quiz_attempt'`,
+
   `CREATE OR REPLACE FUNCTION acc_training_course_revision() RETURNS trigger LANGUAGE plpgsql AS $$
    BEGIN
     IF ROW(NEW.course_name, NEW.description, NEW.version, NEW.passing_score, NEW.regulatory_reference, NEW.validity_period_days)
@@ -170,6 +194,9 @@ const MIGRATIONS: string[] = [
   `DROP TRIGGER IF EXISTS acc_training_record_history_guard ON acc_training_record_history`,
   `CREATE TRIGGER acc_training_record_history_guard BEFORE UPDATE OR DELETE ON acc_training_record_history
     FOR EACH ROW EXECUTE FUNCTION acc_training_immutable_history()`,
+  `DROP TRIGGER IF EXISTS acc_training_record_history_truncate_guard ON acc_training_record_history`,
+  `CREATE TRIGGER acc_training_record_history_truncate_guard BEFORE TRUNCATE ON acc_training_record_history
+    FOR EACH STATEMENT EXECUTE FUNCTION acc_training_immutable_history()`,
   `CREATE TABLE IF NOT EXISTS acc_training_impact_plans (
     id UUID PRIMARY KEY, idempotency_key UUID NOT NULL, created_by INTEGER NOT NULL CHECK(created_by>0),
     plan JSONB NOT NULL, plan_hash TEXT NOT NULL, source_observation JSONB NOT NULL,

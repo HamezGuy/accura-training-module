@@ -5,6 +5,7 @@ import { authorizeTrainingTargets, resolveObligationScope, observeTrainingInspec
 import { TrainingCourse, TrainingDutyPolicy, TrainingDutyReadinessRequest, TrainingObligation, TrainingObligationRequest, TrainingObligationScope, TrainingObligationView, TrainingRecord } from '../types/training.types';
 import {assertMaterialUse,publishedMaterial,observePublication,validateInspectionMaterial} from './training-materials.service';
 import {mapRecordToDto} from './training-record-dto';
+import {verifyRecordAssessment,verifyAssessmentRows,AssessmentHistoryRow} from './training-assessment-evidence';
 import {createHash} from 'node:crypto';
 import type {TrainingInspectionEvidence,TrainingMaterialSource} from '../types/training.types';
 
@@ -113,6 +114,7 @@ export function obligationReadiness(obligation: TrainingObligation, course: Trai
   if (record.courseVersion !== obligation.courseVersion || record.contentRevision !== obligation.contentRevision || record.status === 'expired'
     || record.expirationDate !== null && (!Number.isFinite(new Date(record.expirationDate).getTime()) || new Date(record.expirationDate).getTime() <= now)) return 'retraining_required';
   if (record.status !== 'completed') return record.status === 'in_progress' ? 'in_progress' : 'pending';
+  if ((record.assessmentCycleId||record.assessmentReceipt)&&record.assessmentEvidenceVerified!==true) return 'pending';
   if (!record.completedAt || !Number.isFinite(new Date(record.completedAt).getTime()) || !record.certificateNumber) return 'pending';
   if (!record.verifiedAt || !record.verifiedBy || record.verifiedBy === obligation.userId || !Number.isFinite(new Date(record.verifiedAt).getTime())
     || new Date(record.verifiedAt).getTime() < new Date(record.completedAt).getTime() || new Date(record.verifiedAt).getTime() > now) return 'awaiting_verification';
@@ -132,7 +134,11 @@ export async function getObligations(authority: TrainingAuthorityContext, userId
   for (const row of rows) {
     const course = await queryOne<TrainingCourse>('SELECT * FROM acc_training_courses WHERE id=$1', [row.courseId]);
     if (!course) fail('Training course evidence is missing');
-    const record = await queryOne<TrainingRecord>('SELECT * FROM acc_training_records WHERE user_id=$1 AND course_id=$2', [userId, row.courseId]);
+    const record = await transaction(async client=>{
+      await client.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
+      const retained=await client.queryOne<TrainingRecord>('SELECT * FROM acc_training_records WHERE user_id=$1 AND course_id=$2', [userId, row.courseId]);
+      if(retained)await verifyRecordAssessment(client,retained);return retained;
+    });
     let scope: 'current' | 'changed' | 'unavailable' = 'current';
     if (row.status !== 'withdrawn') {
       try {
@@ -164,8 +170,8 @@ export async function getObligationHistory(authority: TrainingAuthorityContext, 
   const {rows} = await query(`SELECT e.id,e.obligation_id,e.revision,e.actor_user_id,e.action,e.snapshot,e.created_at
     FROM acc_training_obligation_events e JOIN acc_training_obligations o ON o.id=e.obligation_id WHERE o.user_id=$1 ORDER BY e.id`, [userId]);
   const records = await query<TrainingRecord>(`SELECT id,user_id,course_id,course_version,content_revision,status,started_at,completed_at,
-    score,attempts,certificate_number,expiration_date,verified_by,verified_at,notes FROM acc_training_records WHERE user_id=$1 ORDER BY id`, [userId]);
-  const history = await query<{historyId:number;archivedAt:string;record:TrainingRecord}>(`SELECT history_id,archived_at,record_snapshot AS record
+    score,attempts,certificate_number,expiration_date,verified_by,verified_at,notes,assessment_cycle_id,assessment_receipt FROM acc_training_records WHERE user_id=$1 ORDER BY id`, [userId]);
+  const history = await query<{historyId:number;archivedAt:string;eventKind:string;record:TrainingRecord}>(`SELECT history_id,archived_at,event_kind,record_snapshot AS record
     FROM acc_training_record_history WHERE user_id=$1 ORDER BY history_id`, [userId]);
   const audit = await query(`SELECT id,user_id,action,record_id,course_id,details,created_at FROM acc_training_audit_log
     WHERE (user_id=$1 AND action IN('training_started','quiz_submitted','quiz_passed','quiz_failed'))
@@ -225,6 +231,9 @@ async function collectTrainingInspectionEvidence(authority:TrainingAuthorityCont
   const publications=await read('acc_training_material_publications','SELECT * FROM acc_training_material_publications WHERE course_id=ANY($1::int[]) ORDER BY id',[courseIds]);
   const materialEvents=await read('acc_training_material_events','SELECT * FROM acc_training_material_events WHERE draft_id=ANY($1::uuid[]) ORDER BY id',[drafts.map(r=>r.id)]);
   const camel=(row:any)=>Object.fromEntries(Object.entries(row).map(([k,v])=>[k.replace(/_([a-z])/g,(_,c)=>c.toUpperCase()),v]));
+  const assessmentRows=recordHistory.map(camel) as unknown as AssessmentHistoryRow[];
+  verifyAssessmentRows(assessmentRows);
+  for(const record of records)verifyAssessmentRows(assessmentRows,camel(record) as unknown as TrainingRecord);
   await validateInspectionMaterial(client,drafts.map(camel) as any,publications.map(camel) as any,materialEvents.map(camel) as any);
   // A generic course can serve learners in other studies. Include its authored
   // changes, but never another scope's learner activity merely by course ID.
@@ -245,6 +254,7 @@ async function collectTrainingInspectionEvidence(authority:TrainingAuthorityCont
     &&!records.some(r=>r.course_id===pin.courseId&&r.content_revision===pin.revision&&r.content_snapshot)&&!recordHistory.some(r=>r.course_id===pin.courseId&&r.record_snapshot.contentRevision===pin.revision&&r.record_snapshot.contentSnapshot))gaps.push(`Historical course ${pin.courseId}, content revision ${pin.revision}: no retained material or learner snapshot is available.`);
   }
   for(const record of records)if(!record.content_snapshot)gaps.push(`Legacy training record ${record.id}: viewed material snapshot was not retained.`);
+  for(const record of records)if(!record.assessment_cycle_id)gaps.push(`Legacy training record ${record.id}: individual graded-attempt receipts were not retained; completion remains summary evidence.`);
   const pins=new Map<string,{fileId:string;sha256:string;nativeStudyId:number}>();
   for(const source of [...materialSources,...plans.map(p=>({...p.plan.source,scope:p.plan.scope}))])for(const pin of source.originals){const entry={fileId:pin.fileId,sha256:pin.sha256,nativeStudyId:source.scope.siteId??source.scope.studyId},old=pins.get(pin.fileId);if(old&&canonical(old)!==canonical(entry))fail('Conflicting training original custody');pins.set(pin.fileId,entry);}
   const at=(await client.queryOne<{at:string}>('SELECT transaction_timestamp()::text AS at'))!;
@@ -253,7 +263,7 @@ async function collectTrainingInspectionEvidence(authority:TrainingAuthorityCont
  const current=await observeTrainingInspection(authority,input.nativeStudyId,captured.materialSources,admitted.scopeFingerprint,captured.impactSources);
  if(canonical(current.studyIds)!==canonical(admitted.studyIds)||canonical(current.scopes)!==canonical(admitted.scopes))fail('Native inspection scope changed');
  const body={nativeStudyId:input.nativeStudyId,actorUserId:authority.actorUserId,studyIds:admitted.studyIds,scopes:admitted.scopes,...captured,sourceChecks:current.sourceChecks,impactChecks:current.impactChecks,
-  authorityHash:current.authorityHash,complete:true as const,limitations:['Complete retained obligations and scoped material; this is not a complete staff curriculum census.','Learner/course attempts may support several scoped obligations; their existence does not prove duty applicability.','Quiz submissions retain scores/counts in audit, not a complete historical answer-selection transcript.','Certificate identifiers and independent verification are retained records, not clinical competency or regulated approval.','Snapshot evidence can be historical or superseded. Source currentness is a separate native observation; no distributed atomic snapshot is claimed.','Training audit IP addresses and user agents are excluded; retained audit details and actor identities remain.']};
+  authorityHash:current.authorityHash,complete:true as const,limitations:['Complete retained obligations and scoped material; this is not a complete staff curriculum census.','Learner/course attempts may support several scoped obligations; their existence does not prove duty applicability.','New assessment cycles retain immutable quiz definitions, answer selections and grading receipts. Legacy summary-only completions have no reconstructed attempt transcript; existing qualification policy remains unchanged.','Certificate identifiers and independent verification are retained records, not clinical competency or regulated approval.','Snapshot evidence can be historical or superseded. Source currentness is a separate native observation; no distributed atomic snapshot is claimed.','Training audit IP addresses and user agents are excluded; retained audit details and actor identities remain.']};
  await logAudit({userId:authority.actorUserId,action:'training_inspection_read',details:{nativeStudyId:input.nativeStudyId,evidenceHash:trainingEvidenceHash(body)}});
  return {schemaVersion:'training-inspection-evidence/1',nonce:input.nonce,observedAt:new Date().toISOString(),consistency:'training-snapshot-with-separate-native-observations',...body,evidenceHash:trainingEvidenceHash(body)};
 }
@@ -320,6 +330,7 @@ export async function getDutyReadiness(authority: TrainingAuthorityContext, valu
     const obligations=await client.query<TrainingObligation>('SELECT * FROM acc_training_obligations WHERE id=ANY($1::integer[])',[[...new Set(pins.map(pin=>pin.id))]]);
     const courses=await client.query<TrainingCourse>('SELECT * FROM acc_training_courses WHERE id=ANY($1::integer[])',[[...new Set(pins.map(pin=>pin.courseId))]]);
     const records=await client.query<TrainingRecord>('SELECT * FROM acc_training_records WHERE user_id=ANY($1::integer[]) AND course_id=ANY($2::integer[])',[[...new Set(selected.map(row=>row.userId))],[...new Set(pins.map(pin=>pin.courseId))]]);
+    for(const record of records.rows)await verifyRecordAssessment(client,record);
     const materials=new Map<number,NonNullable<Awaited<ReturnType<typeof publishedMaterial>>>>();for(const course of courses.rows){const pub=await publishedMaterial(client,course);if(pub)materials.set(course.id,pub);}
     return {obligations:new Map(obligations.rows.map(row=>[row.id,row])),courses:new Map(courses.rows.map(row=>[row.id,row])),records:new Map(records.rows.map(row=>[`${row.userId}:${row.courseId}`,row])),materials};
   }):{obligations:new Map<number,TrainingObligation>(),courses:new Map<number,TrainingCourse>(),records:new Map<string,TrainingRecord>(),materials:new Map<number,NonNullable<Awaited<ReturnType<typeof publishedMaterial>>>>()};

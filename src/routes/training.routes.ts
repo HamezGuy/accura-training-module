@@ -73,15 +73,18 @@ const addQuestionsSchema = Joi.object({
 });
 
 const submitQuizSchema = Joi.object({
+  recordId: Joi.number().integer().positive().strict().required(),
+  cycleId: Joi.string().guid().required(),
+  requestId: Joi.string().guid().required(),
   contentRevision: Joi.number().integer().positive().strict().required(),
   answers: Joi.array()
     .items(
       Joi.object({
-        questionId: Joi.number().integer().required(),
-        selectedOptions: Joi.array().items(Joi.number().integer().min(0)).min(1).required(),
+        questionId: Joi.number().integer().positive().strict().required(),
+        selectedOptions: Joi.array().items(Joi.number().integer().min(0).strict()).min(1).unique().required(),
       })
     )
-    .min(1)
+    .min(1).max(1000)
     .required(),
 });
 

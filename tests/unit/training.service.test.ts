@@ -157,41 +157,43 @@ describe('TrainingService', () => {
   });
 
   describe('submitQuiz', () => {
-    it('should throw 404 for non-existent course', async () => {
+    const cycleId='11111111-1111-4111-8111-111111111111',requestId='22222222-2222-4222-8222-222222222222';
+    const submission={recordId:10,cycleId,requestId},learner={...authority,actorUserId:1};
+    it('requires explicit cycle and authenticated learner before any grading',async()=>{
+      await expect(trainingService.submitQuiz(1,1,[])).rejects.toMatchObject({statusCode:400});
+      await expect(trainingService.submitQuiz(1,1,[],undefined,1,authority,submission)).rejects.toMatchObject({statusCode:403});
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+    it('does not recover another learner record when course or record is absent',async()=>{
       mockQueryOne.mockResolvedValue(null);
-
-      await expect(trainingService.submitQuiz(1, 999, [])).rejects.toMatchObject({
-        statusCode: 404,
-      });
+      await expect(trainingService.submitQuiz(1,999,[],undefined,1,learner,submission)).rejects.toMatchObject({statusCode:404});
     });
-
-    it('should throw 400 if no questions exist', async () => {
-      mockQueryOne.mockResolvedValue({ id: 1, courseCode: 'GCP-101', passingScore: 80 });
-      mockQuery.mockResolvedValue({ rows: [], rowCount: 0 });
-
-      await expect(trainingService.submitQuiz(1, 1, [])).rejects.toMatchObject({
-        statusCode: 400,
+    it('grades the retained snapshot and writes receipt and audit in the same transaction',async()=>{
+      const course:any={id:1,courseCode:'GCP-101',passingScore:80,validityPeriodDays:365,version:'1',contentRevision:1,active:true};
+      const questions:any[]=[{id:1,courseId:1,options:[{text:'A',isCorrect:true},{text:'B',isCorrect:false}],questionType:'multiple_choice',questionText:'Q1',orderIndex:1},
+        {id:2,courseId:1,options:[{text:'True',isCorrect:true},{text:'False',isCorrect:false}],questionType:'true_false',questionText:'Q2',orderIndex:2}];
+      const record:any={id:10,userId:1,courseId:1,status:'in_progress',courseVersion:'1',contentRevision:1,assessmentCycleId:cycleId,assessmentReceipt:null,
+        attempts:0,score:null,completedAt:null,certificateNumber:null,expirationDate:null,startedAt:'2026-01-01T00:00:00.000Z',contentSnapshot:{course,slides:[],questions}};
+      const history:any[]=[{recordId:10,userId:1,courseId:1,eventKind:'cycle_started',assessmentCycleId:cycleId,recordSnapshot:structuredClone(record)}];
+      mockQueryOne.mockImplementation(async(sql:string,values:any[])=>{
+        if(sql.startsWith('SELECT * FROM acc_training_courses'))return course;
+        if(sql.startsWith('SELECT * FROM acc_training_records'))return record;
+        if(sql.startsWith('UPDATE acc_training_records'))return Object.assign(record,{status:values[1],score:values[2],attempts:1,completedAt:values[3],certificateNumber:values[4],expirationDate:values[5],assessmentReceipt:JSON.parse(values[6])});
+        throw new Error('Unexpected single-row query');
       });
-    });
-
-    it('should grade quiz correctly and return result via transaction', async () => {
-      mockQueryOne.mockResolvedValueOnce({ id: 1, courseCode: 'GCP-101', passingScore: 80, validityPeriodDays: 365, version:'1', contentRevision:1 }).mockResolvedValueOnce({id:10,status:'in_progress',courseVersion:'1',contentRevision:1});
-      mockQuery.mockResolvedValue({
-        rows: [
-          { id: 1, courseId: 1, options: [{ text: 'A', isCorrect: true }, { text: 'B', isCorrect: false }], questionType: 'multiple_choice', questionText: 'Q1', orderIndex: 1 },
-          { id: 2, courseId: 1, options: [{ text: 'True', isCorrect: true }, { text: 'False', isCorrect: false }], questionType: 'true_false', questionText: 'Q2', orderIndex: 2 },
-        ],
-        rowCount: 2,
+      mockQuery.mockImplementation(async(sql:string,values:any[])=>{
+        if(sql.startsWith('SELECT * FROM acc_training_record_history'))return {rows:history};
+        if(sql.startsWith('SELECT * FROM acc_training_questions'))return {rows:questions};
+        if(sql.startsWith('INSERT INTO acc_training_record_history'))history.push({recordId:10,userId:1,courseId:1,recordSnapshot:JSON.parse(values[3]),eventKind:'quiz_attempt',assessmentCycleId:values[4],requestKey:values[5],requestHash:values[6],assessment:JSON.parse(values[7])});
+        return {rows:[]};
       });
-
-      const result = await trainingService.submitQuiz(1, 1, [
-        { questionId: 1, selectedOptions: [0] },
-        { questionId: 2, selectedOptions: [0] },
-      ], undefined, 1);
-
-      expect(result.passed).toBe(true);
-      expect(result.score).toBe(100);
-      expect(result.certificateNumber).toBeDefined();
+      const result=await trainingService.submitQuiz(1,1,[{questionId:1,selectedOptions:[0]},{questionId:2,selectedOptions:[0]}],undefined,1,learner,submission);
+      expect(result).toMatchObject({passed:true,score:100,replayed:false,receipt:{cycleId,attemptNumber:1}});
+      expect(history[1].assessment.answers).toEqual([{questionId:1,selectedOptions:[0]},{questionId:2,selectedOptions:[0]}]);
+      expect(mockQuery.mock.calls.filter(([sql])=>sql.includes('INSERT INTO acc_training_audit_log'))).toHaveLength(1);
+      const again=await trainingService.submitQuiz(1,1,[{questionId:2,selectedOptions:[0]},{questionId:1,selectedOptions:[0]}],undefined,1,learner,submission);
+      expect(again).toMatchObject({replayed:true,receipt:result.receipt});expect(history).toHaveLength(2);
+      expect(mockQuery.mock.calls.filter(([sql])=>sql.includes('INSERT INTO acc_training_audit_log'))).toHaveLength(1);
     });
   });
 
