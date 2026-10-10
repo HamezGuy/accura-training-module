@@ -2,7 +2,7 @@ import { getRoleByName, ROLES } from '@accura-trial/auth-core';
 import { createHash } from 'node:crypto';
 import { query, queryOne, transaction, TransactionClient } from '../config/database';
 import { logAudit } from './audit.service';
-import { authorizeTrainingTargets, resolveObligationScope, TrainingAuthorityContext } from './training-authority.service';
+import { authorizeTrainingTargets, resolveObligationScope, TrainingAuthorityContext, ObligationScopeObservation } from './training-authority.service';
 import { TrainingCourse, TrainingDutyPolicy, TrainingDutyReadinessRequest, TrainingObligation, TrainingObligationRequest, TrainingObligationScope, TrainingObligationView, TrainingRecord } from '../types/training.types';
 
 function fail(message: string, statusCode = 409): never { throw Object.assign(new Error(message), { statusCode }); }
@@ -39,7 +39,19 @@ export async function assignObligation(authority: TrainingAuthorityContext, requ
   const observed = await resolveObligationScope(authority, 'obligations:manage', request.userId, scope);
   if (!observed.eligible || !observed.roles.includes(request.role)) fail('The learner does not hold this role in the exact active study or site');
   try {
-    return await transaction(async client => {
+    return await transaction(client => assignObligationInTransaction(client, authority, request, revise, observed));
+  } catch (error) {
+    if ((error as {code?: string}).code === '23505') fail('An active obligation already exists for this learner, course, role and scope; refresh and revise it');
+    throw error;
+  }
+}
+
+/** Shared writer for one assignment and atomic reviewed impact plans. */
+export async function assignObligationInTransaction(client: TransactionClient, authority: TrainingAuthorityContext,
+  request: TrainingObligationRequest, revise: {id:number;expectedRevision:number}|undefined, observed: ObligationScopeObservation): Promise<TrainingObligation> {
+      validateObligationRequest(request);
+      const scope=canonicalScope(request.scope);
+      if(!observed.eligible||!observed.roles.includes(request.role))fail('The learner no longer holds the declared role');
       const course = await client.queryOne<TrainingCourse>('SELECT * FROM acc_training_courses WHERE id=$1 AND active=true FOR SHARE', [request.courseId]);
       if (!course || course.contentRevision !== request.contentRevision) fail('Select the current active course revision before assigning training');
       let previous: TrainingObligation | null = null;
@@ -61,17 +73,18 @@ export async function assignObligation(authority: TrainingAuthorityContext, requ
       if (!obligation) fail('The obligation could not be saved');
       await recordEvent(client, obligation, authority.actorUserId, previous ? 'obligation_revised' : 'obligation_assigned');
       return obligation;
-    });
-  } catch (error) {
-    if ((error as {code?: string}).code === '23505') fail('An active obligation already exists for this learner, course, role and scope; refresh and revise it');
-    throw error;
-  }
 }
 
 export async function withdrawObligation(authority: TrainingAuthorityContext, obligationId: number, expectedRevision: number, explanation: string) {
   if (!id(obligationId) || !id(expectedRevision)) fail('An exact obligation and expected revision are required', 400);
   reason(explanation);
-  return transaction(async client => {
+  return transaction(client => withdrawObligationInTransaction(client,authority,obligationId,expectedRevision,explanation));
+}
+
+export async function withdrawObligationInTransaction(client: TransactionClient, authority: TrainingAuthorityContext,
+  obligationId: number, expectedRevision: number, explanation: string): Promise<TrainingObligation> {
+    if (!id(obligationId) || !id(expectedRevision)) fail('An exact obligation and expected revision are required', 400);
+    reason(explanation);
     const previous = await client.queryOne<TrainingObligation>('SELECT * FROM acc_training_obligations WHERE id=$1 FOR UPDATE', [obligationId]);
     if (!previous) fail('Obligation not found', 404);
     // Closed scope may be withdrawn, but organization membership alone never
@@ -83,7 +96,6 @@ export async function withdrawObligation(authority: TrainingAuthorityContext, ob
     if (!updated) fail('The obligation could not be withdrawn');
     await recordEvent(client, updated, authority.actorUserId, 'obligation_withdrawn');
     return updated;
-  });
 }
 
 export function obligationReadiness(obligation: TrainingObligation, course: TrainingCourse, record: TrainingRecord | null,

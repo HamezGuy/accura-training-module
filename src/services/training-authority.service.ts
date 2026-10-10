@@ -1,7 +1,7 @@
 import { getRoleByName, ROLES } from '@accura-trial/auth-core';
 import { config } from '../config/environment';
 import type { ReadableStreamDefaultReader } from 'node:stream/web';
-import type { TrainingObligationScope } from '../types/training.types';
+import type { TrainingObligationScope, TrainingImpactSource } from '../types/training.types';
 
 /** Request-local native credentials; never persist or serialize this context. */
 export interface TrainingAuthorityContext {
@@ -39,7 +39,10 @@ const MAX_NATIVE_ID = 2147483647;
 const isId = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0 && (value as number) <= MAX_NATIVE_ID;
 const isBound = (value: unknown): value is number => value === 0 || isId(value);
 const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
-const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
+function canonicalWire(value:any):string {if(Array.isArray(value))return `[${value.map(canonicalWire).join(',')}]`;if(isRecord(value))return `{${Object.keys(value).sort().map(key=>`${JSON.stringify(key)}:${canonicalWire(value[key])}`).join(',')}}`;return JSON.stringify(value);}
+// Persisted JSONB may reorder object keys. Exact values/array order matter;
+// property insertion order is not part of the authority wire contract.
+const same = (a: unknown, b: unknown): boolean => canonicalWire(a) === canonicalWire(b);
 
 class TrainingAuthorityFailure extends Error {
   constructor(public readonly statusCode: number, message: string, public readonly code: string) { super(message); }
@@ -149,6 +152,30 @@ const transport = new TrainingAuthorityTransport(config.authority);
 
 export interface ObligationScopeObservation {
   scope: TrainingObligationScope; userId: number; eligible: boolean; roles: string[]; observationHash: string; scopeFingerprint: string;
+}
+export interface ImpactSourceObservation {
+  scope:{studyId:number;siteId?:number};source:TrainingImpactSource;
+  sourceObservationHash:string;scopeFingerprint:string;actorAuthorityHash:string;
+}
+/** Native source custody must be resolved by the existing authority, never a posted approval flag. */
+export async function resolveImpactSource(context:TrainingAuthorityContext,scope:ImpactSourceObservation['scope'],source:TrainingImpactSource,
+  expected?:ImpactSourceObservation,reviewer?:{userId:number;authorityHash:string}):Promise<ImpactSourceObservation>{
+  const data=await transport.resolve(context,{op:'impact-source',action:'obligations:manage',scope,source,...(reviewer?{reviewer}:{}),
+    ...(expected?{expectedScopeFingerprint:expected.scopeFingerprint}:{})});
+  if(data.complete!==true||!same(data.scope,scope)||!same(data.source,source)
+    ||typeof data.sourceObservationHash!=='string'||!HASH.test(data.sourceObservationHash)||typeof data.actorAuthorityHash!=='string'||!HASH.test(data.actorAuthorityHash))invalid();
+  const observed={scope,source,sourceObservationHash:data.sourceObservationHash,scopeFingerprint:data.scopeFingerprint as string,actorAuthorityHash:data.actorAuthorityHash};
+  if(expected&&expected.sourceObservationHash!==observed.sourceObservationHash)fail(409,'The native training impact source changed; review a new plan','TRAINING_AUTHORITY_SELECTION_CHANGED');
+  return observed;
+}
+export async function inspectImpactSource(context:TrainingAuthorityContext,scope:ImpactSourceObservation['scope'],originals:TrainingImpactSource['originals']):Promise<ImpactSourceObservation>{
+  const data=await transport.resolve(context,{op:'impact-source',action:'obligations:manage',scope,originals});
+  if(data.complete!==true||!same(data.scope,scope)||!isRecord(data.source)||!same(data.source.originals,originals)
+    ||typeof data.source.nativeSourceHash!=='string'||!/^[a-f0-9]{64}$/.test(data.source.nativeSourceHash)
+    ||!isBound(data.source.lifecycleRevision)||typeof data.sourceObservationHash!=='string'||!HASH.test(data.sourceObservationHash)
+    ||typeof data.actorAuthorityHash!=='string'||!HASH.test(data.actorAuthorityHash))invalid();
+  return {scope,source:data.source as unknown as TrainingImpactSource,sourceObservationHash:data.sourceObservationHash,
+    scopeFingerprint:data.scopeFingerprint as string,actorAuthorityHash:data.actorAuthorityHash};
 }
 export async function resolveObligationScope(context: TrainingAuthorityContext, action: 'obligations:read' | 'obligations:manage' | 'obligations:withdraw' | 'duties:read',
   userId: number, scope: TrainingObligationScope, expected?: ObligationScopeObservation): Promise<ObligationScopeObservation> {

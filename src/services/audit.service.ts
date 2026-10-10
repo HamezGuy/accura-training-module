@@ -13,6 +13,11 @@ export type AuditAction =
   | 'obligation_assigned'
   | 'obligation_revised'
   | 'obligation_withdrawn'
+  | 'training_impact_proposed'
+  | 'training_impact_reviewed'
+  | 'training_impact_rejected'
+  | 'training_impact_applied'
+  | 'training_impact_cancelled'
   | 'compliance_checked';
 
 interface AuditFields {

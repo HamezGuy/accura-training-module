@@ -193,3 +193,22 @@ export interface TrainingDutyReadinessRequest {
   duty?: 'participant_enrollment' | 'arm_assignment';
   armIds?: number[];
 }
+
+/** Native source custody, not a claim of clinical approval. */
+export interface TrainingImpactSource {
+  nativeSourceHash: string;
+  lifecycleRevision: number;
+  originals: Array<{kind:'protocol'|'product'|'duty'|'amendment'|'staff';fileId:string;sha256:string}>;
+}
+export type TrainingImpactAction =
+  | {kind:'assign';request:TrainingObligationRequest}
+  | {kind:'revise';obligationId:number;expectedRevision:number;request:TrainingObligationRequest}
+  | {kind:'withdraw';obligationId:number;expectedRevision:number;reason:string};
+export interface TrainingImpactPlanRequest {
+  schemaVersion:'training-impact-plan/1';
+  idempotencyKey:string;
+  scope:{studyId:number;siteId?:number};
+  source:TrainingImpactSource;
+  reason:string;
+  actions:TrainingImpactAction[];
+}

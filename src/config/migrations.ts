@@ -170,6 +170,32 @@ const MIGRATIONS: string[] = [
   `DROP TRIGGER IF EXISTS acc_training_record_history_guard ON acc_training_record_history`,
   `CREATE TRIGGER acc_training_record_history_guard BEFORE UPDATE OR DELETE ON acc_training_record_history
     FOR EACH ROW EXECUTE FUNCTION acc_training_immutable_history()`,
+  `CREATE TABLE IF NOT EXISTS acc_training_impact_plans (
+    id UUID PRIMARY KEY, idempotency_key UUID NOT NULL, created_by INTEGER NOT NULL CHECK(created_by>0),
+    plan JSONB NOT NULL, plan_hash TEXT NOT NULL, source_observation JSONB NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('proposed','reviewed','applied','cancelled','rejected')),
+    revision INTEGER NOT NULL DEFAULT 1 CHECK(revision>0), reviewed_by INTEGER, reviewed_at TIMESTAMPTZ,
+    review_reason TEXT, review_authority JSONB, cancellation_reason TEXT, application JSONB, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(created_by,idempotency_key), CHECK(reviewed_by IS NULL OR reviewed_by<>created_by))`,
+  `ALTER TABLE acc_training_impact_plans ADD COLUMN IF NOT EXISTS cancellation_reason TEXT`,
+  `CREATE OR REPLACE FUNCTION acc_training_impact_source_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF TG_OP='DELETE' THEN RAISE EXCEPTION 'Training impact source is retained'; END IF;
+      IF ROW(NEW.id,NEW.idempotency_key,NEW.created_by,NEW.plan,NEW.plan_hash,NEW.source_observation,NEW.created_at)
+         IS DISTINCT FROM ROW(OLD.id,OLD.idempotency_key,OLD.created_by,OLD.plan,OLD.plan_hash,OLD.source_observation,OLD.created_at)
+      THEN RAISE EXCEPTION 'Training impact source is immutable'; END IF;
+      RETURN NEW;
+    END; $$`,
+  `DROP TRIGGER IF EXISTS acc_training_impact_source_guard ON acc_training_impact_plans`,
+  `CREATE TRIGGER acc_training_impact_source_guard BEFORE UPDATE OR DELETE ON acc_training_impact_plans
+    FOR EACH ROW EXECUTE FUNCTION acc_training_impact_source_guard()`,
+  `CREATE TABLE IF NOT EXISTS acc_training_impact_events (
+    id BIGSERIAL PRIMARY KEY, plan_id UUID NOT NULL REFERENCES acc_training_impact_plans(id),
+    revision INTEGER NOT NULL, actor_user_id INTEGER NOT NULL, action TEXT NOT NULL,
+    snapshot JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(plan_id,revision))`,
+  `DROP TRIGGER IF EXISTS acc_training_impact_history_guard ON acc_training_impact_events`,
+  `CREATE TRIGGER acc_training_impact_history_guard BEFORE UPDATE OR DELETE ON acc_training_impact_events
+   FOR EACH ROW EXECUTE FUNCTION acc_training_immutable_history()`,
 ];
 
 export async function runMigrations(): Promise<void> {

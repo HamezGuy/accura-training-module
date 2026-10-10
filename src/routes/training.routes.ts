@@ -6,6 +6,9 @@ import { validate } from '../middleware/validation.middleware';
 import { asyncHandler } from '../middleware/errorHandler.middleware';
 import * as controller from '../controllers/training.controller';
 import * as obligations from '../services/training-obligations.service';
+import * as impact from '../services/training-impact.service';
+import {inspectImpactSource} from '../services/training-authority.service';
+import {getObligationDueSource} from '../services/training-due-source.service';
 import { exactPositiveId } from '../middleware/validation.middleware';
 
 const router = Router();
@@ -122,6 +125,30 @@ router.get('/my-record-history', asyncHandler<AuthRequest>(controller.getMyRecor
 router.post('/duty-readiness', asyncHandler<AuthRequest>(async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   res.json({ success: true, data: await obligations.getDutyReadiness(req.trainingAuthority!, req.body) });
+}));
+
+router.post('/impact-source',authorize(['admin','data_manager']),asyncHandler<AuthRequest>(async(req,res)=>{
+  if(!req.body||Object.keys(req.body).some(key=>!['scope','originals'].includes(key)))throw Object.assign(new Error('Exact source selectors required'),{statusCode:400});
+  res.setHeader('Cache-Control','no-store');res.json({success:true,data:await inspectImpactSource(req.trainingAuthority!,req.body.scope,req.body.originals)});
+}));
+router.post('/obligation-due-source',authorize(['admin','data_manager']),asyncHandler<AuthRequest>(async(req,res)=>{
+  if(!req.body||Object.keys(req.body).some(key=>!['scope','originals'].includes(key)))throw Object.assign(new Error('Exact due-source selectors required'),{statusCode:400});
+  res.setHeader('Cache-Control','no-store');res.json({success:true,data:await getObligationDueSource(req.trainingAuthority!,req.body.scope,req.body.originals)});
+}));
+router.post('/impact-plans',authorize(['admin','data_manager']),asyncHandler<AuthRequest>(async(req,res)=>{
+  res.status(201).json({success:true,data:await impact.proposeImpactPlan(req.trainingAuthority!,req.body)});
+}));
+router.get('/impact-plans/:id',authorize(['admin','data_manager']),asyncHandler<AuthRequest>(async(req,res)=>{
+  res.setHeader('Cache-Control','no-store');res.json({success:true,data:await impact.getImpactPlan(req.trainingAuthority!,req.params['id'])});
+}));
+router.post('/impact-plans/:id/review',authorize(['admin','data_manager']),asyncHandler<AuthRequest>(async(req,res)=>{
+  res.json({success:true,data:await impact.reviewImpactPlan(req.trainingAuthority!,req.params['id'],req.body)});
+}));
+router.post('/impact-plans/:id/apply',authorize(['admin','data_manager']),asyncHandler<AuthRequest>(async(req,res)=>{
+  res.json({success:true,data:await impact.applyImpactPlan(req.trainingAuthority!,req.params['id'],req.body)});
+}));
+router.post('/impact-plans/:id/cancel',authorize(['admin','data_manager']),asyncHandler<AuthRequest>(async(req,res)=>{
+  res.json({success:true,data:await impact.cancelImpactPlan(req.trainingAuthority!,req.params['id'],req.body)});
 }));
 
 const obligationSchema = Joi.object({

@@ -237,3 +237,53 @@ loopback database named `training_obligation_test_*`,
 `TRAINING_NATIVE_AUTHORITY_ROOT` pointing at the matching primary EDC API checkout.
 The existing `training-audit-postgres.test.ts` uses its separately named empty
 `training_audit_test_*` database and documented `TRAINING_AUDIT_TEST_*` variables.
+
+### Reviewed training change impact
+
+The existing training page now supports `training-impact-plan/1`: select the
+native master/site, retained original files and their purpose; queue affected
+assignments, revisions or withdrawals; retain the exact mapping; have a different
+currently authorized manager accept or reject it; then apply the reviewed batch.
+The current native source observation covers the existing lifecycle's study,
+definition/amendment, staff, arm and authority source. Selected originals are
+reopened through the existing custody path and checked against their exact bytes
+and scope. They can be downloaded from the review page. This establishes source
+custody and human training-applicability review, not clinical protocol approval,
+curriculum adequacy, or automatic interpretation of a protocol/product change.
+
+The native authority requires current exact-scope management and retains the
+independent reviewer's authority epoch. Source, role, obligation or course changes
+refuse application; revoking and regranting the reviewer's role does not revive
+the old review. Each plan contains 1–50 explicit affected actions with reasons.
+Larger changes need separately reviewed complete batches. There is no silent
+truncation or automatic assertion that every affected learner was identified.
+
+Application factors the existing obligation writers into one training transaction,
+locks courses and obligations in stable order, and rechecks native source and
+review authority after writes. Assignment snapshots, impact events and audit
+commit together. Original plans and decision events are immutable; cancellation
+preserves the independent review and its separate cancellation reason. Exact
+idempotency keys recover uncertain proposals/applications without duplicating
+obligations. Current management remains required to read/recover retained plans.
+Native observations and the training commit remain separate service transactions.
+
+Authenticated `POST /api/training/obligation-due-source` exposes
+`TrainingObligationDueSourceV1@1.0.0`: every retained obligation in the exact
+study/site, stable obligation/revision identity, course pins, due time, current
+scope and completion evidence, and effective open/satisfied/blocked/inactive
+status. Withdrawn or invalid retained scopes remain explicit. More than 1,000
+rows refuses the entire census. Course/completion data comes from one local
+snapshot; final native rechecks and one final expiry cutoff are explicit current
+observations, not a distributed snapshot. This is an authenticated source for a
+future task adapter. It does not schedule reminders, grant worker authority,
+send messages or prove delivery. T.5 reminder/escalation execution still requires
+an authenticated bridge into the existing CommandCenter task/timer workflow.
+
+Deploy the matching EDC authority/proxy before the training service and UI. The
+existing training startup migration transaction adds impact plans/events and
+their retention triggers; no new EDC migration or signing secret is required.
+The opt-in EDC `training-impact.native.postgres.test.ts` exercises the actual
+training HTTP routes and native authority against two isolated synthetic
+PostgreSQL databases, including review, exact source custody, concurrent retries,
+revocation, rollback, retained history and due-state transitions. Fixture session
+admission is synthetic; native authorization and database persistence are real.
