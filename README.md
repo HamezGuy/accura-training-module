@@ -279,6 +279,27 @@ future task adapter. It does not schedule reminders, grant worker authority,
 send messages or prove delivery. T.5 reminder/escalation execution still requires
 an authenticated bridge into the existing CommandCenter task/timer workflow.
 
+The separate machine reader is `POST
+/api/training/obligation-due-source/observe` through the native fixed-origin
+proxy. Native deployment requires `ENABLE_M2M_API_KEYS=true`, an exact nonempty
+`TRAINING_DUE_SOURCE_INSTALLATION_ID`, and explicitly allowlisted native service
+accounts in `TRAINING_DUE_SERVICE_USER_IDS` (comma-separated IDs). The active
+account must belong to the API key's organization and have an active exact
+study/site `data_manager` delegation. Its key requires the explicit
+`training:due-source:read` scope. Every callback uses only the purpose-specific
+`/api/training-authority/resolve-due` source, obligation or material read operation;
+this admission grants no human, management, verification or inspection authority.
+Credentials stay request-local and no human JWT is stored.
+
+The machine envelope retains the request identity/hash, installation, exact
+scope, authority observation and complete due-source hash. Collection refuses
+more than 1,000 obligations, 8 MiB of output, 30 seconds of elapsed observation or
+four simultaneous requests. Unavailability never becomes an empty census. The
+15-second reply freshness bound is an observation, not a distributed lease. It
+does not identify every staff member requiring training, schedule a reminder,
+establish a CommandCenter recipient or confirm external delivery; that consumer
+adapter remains a separate qualification step.
+
 Deploy the matching EDC authority/proxy before the training service and UI. The
 existing training startup migration transaction adds impact plans/events and
 their retention triggers; no new EDC migration or signing secret is required.
@@ -333,3 +354,40 @@ or new signing secret is needed. The opt-in EDC
 `training-material.native.postgres.test.ts` uses the actual training HTTP routes,
 native source authority and isolated PostgreSQL stores. Its synthetic material is
 software qualification content, never clinical instruction or regulatory approval.
+
+### Training evidence in the existing inspection copy
+
+The native inspection request accepts `includeTraining: true` to retain a
+`edc-inspection-copy/2` through the same immutable encrypted original, build
+receipt, publication audit and download path. Omission preserves `/1`. A request
+key cannot be reused with a different coverage choice. Retrying a retained copy
+does not require the training service to be available or rebuild its cutoff.
+
+The internal `POST /inspection-evidence` is a privileged, exact native inspection
+read, not a learner or manager export shortcut. Both native observations require
+current inspection role, direct scope, unblinding and explicit export permission.
+It collects one local snapshot of all retained obligations in that study/site
+(or authorized parent family), their revisions, referenced learner/course records
+and archives, scoped drafts/reviews/publications, impacted courses and impact
+history. Complete means the declared retained-store census, not a complete staff
+curriculum or inspection-readiness finding. Missing legacy material snapshots are
+explicit gaps. The copy retains certificate identifiers/expiry and independent
+verification, not a claim of clinical competence.
+
+The privileged copy includes retained material and assessment answer keys; the
+ordinary learner DTOs remain redacted. Every row has a hash of its original
+PostgreSQL JSON string, and every table, complete constituent and native package
+has a checked hash. The existing native original-file custody must supply every
+cited source byte with its exact scope/hash. Missing or conflicting custody holds
+publication. Native material and impact-source currentness is observed separately
+from historical evidence; there is no distributed atomic snapshot or lease.
+
+Collection refuses partial results above its 13-store, 10,000-rows-per-store,
+100,000-total-row, 16 MiB raw-row or 500-source-class limits. Four in-flight
+producer collections and the existing native export admission bound resource use.
+The native consumer observes training before holding its clinical snapshot pool
+client. No new EDC schema or second package store is introduced. This producer
+slice does not implement IL TMF ingestion or prove foreign-producer authenticity
+from an uploaded JSON document. The opt-in native test
+`training-inspection.native.postgres.test.ts` exercises actual producer HTTP,
+two isolated PostgreSQL stores and encrypted native package custody.

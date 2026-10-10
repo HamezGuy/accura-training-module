@@ -30,6 +30,7 @@ export type AuditAction =
   | 'training_material_reviewed'
   | 'training_material_rejected'
   | 'training_material_published'
+  | 'training_inspection_read'
   | 'compliance_checked';
 
 interface AuditFields {

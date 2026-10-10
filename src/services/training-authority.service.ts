@@ -150,6 +150,18 @@ export class TrainingAuthorityTransport {
 
 const transport = new TrainingAuthorityTransport(config.authority);
 
+export async function observeTrainingInspection(context:TrainingAuthorityContext,nativeStudyId:number,materials:TrainingMaterialSource[]=[],expectedScopeFingerprint?:string,impacts:Array<{scope:{studyId:number;siteId?:number};source:TrainingImpactSource}>=[]){
+ const started=Date.now();const data=await transport.resolve(context,{op:'inspection',action:'records:inspect',nativeStudyId,materials,impacts,...(expectedScopeFingerprint?{expectedScopeFingerprint}:{})});
+ if(data.complete!==true||data.nativeStudyId!==nativeStudyId||!Array.isArray(data.studyIds)||!data.studyIds.length||data.studyIds.length>500||data.studyIds.some(v=>!isId(v))||new Set(data.studyIds).size!==data.studyIds.length
+  ||!Array.isArray(data.scopes)||data.scopes.length!==data.studyIds.length||data.scopes.some((s:any,i)=>!isRecord(s)||Object.keys(s).some(k=>!['studyId','siteId'].includes(k))||!isId(s.studyId)||s.siteId!==undefined&&!isId(s.siteId)||(s.siteId??s.studyId)!==(data.studyIds as number[])[i])
+  ||typeof data.authorityHash!=='string'||!/^[a-f0-9]{64}$/.test(data.authorityHash)||data.scopeFingerprint!==`sha256:${data.authorityHash}`
+  ||!Array.isArray(data.sourceChecks)||data.sourceChecks.length!==materials.length||data.sourceChecks.some((c:any,i)=>!isRecord(c)||Object.keys(c).some(k=>!['sourceHash','current'].includes(k))||c.sourceHash!==materials[i]!.sourceHash||typeof c.current!=='boolean')
+  ||!Array.isArray(data.impactChecks)||data.impactChecks.length!==impacts.length||data.impactChecks.some((c:any,i)=>!isRecord(c)||Object.keys(c).some(k=>!['nativeSourceHash','lifecycleRevision','current'].includes(k))||c.nativeSourceHash!==impacts[i]!.source.nativeSourceHash||c.lifecycleRevision!==impacts[i]!.source.lifecycleRevision||typeof c.current!=='boolean')
+  ||Date.parse(data.observedAt as string)<started-5000||Date.parse(data.observedAt as string)>Date.now()+5000)invalid();
+ return {nativeStudyId,studyIds:data.studyIds as number[],scopes:data.scopes as Array<{studyId:number;siteId?:number}>,authorityHash:data.authorityHash,
+  scopeFingerprint:data.scopeFingerprint as string,sourceChecks:data.sourceChecks as Array<{sourceHash:string;current:boolean}>,impactChecks:data.impactChecks as Array<{nativeSourceHash:string;lifecycleRevision:number;current:boolean}>};
+}
+
 export async function observeMaterialSource(context:TrainingAuthorityContext,source:Omit<TrainingMaterialSource,'sourceHash'>&{sourceHash?:string},
  options:{learner?:{userId:number;scope:TrainingObligationScope};reviewer?:{userId:number;authorityHash:string};authorityHash?:string}={}){
  const data=await transport.resolve(context,{op:'material-source',action:options.learner?'duties:read':'obligations:manage',...source,

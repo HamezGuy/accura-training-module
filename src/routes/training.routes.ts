@@ -11,10 +11,14 @@ import {inspectImpactSource,observeMaterialSource} from '../services/training-au
 import * as materials from '../services/training-materials.service';
 import {getObligationDueSource} from '../services/training-due-source.service';
 import { exactPositiveId } from '../middleware/validation.middleware';
+import {observeServiceDue} from '../services/service-due-authority';
 
 const router = Router();
 
-// All routes require authentication
+// The service reader owns explicit machine authentication at every native
+// callback. It cannot enter any human course, record or management route.
+router.post('/obligation-due-source/observe',asyncHandler(observeServiceDue));
+// All remaining routes require current human authentication.
 router.use(authMiddleware);
 
 // ============================================================================
@@ -122,6 +126,9 @@ router.post(
 
 router.get('/my-records', asyncHandler<AuthRequest>(controller.getMyRecords));
 router.get('/my-record-history', asyncHandler<AuthRequest>(controller.getMyRecordHistory));
+router.post('/inspection-evidence',asyncHandler<AuthRequest>(async(req,res)=>{
+  res.setHeader('Cache-Control','private, no-store');res.json({success:true,data:await obligations.getTrainingInspectionEvidence(req.trainingAuthority!,req.body)});
+}));
 
 router.post('/duty-readiness', asyncHandler<AuthRequest>(async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');

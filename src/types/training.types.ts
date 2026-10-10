@@ -115,6 +115,17 @@ export interface TrainingRecord {
   notes: string | null;
 }
 
+export interface TrainingInspectionEvidence {
+  schemaVersion:'training-inspection-evidence/1';nonce:string;nativeStudyId:number;actorUserId:number;
+  studyIds:number[];scopes:Array<{studyId:number;siteId?:number}>;capturedAt:string;observedAt:string;
+  consistency:'training-snapshot-with-separate-native-observations';authorityHash:string;complete:true;
+  tables:Array<{table:string;count:number;contentHash:string;rows:Array<{nativeJson:string;sha256:string}>}>;
+  materialSources:TrainingMaterialSource[];sourceChecks:Array<{sourceHash:string;current:boolean}>;
+  impactSources:Array<{scope:{studyId:number;siteId?:number};source:TrainingImpactSource}>;
+  impactChecks:Array<{nativeSourceHash:string;lifecycleRevision:number;current:boolean}>;
+  originalPins:Array<{fileId:string;sha256:string;nativeStudyId:number}>;gaps:string[];limitations:string[];evidenceHash:string;
+}
+
 export interface TrainingComplianceStatus {
   userId: number;
   username: string;

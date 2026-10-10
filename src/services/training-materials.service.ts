@@ -47,6 +47,17 @@ async function checkPublication(client:Pick<TransactionClient,'queryOne'>,pub:Pu
  if(!r||r.schemaVersion!=='training-material-publication/1'||draft.status!=='published'||draft.createdBy===draft.reviewedBy||r.courseVersion!==draft.request.material.version||r.clinicalAdequacyClaimed!==false
   ||hash(pub.runtimeSnapshot)!==pub.runtimeHash||r.runtimeHash!==pub.runtimeHash||r.publicationId!==pub.id||r.courseId!==pub.courseId||draft.courseId!==pub.courseId||r.draftId!==draft.id||r.requestHash!==draft.requestHash
   ||r.contentRevision!==pub.contentRevision||hash(r.source)!==hash(draft.request.source)||r.authorUserId!==draft.createdBy||r.reviewerUserId!==draft.reviewedBy||r.reviewReason!==draft.reviewReason)fail('Retained material publication integrity failed');return pub;}
+/** Validate historic as well as current publications through the same custody
+ * rules; inspection is not allowed to trust a stored hash column alone. */
+export async function validateInspectionMaterial(client:Pick<TransactionClient,'queryOne'>,drafts:Draft[],publications:Publication[],events:Array<{draftId:string;revision:number;snapshot:Draft}>){
+ for(const draft of drafts){checkDraft(draft);const history=events.filter(e=>e.draftId===draft.id).sort((a,b)=>a.revision-b.revision);
+  if(history.length!==draft.revision||history.some((e,i)=>e.revision!==i+1||e.snapshot.revision!==e.revision||e.snapshot.id!==draft.id||e.snapshot.requestHash!==draft.requestHash))fail('Material history is incomplete or inconsistent');
+  const last=history.at(-1)!.snapshot;if(last.status!==draft.status||last.reviewedBy!==draft.reviewedBy||last.reviewReason!==draft.reviewReason||last.reviewAuthorityHash!==draft.reviewAuthorityHash)fail('Material head differs from its retained history');
+  if((draft.status==='published')!==publications.some(p=>p.draftId===draft.id))fail('Material publication closure is incomplete');
+ }
+ for(const event of events){const snapshot=checkDraft(event.snapshot),draft=drafts.find(row=>row.id===snapshot.id);if(!draft||draft.requestHash!==snapshot.requestHash)fail('Material history integrity failed');}
+ for(const publication of publications)await checkPublication(client,publication);
+}
 async function event(client:TransactionClient,row:Draft,actor:number,action:AuditAction){await client.query('INSERT INTO acc_training_material_events(draft_id,revision,actor_user_id,action,snapshot) VALUES($1,$2,$3,$4,$5::jsonb)',[row.id,row.revision,actor,action,JSON.stringify(row)]);await logAudit({userId:actor,courseId:row.courseId,action,details:{draftId:row.id,revision:row.revision,requestHash:row.requestHash}},client);}
 async function locked(client:TransactionClient,draftId:string){const prior=await draftById(client,draftId);const course=await client.queryOne<TrainingCourse>('SELECT * FROM acc_training_courses WHERE id=$1 FOR UPDATE',[prior.courseId]);if(!course)fail('Course custody missing');const row=await client.queryOne<Draft>('SELECT * FROM acc_training_material_drafts WHERE id=$1 FOR UPDATE',[draftId]);if(!row)fail('Draft custody missing');return {course,row:checkDraft(row)};}
 export async function getMaterialDraft(authority:TrainingAuthorityContext,draftId:string){const row=await draftById(database,draftId);await manager(authority,row.request.source.scope);
