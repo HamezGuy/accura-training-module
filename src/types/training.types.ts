@@ -195,7 +195,7 @@ export interface TrainingDutyPolicy {
     armId?: number;
     disposition: 'required' | 'not_required';
     rationale: string;
-    duties: Array<'site_activation' | 'participant_enrollment' | 'arm_assignment'>;
+    duties: Array<'site_activation' | 'participant_enrollment' | 'arm_assignment' | 'supply_dispensing'>;
     obligations: Array<{ id: number; revision: number; courseId: number; courseVersion: string; contentRevision: number }>;
   }>;
 }
@@ -206,7 +206,7 @@ export interface TrainingDutyReadinessRequest {
   policy: TrainingDutyPolicy;
   /** Omitted only when evaluating the complete activation census. */
   actorUserId?: number;
-  duty?: 'participant_enrollment' | 'arm_assignment';
+  duty?: 'participant_enrollment' | 'arm_assignment' | 'supply_dispensing';
   armIds?: number[];
 }
 

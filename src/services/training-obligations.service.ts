@@ -258,7 +258,7 @@ async function collectTrainingInspectionEvidence(authority:TrainingAuthorityCont
  return {schemaVersion:'training-inspection-evidence/1',nonce:input.nonce,observedAt:new Date().toISOString(),consistency:'training-snapshot-with-separate-native-observations',...body,evidenceHash:trainingEvidenceHash(body)};
 }
 
-const dutyNames = ['site_activation', 'participant_enrollment', 'arm_assignment'];
+const dutyNames = ['site_activation', 'participant_enrollment', 'arm_assignment', 'supply_dispensing'];
 const dutyTimestamp=(value:unknown):string|null=>value===null||value===undefined||!Number.isFinite(new Date(value as string).getTime())?null:new Date(value as string).toISOString();
 const isObject = (value: unknown): value is Record<string, any> => !!value && typeof value === 'object' && !Array.isArray(value);
 function exactObject(value: unknown, keys: string[]): asserts value is Record<string, any> {
@@ -302,7 +302,7 @@ export async function getDutyReadiness(authority: TrainingAuthorityContext, valu
   exactObject(value, ['schemaVersion', 'nonce', 'policy', 'actorUserId', 'duty', 'armIds']);
   if (value.schemaVersion !== 'training-duty-readiness-request/1' || typeof value.nonce !== 'string' || !/^[a-f0-9]{32}$/.test(value.nonce)) fail('An exact duty request and fresh nonce are required', 400);
   validateDutyPolicy(value.policy);
-  if ((value.actorUserId === undefined) !== (value.duty === undefined) || value.actorUserId !== undefined && (!id(value.actorUserId) || !['participant_enrollment', 'arm_assignment'].includes(value.duty))) fail('An actor-specific request requires an exact learner and delegated duty', 400);
+  if ((value.actorUserId === undefined) !== (value.duty === undefined) || value.actorUserId !== undefined && (!id(value.actorUserId) || !['participant_enrollment', 'arm_assignment', 'supply_dispensing'].includes(value.duty))) fail('An actor-specific request requires an exact learner and delegated duty', 400);
   if (value.actorUserId !== undefined && value.actorUserId !== authority.actorUserId) fail('A clinical duty assessment must identify the authenticated actor', 403);
   if(value.armIds!==undefined&&(value.actorUserId===undefined||!Array.isArray(value.armIds)||value.armIds.length>100||value.armIds.some((n:unknown)=>!id(n))||new Set(value.armIds).size!==value.armIds.length))fail('Exact distinct native arm selection is required',400);
   const request = value as unknown as TrainingDutyReadinessRequest;
