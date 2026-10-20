@@ -167,15 +167,15 @@ owned('native obligation scope, durable assignment and completion evidence',()=>
     {userId:22,role:'coordinator',armId:5,duties:['participant_enrollment','arm_assignment'],disposition:'required',rationale:'Synthetic arm procedure requires assigned curriculum',
       obligations:[{id:row.id,revision:row.revision,courseId:row.courseId,courseVersion:row.courseVersion,contentRevision:row.contentRevision}]}]});
   const dutyRequest=(policy:any,extra:object={})=>({schemaVersion:'training-duty-readiness-request/1',nonce:'d'.repeat(32),policy,actorUserId:22,duty:'arm_assignment',armIds:[5],...extra});
-  test('supply duty is explicit, actor-bound and requires exact verified common/arm assignments',async()=>{
-    const row=await assign(),policy=dutyPolicy(row),old=JSON.stringify(policy),req=dutyRequest(policy,{duty:'supply_dispensing'});
+  test.each(['supply_dispensing','data_entry'])('%s duty is explicit, actor-bound and requires exact verified common/arm assignments',async duty=>{
+    const row=await assign(),policy=dutyPolicy(row),old=JSON.stringify(policy),req=dutyRequest(policy,{duty});
     expect((await api(22).post('/duty-readiness',req)).body.data.ready).toBe(false);expect(JSON.stringify(policy)).toBe(old);
-    policy.assignments[0].duties.push('supply_dispensing');
+    policy.assignments[0].duties.push(duty);
     expect((await api(22).post('/duty-readiness',req)).body.data.ready).toBe(false);
-    policy.assignments[1].duties.push('supply_dispensing');
+    policy.assignments[1].duties.push(duty);
     expect((await api(22).post('/duty-readiness',req)).body.data.ready).toBe(false);
-    const recordId=await complete();expect((await api(33).post(`/verify/${recordId}`,{notes:'Synthetic independent supply training verification'})).status).toBe(200);
-    expect((await api(22).post('/duty-readiness',req)).body.data).toMatchObject({ready:true,duty:'supply_dispensing',actorUserId:22,armIds:[5]});
+    const recordId=await complete();expect((await api(33).post(`/verify/${recordId}`,{notes:'Synthetic independent clinical duty verification'})).status).toBe(200);
+    expect((await api(22).post('/duty-readiness',req)).body.data).toMatchObject({ready:true,duty,actorUserId:22,armIds:[5]});
     expect((await api(11).post('/duty-readiness',{...req,actorUserId:11})).body.data.ready).toBe(false);
     expect((await api(33).post('/duty-readiness',req)).status).toBe(403);
     await nativePool.query('UPDATE acc_training_courses SET content_revision=content_revision+1 WHERE id=$1',[courseId]);
