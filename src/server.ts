@@ -13,13 +13,30 @@ import trainingRoutes from './routes/training.routes';
 import { expireOverdueRecords } from './services/training.service';
 import { reportError, startErrorReporter, stopErrorReporter } from './services/error-reporter.service';
 
+/** The public limit, per client address: browsers and every other caller. */
+export const PUBLIC_RATE_LIMIT = { windowMs: 15 * 60 * 1000, max: 200 } as const;
+/** The EDC asks for duty readiness on every clinical action of every one of its users, all from the EDC's own
+ * address and each authenticated by the acting user's bearer. Under the public limit those observations shared one
+ * 200-request budget and refused clinical saves after about 100 (EDC defect D-EDC-7), so they have their own,
+ * higher per-address bucket: TRAINING_DUTY_READINESS_RATE_LIMIT requests per 15 minutes (default 6000). */
+export const DUTY_READINESS_PATH = '/api/training/duty-readiness';
+export function dutyReadinessRateLimit(): number {
+  const raw = process.env['TRAINING_DUTY_READINESS_RATE_LIMIT'];
+  const value = raw === undefined || raw === '' ? 6000 : Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1 || value > 1000000) throw new Error('TRAINING_DUTY_READINESS_RATE_LIMIT must be an integer from 1 to 1000000.');
+  return value;
+}
+
 /** Build the HTTP application without starting runtime resources. */
 export function createApp(): express.Express {
   const application = express();
   application.use(helmet());
   application.use(cors({ origin: config.cors.origin, credentials: true }));
   application.use(express.json({ limit: '1mb' }));
-  application.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 200, standardHeaders: true, legacyHeaders: false }));
+  const dutyReadiness = (req: express.Request) => req.method === 'POST' && req.path === DUTY_READINESS_PATH;
+  application.use(rateLimit({ ...PUBLIC_RATE_LIMIT, standardHeaders: true, legacyHeaders: false, skip: dutyReadiness }));
+  application.use(rateLimit({ windowMs: PUBLIC_RATE_LIMIT.windowMs, max: dutyReadinessRateLimit(), standardHeaders: true, legacyHeaders: false,
+    skip: req => !dutyReadiness(req) }));
   // Liveness only; dependency and native workflow qualification is separate.
   application.get('/health', (_req, res) => {
     res.json({ status: 'healthy', service: 'accura-training-module', version: '1.0.0', timestamp: new Date().toISOString() });
