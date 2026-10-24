@@ -317,6 +317,41 @@ const MIGRATIONS: string[] = [
     FOR EACH STATEMENT EXECUTE FUNCTION acc_training_immutable_history()`,
   `ALTER TABLE acc_training_decision_signatures ENABLE ALWAYS TRIGGER acc_training_decision_signatures_guard`,
   `ALTER TABLE acc_training_decision_signatures ENABLE ALWAYS TRIGGER acc_training_decision_signatures_truncate_guard`,
+  // Training effort intervals (T-4). With TRAINING_EFFORT_LEDGER_ENABLED=true each graded attempt, completion
+  // attestation and verification writes one row in its decision's own transaction (src/services/training-effort.service.ts);
+  // otherwise nothing writes here. The start rule is the EDC effort ledger's: a stated start at most 12 hours before
+  // the end. served is the learner's assigned obligations for the course at capture, which attribute the interval to
+  // studies, sites, arms and roles. A request key is unique only per kind, actor, record and cycle (quiz keys are
+  // unique per learner, record and cycle; EDC signature keys per signer), so one reused client key never fails a
+  // decision; an EDC effort request is counted once.
+  `CREATE TABLE IF NOT EXISTS acc_training_effort_intervals (
+    id BIGSERIAL PRIMARY KEY, request_key UUID NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('learning','attestation','verification')),
+    actor_user_id INTEGER NOT NULL CHECK(actor_user_id>0), actor_role TEXT,
+    learner_user_id INTEGER NOT NULL CHECK(learner_user_id>0),
+    record_id INTEGER NOT NULL REFERENCES acc_training_records(id), course_id INTEGER NOT NULL REFERENCES acc_training_courses(id),
+    assessment_cycle_id UUID, served JSONB NOT NULL CHECK(jsonb_typeof(served)='array'),
+    work_started_at TIMESTAMPTZ, ended_at TIMESTAMPTZ NOT NULL,
+    start_basis TEXT NOT NULL CHECK(start_basis IN ('client-work-start','server-cycle-start','edc-signed-effort','not-supplied')),
+    edc_effort_request_id UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT acc_training_effort_start CHECK((start_basis='not-supplied')=(work_started_at IS NULL)),
+    CONSTRAINT acc_training_effort_window CHECK(work_started_at IS NULL OR (work_started_at<=ended_at AND work_started_at>=ended_at-interval '12 hours')),
+    CONSTRAINT acc_training_effort_edc CHECK((edc_effort_request_id IS NULL OR kind<>'learning') AND (start_basis<>'edc-signed-effort' OR edc_effort_request_id IS NOT NULL)
+      AND (start_basis<>'server-cycle-start' OR kind='learning')),
+    CONSTRAINT acc_training_effort_actor CHECK((kind='verification')=(actor_user_id<>learner_user_id) AND (kind='verification' OR actor_role IS NULL)))`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_training_effort_request ON acc_training_effort_intervals
+    (kind,actor_user_id,record_id,(COALESCE(assessment_cycle_id::text,'')),request_key)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_training_effort_edc_request ON acc_training_effort_intervals
+    (edc_effort_request_id) WHERE edc_effort_request_id IS NOT NULL`,
+  `CREATE INDEX IF NOT EXISTS idx_training_effort_served ON acc_training_effort_intervals USING gin (served jsonb_path_ops)`,
+  `DROP TRIGGER IF EXISTS acc_training_effort_intervals_guard ON acc_training_effort_intervals`,
+  `CREATE TRIGGER acc_training_effort_intervals_guard BEFORE UPDATE OR DELETE ON acc_training_effort_intervals
+    FOR EACH ROW EXECUTE FUNCTION acc_training_immutable_history()`,
+  `DROP TRIGGER IF EXISTS acc_training_effort_intervals_truncate_guard ON acc_training_effort_intervals`,
+  `CREATE TRIGGER acc_training_effort_intervals_truncate_guard BEFORE TRUNCATE ON acc_training_effort_intervals
+    FOR EACH STATEMENT EXECUTE FUNCTION acc_training_immutable_history()`,
+  `ALTER TABLE acc_training_effort_intervals ENABLE ALWAYS TRIGGER acc_training_effort_intervals_guard`,
+  `ALTER TABLE acc_training_effort_intervals ENABLE ALWAYS TRIGGER acc_training_effort_intervals_truncate_guard`,
 ];
 
 /** The ordered startup statements, read-only, for offline guard checks. */

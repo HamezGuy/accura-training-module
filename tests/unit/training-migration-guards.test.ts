@@ -14,7 +14,8 @@ jest.mock('../../src/config/logger', () => ({ logger: { info: jest.fn(), error: 
 import { runMigrations, TRAINING_MIGRATION_STATEMENTS } from '../../src/config/migrations';
 
 const APPEND_ONLY = ['acc_training_audit_log', 'acc_training_obligation_events', 'acc_training_record_history',
-  'acc_training_impact_events', 'acc_training_material_publications', 'acc_training_material_events', 'acc_training_decision_signatures'];
+  'acc_training_impact_events', 'acc_training_material_publications', 'acc_training_material_events', 'acc_training_decision_signatures',
+  'acc_training_effort_intervals'];
 const IMMUTABLE = 'acc_training_immutable_history';
 
 const statements = TRAINING_MIGRATION_STATEMENTS.map(sql => sql.replace(/\s+/g, ' ').trim());
