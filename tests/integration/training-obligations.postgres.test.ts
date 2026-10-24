@@ -234,12 +234,16 @@ owned('native obligation scope, durable assignment and completion evidence',()=>
     expect((await api(22).post('/duty-readiness',dutyRequest(policy,{armIds:[999]}))).body.data.ready).toBe(false);
   });
   test('a verified completion expiring during final native callbacks cannot be ready at the response cutoff',async()=>{
-    const row=await assign(),expires=Date.now()+900;
-    // Synthetic short certificate lifetime is supplied at grading, so both the
+    // The test drives the clock: Date.now() is the real clock plus a step taken inside the third final callback, so
+    // no wall-clock wait meets the 1 s authority timeout and machine load cannot expire the completion early. The
+    // lifetime exceeds any test timeout here, so only that step crosses it. Timers stay real.
+    const realNow=Date.now.bind(Date);let step=0;jest.spyOn(Date,'now').mockImplementation(()=>realNow()+step);
+    const row=await assign(),expires=Date.now()+600000;
+    // A synthetic certificate lifetime is supplied at grading, so both the
     // immutable receipt and record retain it. Do not rewrite either afterward.
     jest.spyOn(certificateService,'calculateExpirationDate').mockReturnValueOnce(new Date(expires));
     const recordId=await complete();expect((await api(33).post(`/verify/${recordId}`,{notes:'Independent synthetic review'})).status).toBe(200);
-    let scopes=0,crossed=false;intercept=async input=>{if(input.action==='duties:read'&&++scopes===3){expect(Date.now()).toBeLessThan(expires);await new Promise(resolve=>setTimeout(resolve,Math.max(1,expires-Date.now()+40)));crossed=true;}};
+    let scopes=0,crossed=false;intercept=async input=>{if(input.action==='duties:read'&&++scopes===3){expect(Date.now()).toBeLessThan(expires);step=expires-realNow()+40;crossed=true;}};
     const observed=await api(22).post('/duty-readiness',dutyRequest(dutyPolicy(row)));intercept=undefined;
     expect(observed.status).toBe(200);expect(crossed).toBe(true);expect(Date.parse(observed.body.data.observedAt)).toBeGreaterThanOrEqual(expires);
     expect(observed.body.data.ready).toBe(false);expect(observed.body.data.assignments[1].obligations[0].readiness).toBe('retraining_required');
