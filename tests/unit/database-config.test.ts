@@ -11,6 +11,7 @@ describe('verified training PostgreSQL configuration', () => {
   });
   function load(database: Record<string, unknown>) {
     jest.doMock('../../src/config/environment', () => ({ config: { database } }));
+    // eslint-disable-next-line @typescript-eslint/no-require-imports -- loads the module after its per-test mocks
     require('../../src/config/database');
     return makePool.mock.calls[0][0];
   }

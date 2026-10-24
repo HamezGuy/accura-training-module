@@ -31,6 +31,10 @@ jobs:
         run: |
           npm run build
           node node_modules/typescript/bin/tsc --noEmit -p tsconfig.test.json
+      - name: Lint source, tests and seeds
+        # Pinned eslint and typescript-eslint with the IntellegenceLayer rule set:
+        # errors fail the job, warnings are reported.
+        run: npm run lint
       - name: Run offline service contracts
         # Native cross-owner PostgreSQL qualification needs explicit owned
         # databases and the pinned API checkout; skips remain visible in JSON.

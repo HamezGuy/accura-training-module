@@ -188,7 +188,7 @@ owned('native obligation scope, durable assignment and completion evidence',()=>
     expect((await api(33).post(`/verify/${recordId}`,{notes:'Independent synthetic procedure review'})).status).toBe(200);
     const observed=await api(22).post('/duty-readiness',req);expect(observed.status).toBe(200);expect(observed.headers['cache-control']).toBe('no-store');
     expect(observed.body.data).toMatchObject({ready:true,nonce:req.nonce,policyHash:trainingDutyHash(policy),actorUserId:22,armIds:[5]});
-    const {schemaVersion,nonce,observedAt,consistency,evidenceHash,...exportedEvidence}=observed.body.data;expect(trainingDutyHash(exportedEvidence)).toBe(evidenceHash);
+    const {schemaVersion:_schemaVersion,nonce:_nonce,observedAt:_observedAt,consistency:_consistency,evidenceHash,...exportedEvidence}=observed.body.data;expect(trainingDutyHash(exportedEvidence)).toBe(evidenceHash);
     expect(observed.body.data.assignments[1].obligations[0]).toMatchObject({retainedScope:{studyId:100,siteId:101,armId:5},verifiedBy:33,recordId});
     const retained=(await nativePool.query('SELECT * FROM acc_training_record_history ORDER BY history_id')).rows;
     expect(retained.map(r=>r.event_kind)).toEqual(['cycle_started','quiz_attempt']);

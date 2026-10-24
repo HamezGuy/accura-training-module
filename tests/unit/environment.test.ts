@@ -14,6 +14,7 @@ describe('explicit trusted authentication authority configuration', () => {
     }
   });
   function load() {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports -- re-reads the environment after each per-test change
     return require('../../src/config/environment').config as import('../../src/config/environment').EnvironmentConfig;
   }
   test.each(['development', 'test', 'production'])('refuses a missing authority in %s without a signing secret', environment => {

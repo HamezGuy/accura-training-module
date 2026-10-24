@@ -28,6 +28,7 @@ jest.mock('../../src/services/training.service', () => ({ expireOverdueRecords: 
 jest.mock('../../src/services/error-reporter.service', () => ({ reportError: jest.fn(), startErrorReporter: jest.fn(), stopErrorReporter: jest.fn() }));
 jest.mock('node-cron', () => ({ ...jest.requireActual('node-cron'), schedule: jest.fn() }));
 jest.mock('../../src/routes/training.routes', () => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- a hoisted jest.mock factory cannot use imports
   const router = require('express').Router();
   router.get('/owned-error', () => { throw new Error('Private owned failure detail'); });
   return router;
@@ -62,6 +63,7 @@ beforeEach(() => {
   // Each process gets one singleton pool/reporter. Reload the module for each
   // independent fixture rather than permitting an unsupported runtime restart.
   jest.resetModules();
+  /* eslint-disable @typescript-eslint/no-require-imports -- a fresh module registry is reloaded synchronously */
   ({ default: app, createApp, startServer } = require('../../src/server'));
   cron = require('node-cron');
   ({ pool } = require('../../src/config/database'));
@@ -69,6 +71,7 @@ beforeEach(() => {
   ({ runMigrations } = require('../../src/config/migrations'));
   ({ expireOverdueRecords } = require('../../src/services/training.service'));
   ({ reportError, startErrorReporter, stopErrorReporter } = require('../../src/services/error-reporter.service'));
+  /* eslint-enable @typescript-eslint/no-require-imports */
   importCalls = [pool.query, runMigrations, cron.schedule, startErrorReporter].map(fn => (fn as jest.Mock).mock.calls.length);
   jest.clearAllMocks(); runtimes = []; stopTask = jest.fn();
   config.training.expirationCheckCron = '0 2 * * *';
@@ -230,6 +233,7 @@ Module._load=function(request,parent,isMain){
     await new Promise<void>(resolve => occupied.close(() => resolve()));
     const relative = path.relative(tmpdir(), directory);
     if (path.isAbsolute(relative) || relative.startsWith('..') || !path.basename(directory).startsWith('training-entrypoint-')) {
+      // eslint-disable-next-line no-unsafe-finally -- refusing to delete outside the temporary root must win over any earlier failure
       throw new Error('Owned child fixture directory escaped its temporary root.');
     }
     rmSync(directory, { recursive: true, force: true });

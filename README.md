@@ -58,6 +58,9 @@ npm run dev
 # Run tests
 npm test
 
+# Lint source, tests and seeds (pinned eslint; errors fail, warnings are reported)
+npm run lint
+
 # Build for production
 npm run build
 npm start

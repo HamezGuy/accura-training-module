@@ -27,13 +27,14 @@ async function generate(): Promise<void> {
       const path = await import('path');
       const ravePath = path.join(__dirname, 'content', 'rave-courses.ts');
       if (fs.existsSync(ravePath)) {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports -- optional module, loaded only when present
         const raveModule = require('./content/rave-courses');
         raveCourseContent = raveModule.raveCourseContent || [];
         console.log(`Loaded ${raveCourseContent.length} Rave-pattern slides`);
       } else {
         console.log('No rave-courses.ts found yet, using standard content for priority courses');
       }
-    } catch (e) {
+    } catch {
       console.log('Rave content not available, using standard content');
     }
 

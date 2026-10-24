@@ -14,6 +14,7 @@ jest.mock('../../src/config/logger', () => ({ logger: { info: jest.fn(), error: 
 jest.mock('../../src/services/training.service', () => ({ expireOverdueRecords: jest.fn() }));
 jest.mock('../../src/services/error-reporter.service', () => ({ reportError: jest.fn(), startErrorReporter: jest.fn(), stopErrorReporter: jest.fn() }));
 jest.mock('../../src/routes/training.routes', () => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- a hoisted jest.mock factory cannot use imports
   const router = require('express').Router();
   router.post('/duty-readiness', (_req: any, res: any) => res.json({ success: true }));
   router.get('/courses', (_req: any, res: any) => res.json({ success: true }));

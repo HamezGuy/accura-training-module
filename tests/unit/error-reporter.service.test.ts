@@ -18,10 +18,12 @@ function deferred() {
 beforeEach(() => {
   jest.resetModules(); jest.useFakeTimers();
   process.env.SMTP_HOST = 'owned-smtp.invalid'; process.env.SMTP_PORT = '587';
+  /* eslint-disable @typescript-eslint/no-require-imports -- a fresh module registry is reloaded synchronously */
   createTransport = require('nodemailer').createTransport;
   sendMail = jest.fn().mockResolvedValue(undefined); close = jest.fn();
   createTransport.mockReturnValue({ sendMail, close } as unknown as Transporter);
   reporter = require('../../src/services/error-reporter.service');
+  /* eslint-enable @typescript-eslint/no-require-imports */
 });
 afterEach(async () => {
   await reporter.stopErrorReporter().catch(() => {});
