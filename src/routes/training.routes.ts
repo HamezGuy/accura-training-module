@@ -248,11 +248,20 @@ router.post(
 const subjectRoles: Record<string, string[]> = {
   verification: ['admin', 'data_manager', 'monitor', 'investigator'],
   'material-approval': ['admin', 'data_manager'],
+  'impact-review': ['admin', 'data_manager'],
 };
 router.get('/signature-subject', (req: AuthRequest, res, next) => {
   const roles = subjectRoles[String(req.query['kind'])];
   if (roles) authorize(roles)(req, res, next); else next();
 }, asyncHandler<AuthRequest>(async (req, res) => {
+  if (req.query['kind'] === 'impact-review') {
+    if (Object.keys(req.query).some(key => !['kind', 'planId'].includes(key)) || typeof req.query['planId'] !== 'string') {
+      throw Object.assign(new Error('Exact signature kind and impact plan required'), { statusCode: 400 });
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ success: true, data: await impact.readImpactSignatureSubject(req.trainingAuthority!, req.query['planId']) });
+    return;
+  }
   if (req.query['kind'] !== 'material-approval') { await controller.getRecordSignatureSubject(req, res); return; }
   if (Object.keys(req.query).some(key => !['kind', 'draftId'].includes(key)) || typeof req.query['draftId'] !== 'string') {
     throw Object.assign(new Error('Exact signature kind and material draft required'), { statusCode: 400 });

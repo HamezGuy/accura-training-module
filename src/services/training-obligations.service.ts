@@ -7,6 +7,9 @@ import {assertMaterialUse,publishedMaterial,observePublication,validateInspectio
 import {mapRecordToDto} from './training-record-dto';
 import {verifyRecordAssessment,verifyAssessmentRows,AssessmentHistoryRow} from './training-assessment-evidence';
 import {bindingFor,recordDecisionSubject,signatureBindings,signatureReference} from './training-signatures.service';
+// The impact plan service reaches the signature leaf through this module: the EDC's native suites compile it with
+// replacements for this module only (tests/helpers/synthetic-training-readiness.ts there).
+export {bindingStatus,bindSignatureReceipt,checkSignedDecision,impactReviewBinding,impactReviewSubject,readSignatureReceipt,signatureAuditDetails} from './training-signatures.service';
 import {createHash} from 'node:crypto';
 import type {TrainingInspectionEvidence,TrainingMaterialSource,TrainingRecordSignatureDecision,TrainingSignatureBinding,TrainingSignatureReference} from '../types/training.types';
 

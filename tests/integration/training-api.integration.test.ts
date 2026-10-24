@@ -530,6 +530,10 @@ describe('Training API Integration', () => {
       ['a malformed record', 'kind=verification&recordId=05&studyId=100', 'admin', 400],
       ['a repeated study', 'kind=verification&recordId=5&studyId=100&studyId=101', 'admin', 400],
       ['a record selector on a material subject', 'kind=material-approval&draftId=x&recordId=5', 'admin', 400],
+      ['an impact review subject for a non-manager role', 'kind=impact-review&planId=x', 'monitor', 403],
+      ['an impact review subject without its plan', 'kind=impact-review', 'admin', 400],
+      ['a record selector on an impact review subject', 'kind=impact-review&planId=x&recordId=5', 'admin', 400],
+      ['a malformed impact plan', 'kind=impact-review&planId=x', 'data_manager', 400],
     ])('refuses %s before any service', async (_name, query, role, status) => {
       expect((await request(app).get(`/api/training/signature-subject?${query}`).set('Authorization', bearer(role))).status).toBe(status);
       expect(mockReadRecordSignatureSubject).not.toHaveBeenCalled();

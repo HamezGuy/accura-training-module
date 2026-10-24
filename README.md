@@ -506,6 +506,20 @@ the current publication's draft. A binding that no longer matches its completion
 or publication refuses the observation. A restart is a new cycle and needs new
 signatures. Readiness `/1` is answered exactly as before.
 
+An accepted impact plan review (`POST /impact-plans/:id/review` with `accepted:
+true`) can carry the reviewer's signature too (decision `impact-review`, subject
+`training-impact-review-subject/1`: plan ID, the revision reviewed, plan hash,
+the native source observation hash, the proposer and the plan's study or site;
+the plan hash covers the affected actions, so no learner or arm id appears). The
+receipt is checked before any write or native read, confirmed with the EDC, and
+bound in the review's transaction (`training_signature_bound`, row keyed by
+`impact_plan_id`, one per plan); the same receipt again replays. Apply refuses a
+retained binding that no longer names the reviewed plan and its reviewer. An
+unsigned review applies as before unless this service runs with
+`TRAINING_IMPACT_REVIEW_SIGNATURE_REQUIRED=true` (read on every apply, off by
+default), which refuses it with 409. The EDC proxy, its meaning and its signature
+table must admit the decision first (FX-EDC-120); until then no such receipt exists.
+
 Not covered yet: matrix approval (reserved for the curriculum matrix, T-1); the
 bindings are not a table of `training-inspection-evidence/1` (the audit rows of
 record decisions are, through their record IDs; a `/2` inspection constituent is

@@ -1,8 +1,9 @@
 import {randomUUID} from 'node:crypto';
 import {queryOne,transaction,TransactionClient} from '../config/database';
 import {TrainingImpactPlanRequest,TrainingImpactAction,TrainingObligation,TrainingCourse,TrainingObligationRequest} from '../types/training.types';
-import {resolveImpactSource,inspectImpactSource,resolveObligationScope,TrainingAuthorityContext,ImpactSourceObservation,ObligationScopeObservation} from './training-authority.service';
-import {assignObligationInTransaction,withdrawObligationInTransaction,validateObligationRequest,trainingDutyHash} from './training-obligations.service';
+import {resolveImpactSource,inspectImpactSource,resolveObligationScope,resolveSignature,TrainingAuthorityContext,ImpactSourceObservation,ObligationScopeObservation} from './training-authority.service';
+import {assignObligationInTransaction,withdrawObligationInTransaction,validateObligationRequest,trainingDutyHash,
+  bindingStatus,bindSignatureReceipt,checkSignedDecision,impactReviewBinding,impactReviewSubject,readSignatureReceipt,signatureAuditDetails} from './training-obligations.service';
 import {logAudit,AuditAction} from './audit.service';
 
 const uuid=(v:unknown):v is string=>typeof v==='string'&&/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(v);
@@ -89,19 +90,70 @@ export async function getImpactPlan(authority:TrainingAuthorityContext,planId:st
   let sourceCurrent=false;try{const observed=await resolveImpactSource(authority,row.plan.scope,row.plan.source);sourceCurrent=observed.sourceObservationHash===row.sourceObservation.sourceObservationHash;}catch(error){if([401,403].includes((error as {statusCode?:number}).statusCode??0))throw error;}
   return {...row,history:events.rows,sourceCurrent,sourceIssue:sourceCurrent?null:'The retained native source is changed or unavailable; history is retained, but a new current observation is required for execution.'};
 }
+/** Off unless TRAINING_IMPACT_REVIEW_SIGNATURE_REQUIRED=true, read on every apply: then only a plan whose accepted
+ * review carries the reviewer's Part 11 signature can be applied. */
+const reviewSignatureRequired=()=>process.env.TRAINING_IMPACT_REVIEW_SIGNATURE_REQUIRED==='true';
+/** The revision a review was made against: the plan head before its review event. */
+async function reviewedRevision(client:Pick<TransactionClient,'queryOne'>,row:PlanRow){
+  if(row.status==='proposed')return row.revision;
+  const reviewed=await client.queryOne<{revision:number}>("SELECT revision FROM acc_training_impact_events WHERE plan_id=$1 AND action='training_impact_reviewed'",[row.id]);
+  if(!reviewed||!id(reviewed.revision-1))fail('Retained impact review history is incomplete');return reviewed.revision-1;
+}
+/** The impact-review subject: a proposed plan, for a manager other than its proposer about to accept it, or an
+ * accepted review, for its recorded reviewer. Without an actor (apply) it is the subject the review was signed over. */
+async function reviewSubject(client:Pick<TransactionClient,'queryOne'>,actor:number|null,row:PlanRow){
+  if(actor!==null&&row.createdBy===actor)fail('A different currently authorized training manager must review the impact mapping',403);
+  if(!['proposed','reviewed','applied'].includes(row.status))fail('Only a proposed plan or an accepted impact review can be signed');
+  if(actor!==null&&row.status!=='proposed'&&row.reviewedBy!==actor)fail('Only the recorded reviewer can sign this impact review',403);
+  const subject=impactReviewSubject({planId:row.id,reviewedRevision:await reviewedRevision(client,row),planHash:row.planHash,
+    sourceObservationHash:row.sourceObservation.sourceObservationHash,proposerUserId:row.createdBy,context:row.plan.scope});
+  return {subject,subjectHash:trainingDutyHash(subject)};
+}
+const signatureSummary=(binding:{signatureId:number;subjectHash:string;signedAt:string})=>({signatureId:binding.signatureId,subjectHash:binding.subjectHash,signedAt:binding.signedAt});
+/** GET /signature-subject for an impact review: the exact subject, and whether it is already bound. */
+export async function readImpactSignatureSubject(authority:TrainingAuthorityContext,planId:string){
+  const prior=await load({queryOne},planId);await inspectImpactSource(authority,prior.plan.scope,[]);
+  const read=await transaction(async client=>{await client.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
+    const row=await load(client,prior.id),signed=await reviewSubject(client,authority.actorUserId,row);
+    return {...signed,binding:bindingStatus(await impactReviewBinding(client,row.id))};
+  });
+  await inspectImpactSource(authority,prior.plan.scope,[]);return read;
+}
+/** An accepted review with an EDC signature receipt also binds the reviewer's Part 11 signature over the exact plan in
+ * the same transaction; without one it is the existing authenticated review. A rejection cannot be signed. */
 export async function reviewImpactPlan(authority:TrainingAuthorityContext,planId:string,input:unknown){
-  object(input,['expectedRevision','accepted','reason']);if(!id(input.expectedRevision)||typeof input.accepted!=='boolean')fail('Exact review revision and disposition are required',400);reason(input.reason);
+  object(input,['expectedRevision','accepted','reason','signatureReceipt']);if(!id(input.expectedRevision)||typeof input.accepted!=='boolean')fail('Exact review revision and disposition are required',400);reason(input.reason);
+  if(input.signatureReceipt!==undefined&&input.accepted!==true)fail('Only an accepted impact review can carry a review signature',400);
+  const receipt=input.signatureReceipt===undefined?undefined:readSignatureReceipt(input.signatureReceipt);
   return transaction(async client=>{
     const row=await load(client,planId,true);
     if(row.createdBy===authority.actorUserId)fail('A different currently authorized training manager must review the impact mapping',403);
+    // An uncertain signed review is reconciled by repeating the same receipt: it replays, never reviews again.
+    if(receipt&&row.status==='reviewed'&&row.reviewedBy===authority.actorUserId&&row.revision===input.expectedRevision+1){
+      const prior=await impactReviewBinding(client,row.id);
+      if(prior&&prior.signatureId===receipt.signatureId&&prior.subjectHash===receipt.subjectHash){await inspectImpactSource(authority,row.plan.scope,[]);return {...row,replayed:true,signature:signatureSummary(prior)};}}
     if(row.revision!==input.expectedRevision||row.status!=='proposed')fail('The impact plan already changed or has a review');
+    const signed=receipt?await reviewSubject(client,authority.actorUserId,row):undefined;
+    if(receipt&&signed)checkSignedDecision(receipt,'impact-review',authority.actorUserId,signed.subjectHash);
     const observed=input.accepted?await resolveImpactSource(authority,row.plan.scope,row.plan.source):await inspectImpactSource(authority,row.plan.scope,[]);
     if(input.accepted){if(observed.sourceObservationHash!==row.sourceObservation.sourceObservationHash)fail('The native impact source changed; a new plan is required');
       await prepare(authority,row.plan,client);await resolveImpactSource(authority,row.plan.scope,row.plan.source,observed);}
     else await getAppliedReplay(authority,row,client);
     const updated=await client.queryOne<PlanRow>(`UPDATE acc_training_impact_plans SET status=$2,revision=revision+1,reviewed_by=$3,reviewed_at=NOW(),review_reason=$4,review_authority=$5::jsonb,updated_at=NOW() WHERE id=$1 RETURNING *`,[planId,input.accepted?'reviewed':'rejected',authority.actorUserId,input.reason.trim(),JSON.stringify({userId:authority.actorUserId,authorityHash:observed.actorAuthorityHash})]);
-    await event(client,updated!,authority.actorUserId,input.accepted?'training_impact_reviewed':'training_impact_rejected');return updated;
+    await event(client,updated!,authority.actorUserId,input.accepted?'training_impact_reviewed':'training_impact_rejected');
+    if(!receipt||!signed)return updated;
+    const bound=await bindSignatureReceipt(client,receipt,await resolveSignature(authority,receipt,signed.subject),{decision:'impact-review',...signed,signerUserId:authority.actorUserId,impactPlanId:row.id});
+    if(!bound.replayed)await logAudit({userId:authority.actorUserId,action:'training_signature_bound',details:{planId:row.id,...signatureAuditDetails(bound.binding)}},client);
+    return {...updated!,replayed:bound.replayed,signature:signatureSummary(bound.binding)};
   });
+}
+/** A retained review signature must name this exact reviewed plan and its recorded reviewer. An unsigned review
+ * applies as before unless TRAINING_IMPACT_REVIEW_SIGNATURE_REQUIRED=true. */
+async function checkReviewSignature(client:TransactionClient,row:PlanRow){
+  const binding=await impactReviewBinding(client,row.id);
+  if(!binding){if(reviewSignatureRequired())fail('A Part 11 signed independent impact review is required to apply this plan');return;}
+  const signed=await reviewSubject(client,null,row);
+  if(binding.subjectHash!==signed.subjectHash||binding.signerUserId!==row.reviewedBy)fail('The retained impact review signature does not match the reviewed plan');
 }
 export async function applyImpactPlan(authority:TrainingAuthorityContext,planId:string,input:unknown){
   object(input,['expectedRevision']);if(!id(input.expectedRevision))fail('Exact reviewed revision is required',400);
@@ -111,6 +163,7 @@ export async function applyImpactPlan(authority:TrainingAuthorityContext,planId:
     if(row.status==='applied'&&row.revision===input.expectedRevision+1)return getAppliedReplay(authority,row,client);
     if(row.revision!==input.expectedRevision||row.status!=='reviewed')fail('A current independently reviewed impact plan is required');
     if(!row.reviewAuthority||row.reviewAuthority.userId!==row.reviewedBy)fail('Independent review authority custody is missing');
+    await checkReviewSignature(client,row);
     const observed=await resolveImpactSource(authority,row.plan.scope,row.plan.source,row.sourceObservation,row.reviewAuthority);
     const prepared=await prepare(authority,row.plan,client);
     // Match the existing writer order: all courses, then obligations; distinct
