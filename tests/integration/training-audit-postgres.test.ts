@@ -3,6 +3,7 @@
 import express from 'express';
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
+import { randomUUID } from 'node:crypto';
 import { createJwtService } from '@accura-trial/auth-core';
 import { Pool } from 'pg';
 import trainingRoutes from '../../src/routes/training.routes';
@@ -29,6 +30,12 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
   const app = express(); app.use(express.json()); app.use('/api/training', trainingRoutes); app.use(errorHandler);
   const token = jwt.sign({ userId: 111, username: 'owned-fixture-admin', role: 'admin', email: 'owned@example.invalid', type: 'access' }, 'owned-training-postgres-test', { algorithm: 'HS256', issuer: 'libreclinica-api', audience: 'libreclinica-client', expiresIn: '1h' });
   let ready = false, courseId: number, questionId: number, recordId: number;
+  // The learner's open tab: the exact record, assessment cycle and content
+  // revision its start returned. Quiz submissions carry these, as a browser does.
+  let tab: { recordId: number; cycleId: string; contentRevision: number } | undefined;
+  // Audit rows above this id belong to the action under test. The log is
+  // append-only, so earlier rows are never deleted to isolate an action.
+  let auditMark = 0;
   const cases = ['create', 'update', 'questions', 'start', 'quiz-pass', 'quiz-fail', 'verify'] as const;
   const options = [{ text: 'yes', isCorrect: true }, { text: 'no', isCorrect: false }];
   const expected = { create: 'course_created', update: 'course_updated', questions: 'questions_added', start: 'training_started',
@@ -44,6 +51,18 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
     const existing = await fixturePool.query("SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' LIMIT 1");
     if (existing.rowCount) throw new Error('The owned PostgreSQL test database must initially be empty.');
     await runMigrations(); await runMigrations(); // Additive DDL is idempotent.
+    nativeAuthority = nativeTrainingAuthority(process.env['TRAINING_NATIVE_AUTHORITY_ROOT']!, fixturePool);
+    console.info('TRAINING_NATIVE_AUTHORITY_SOURCE_HASHES', JSON.stringify(nativeAuthority.sourceHashes));
+    ready = true;
+  }, 30_000);
+  afterAll(async () => { await pool.end(); await fixturePool.end(); });
+
+  // This entire database was created empty and validated as owned above. Each
+  // test recreates its disposable schema; it never truncates or deletes the
+  // append-only training history or audit log, and never disables their guards.
+  async function recreateOwnedSchema() {
+    await fixturePool.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public');
+    await runMigrations();
     // Minimal projection of the authoritative EDC schema, not a second account store.
     // Column names/joins match libreclinicaapi auth.service/user.service and native study membership.
     await fixturePool.query(`CREATE TABLE user_account (user_id integer PRIMARY KEY, user_name text UNIQUE NOT NULL,
@@ -57,14 +76,10 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
         role_name text, status_id integer NOT NULL)`);
     await fixturePool.query(`CREATE FUNCTION reject_owned_training_audit() RETURNS trigger LANGUAGE plpgsql AS $$
       BEGIN RAISE EXCEPTION 'Owned injected audit storage failure'; END; $$`);
-    nativeAuthority = nativeTrainingAuthority(process.env['TRAINING_NATIVE_AUTHORITY_ROOT']!, fixturePool);
-    console.info('TRAINING_NATIVE_AUTHORITY_SOURCE_HASHES', JSON.stringify(nativeAuthority.sourceHashes));
-    ready = true;
-  }, 30_000);
-  afterAll(async () => { await pool.end(); await fixturePool.end(); });
+  }
 
   beforeEach(async () => {
-    beforeNativeResolve = undefined;
+    beforeNativeResolve = undefined; tab = undefined; auditMark = 0;
     const verifier = createJwtService({ secret: 'owned-training-postgres-test' });
     jest.spyOn(globalThis, 'fetch').mockImplementation(async (url, options) => {
       const bearer = new Headers(options?.headers).get('Authorization')!.slice('Bearer '.length);
@@ -87,10 +102,8 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
       } } : { success: false }), { status: verified ? 200 : 401 });
     });
     if (!ready) throw new Error('Owned test database preparation did not complete.');
-    await fixturePool.query('DROP TRIGGER IF EXISTS reject_owned_training_audit ON acc_training_audit_log');
-    await fixturePool.query('TRUNCATE acc_training_questions, acc_training_records, acc_training_audit_log, acc_training_courses RESTART IDENTITY CASCADE');
-    await fixturePool.query(`TRUNCATE acc_organization_member, study_user_role, user_account_extended, user_account, study;
-      INSERT INTO user_account VALUES (111,'owned-admin','Owned','Admin',1,1),(222,'owned-manager','Owned','Manager',2,1),
+    await recreateOwnedSchema();
+    await fixturePool.query(`INSERT INTO user_account VALUES (111,'owned-admin','Owned','Admin',1,1),(222,'owned-manager','Owned','Manager',2,1),
         (333,'owned-inactive','Owned','Inactive',2,1),(444,'owned-outside','Owned','Outside',2,1);
       INSERT INTO user_account_extended VALUES (111,'monitor'),(222,'study_director'),(333,'monitor'),(444,'monitor');
       INSERT INTO acc_organization_member VALUES (10,111,'active'),(10,222,'active'),(10,333,'removed'),(20,444,'active');
@@ -137,6 +150,8 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
     for (const table of ['acc_training_courses', 'acc_training_questions', 'acc_training_records', 'acc_training_audit_log']) {
       state[table] = (await fixturePool.query(`SELECT * FROM ${table} ORDER BY id`)).rows;
     }
+    // Retained assessment cycles, attempts and restarts are business rows too.
+    state['acc_training_record_history'] = (await fixturePool.query('SELECT * FROM acc_training_record_history ORDER BY history_id')).rows;
     return state;
   }
   afterEach(() => jest.restoreAllMocks());
@@ -151,15 +166,27 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
       : kind === 'questions' ? client.post(`/api/training/courses/${courseId}/questions`).send({ questions: [{ questionText: 'Second owned question', questionType: 'true_false', options, orderIndex: 1 }] })
       : kind === 'start' ? client.post(`/api/training/start/${courseId}`).send({})
       : kind === 'verify' ? client.post(`/api/training/verify/${recordId}`).send({ notes: 'Owned verification note' })
-      : client.post(`/api/training/submit-quiz/${courseId}`).send({ contentRevision:2, answers: [{ questionId, selectedOptions: [kind === 'quiz-pass' ? 0 : 1] }] });
+      : client.post(`/api/training/submit-quiz/${courseId}`).send({ ...tab, requestId: randomUUID(),
+        answers: [{ questionId, selectedOptions: [kind === 'quiz-pass' ? 0 : 1] }] });
     return pending.set('Authorization', `Bearer ${token}`);
   }
 
-  async function prepareQuiz(kind: string) {
-    if (!kind.startsWith('quiz-')) return;
+  // Start the course in a learner tab and keep what the tab was given.
+  async function startTab() {
     const response = await request(app).post(`/api/training/start/${courseId}`).set('Authorization',`Bearer ${token}`).send({});
     expect(response.status).toBe(200);
-    await fixturePool.query('DELETE FROM acc_training_audit_log'); // isolate action under test
+    const current = (await fixturePool.query('SELECT content_revision FROM acc_training_courses WHERE id=$1', [courseId])).rows[0];
+    expect(response.body.data.contentRevision).toBe(current.content_revision);
+    tab = { recordId: response.body.data.id, cycleId: response.body.data.assessmentCycleId, contentRevision: current.content_revision };
+    return response;
+  }
+  async function markAudit() {
+    auditMark = (await fixturePool.query('SELECT COALESCE(MAX(id),0)::int AS mark FROM acc_training_audit_log')).rows[0].mark;
+  }
+  async function prepareQuiz(kind: string) {
+    if (!kind.startsWith('quiz-')) return;
+    await startTab();
+    await markAudit(); // isolate the action under test without deleting audit rows
   }
   test.each(cases)('%s leaves all business and audit rows unchanged when PostgreSQL rejects the audit insert', async kind => {
     await prepareQuiz(kind);
@@ -173,7 +200,7 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
     const before = await snapshot(), response = await send(kind);
     expect(response.status).toBeLessThan(300); expect(response.body.success).toBe(true);
     expect(await snapshot()).not.toEqual(before);
-    const audit = await fixturePool.query('SELECT user_id, action, record_id, course_id FROM acc_training_audit_log');
+    const audit = await fixturePool.query('SELECT user_id, action, record_id, course_id FROM acc_training_audit_log WHERE id > $1 ORDER BY id', [auditMark]);
     expect(audit.rows).toHaveLength(1);
     expect(audit.rows[0]).toMatchObject({ user_id: 111, action: expected[kind] });
     if (kind === 'verify') expect(audit.rows[0].record_id).toBe(recordId);
@@ -361,8 +388,7 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
   });
 
   test('material changes invalidate completion; retraining archives the exact certificate and content', async () => {
-    const start = await request(app).post(`/api/training/start/${courseId}`).set('Authorization',`Bearer ${token}`).send({});
-    expect(start.status).toBe(200); const revision = start.body.data.contentRevision;
+    const start = await startTab(); const revision = start.body.data.contentRevision;
     expect(start.body.data).not.toHaveProperty('contentSnapshot');
     const complete = await send('quiz-pass'); expect(complete.status).toBe(200);
     const old = (await fixturePool.query('SELECT * FROM acc_training_records WHERE user_id=111')).rows[0];
@@ -375,7 +401,8 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
     expect((await request(app).post(`/api/training/start/${courseId}`).set('Authorization',`Bearer ${token}`).send({contentRevision:revision})).status).toBe(409);
     const restart = await request(app).post(`/api/training/start/${courseId}`).set('Authorization',`Bearer ${token}`).send({contentRevision:current.content_revision});
     expect(restart.status).toBe(200); expect(restart.body.data.certificateNumber).toBeNull();
-    const history = (await fixturePool.query('SELECT record_snapshot FROM acc_training_record_history WHERE user_id=111')).rows;
+    // Cycle starts and attempts are retained beside it; the restart archive holds the old completion.
+    const history = (await fixturePool.query("SELECT record_snapshot FROM acc_training_record_history WHERE user_id=111 AND event_kind='restart'")).rows;
     expect(history).toHaveLength(1);
     expect(history[0].record_snapshot.certificateNumber).toBe(old.certificate_number);
     expect(history[0].record_snapshot.contentSnapshot.questions[0].questionText).toBe('Owned fixture?');
@@ -394,16 +421,18 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
     await prepareQuiz('quiz-pass'); expect((await send('quiz-pass')).status).toBe(200);
     await fixturePool.query("UPDATE acc_training_courses SET version='2' WHERE id=$1",[courseId]);
     const previous=(await fixturePool.query('SELECT * FROM acc_training_records WHERE user_id=111')).rows[0];
+    const retained=(await fixturePool.query('SELECT * FROM acc_training_record_history ORDER BY history_id')).rows;
     await refuseAudit(); expect((await send('start')).status).toBe(500);
     expect((await fixturePool.query('SELECT * FROM acc_training_records WHERE user_id=111')).rows[0]).toEqual(previous);
-    expect((await fixturePool.query('SELECT * FROM acc_training_record_history')).rows).toHaveLength(0);
+    // No restart archive or new cycle survives the refused audit.
+    expect((await fixturePool.query('SELECT * FROM acc_training_record_history ORDER BY history_id')).rows).toEqual(retained);
   });
 
   test('an older tab cannot submit after another tab starts the new revision', async () => {
     await prepareQuiz('quiz-pass');
     await fixturePool.query("UPDATE acc_training_questions SET question_text='Updated question' WHERE id=$1",[questionId]);
     expect((await send('start')).status).toBe(200); // second tab binds current revision
-    expect((await send('quiz-pass')).status).toBe(409); // first tab still sends revision 2
+    expect((await send('quiz-pass')).status).toBe(409); // first tab still sends its own cycle and revision
     expect((await fixturePool.query('SELECT status FROM acc_training_records WHERE user_id=111')).rows[0].status).toBe('in_progress');
   });
 
