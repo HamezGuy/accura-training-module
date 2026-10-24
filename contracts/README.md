@@ -9,6 +9,8 @@ on every checkout. A change of meaning is a new version (`/2`), never an edit of
 |---|---|---|---|
 | `training-signature-subject-v1.schema.json` | `training-signature-subject/1` | `GET /api/training/signature-subject` | EDC training proxy (hash check before signing), EDC readiness verifier, Command Center harness |
 | `training-signature-subject-v1.vectors.json` | hash vectors for `training-signature-subject/1` | this repository | this repository's tests and the EDC's tests: each side must reproduce `canonical` and `subjectHash` with its own canonicalizer |
+| `training-impact-review-subject-v1.schema.json` | `training-impact-review-subject/1` | `GET /api/training/signature-subject?kind=impact-review` | EDC training proxy (hash check before signing), Command Center harness |
+| `training-impact-review-subject-v1.vectors.json` | hash vectors for `training-impact-review-subject/1` | this repository | as for the signature subject vectors |
 | `training-duty-readiness-v2.schema.json` | `training-duty-readiness/2` | `POST /api/training/duty-readiness` answering `training-duty-readiness-request/2` | EDC duty readiness consumer |
 | `training-effort-observation-request-v1.schema.json` | `training-effort-observation-request/1` | Command Center (the requester) | `POST /api/training/effort-source/observe` (this service) |
 | `training-effort-source-v1.schema.json` | `TrainingEffortSourceV1@1.0.0` | `POST /api/training/effort-source/observe`, the `data` of `TrainingEffortServiceObservationV1@1.0.0` | Command Center TA3 metrics register (plan item T-4/cc) |
@@ -23,7 +25,8 @@ People sign in the EDC, never in this service and never with a machine credentia
 
 1. The EDC proxy reads `GET /api/training/signature-subject` with the signer's own bearer and compares the hash of
    the returned `subject` with the hash the person was shown. Query keys: `kind=completion-attestation` or
-   `kind=verification` with `recordId`, `studyId` and optional `siteId`; or `kind=material-approval` with `draftId`.
+   `kind=verification` with `recordId`, `studyId` and optional `siteId`; or `kind=material-approval` with `draftId`;
+   or `kind=impact-review` with `planId` (the subject is then `training-impact-review-subject/1`).
    The answer is `{subject, subjectHash, binding}`, where `binding` is `{status: 'unbound'}` or
    `{status: 'bound', signatureId, requestKey, signerUserId, signedAt}`.
 2. The person signs with password re-entry; the EDC stores its signature row and hash-chained audit row.
@@ -43,9 +46,17 @@ People sign in the EDC, never in this service and never with a machine credentia
 | `POST /verify/:recordId/signature` | `verification`, by the person who already recorded it | required; binding only |
 | `POST /material-drafts/:id/review` | `material-approval`, by the reviewer, accepted reviews only | optional |
 | `POST /material-drafts/:id/approval-signature` | `material-approval`, by the recorded reviewer | required; binding only |
+| `POST /impact-plans/:id/review` | `impact-review`, by the independent reviewer, accepted reviews only | optional; `POST /impact-plans/:id/apply` requires it only with `TRAINING_IMPACT_REVIEW_SIGNATURE_REQUIRED=true` |
 
 `matrix-approval` is reserved for the curriculum matrix (plan item T-1): it is in the decision vocabulary, but no
 route produces it and no row shape admits it.
+
+`impact-review` (FX-TRN-01) is a decision of `training-signature-receipt/1` whose subject is a separate contract,
+`training-impact-review-subject/1`, so `training-signature-subject/1` is unchanged: `{schemaVersion, kind:
+'impact-review', context, planId, reviewedRevision, planHash, sourceObservationHash, proposerUserId, disposition:
+'accepted'}`, `context` being the plan's study or site scope and `reviewedRevision` the proposed revision the review
+accepted. The EDC answers op `signature` for it exactly as for the other decisions (`studyId` the context site, else
+the study).
 
 Authority op `signature` (request `training-authority-request/1`, answered by the EDC): request
 `{schemaVersion, op: 'signature', action: 'signatures:read', signatureId, requestKey, decision, subjectHash}`;

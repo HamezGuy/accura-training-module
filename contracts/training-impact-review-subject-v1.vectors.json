@@ -1,0 +1,43 @@
+{
+  "schemaVersion": "training-impact-review-subject-vectors/1",
+  "description": "Committed hash vectors for training-impact-review-subject/1. subjectHash is the hex SHA-256 of canonical, the subject in canonical JSON (object keys sorted by code unit, arrays in order, JSON.stringify scalars and strings). The training service and the EDC each hash these subjects with their own canonicalizer and must reproduce both values. The plan ID was given in upper case; a subject carries it in lower case. Synthetic values only.",
+  "vectors": [
+    {
+      "name": "impact review of a site-scoped plan",
+      "subject": {
+        "schemaVersion": "training-impact-review-subject/1",
+        "kind": "impact-review",
+        "context": {
+          "studyId": 100,
+          "siteId": 101
+        },
+        "planId": "5a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+        "reviewedRevision": 1,
+        "planHash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "sourceObservationHash": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "proposerUserId": 11,
+        "disposition": "accepted"
+      },
+      "canonical": "{\"context\":{\"siteId\":101,\"studyId\":100},\"disposition\":\"accepted\",\"kind\":\"impact-review\",\"planHash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"planId\":\"5a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d\",\"proposerUserId\":11,\"reviewedRevision\":1,\"schemaVersion\":\"training-impact-review-subject/1\",\"sourceObservationHash\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}",
+      "subjectHash": "9ccb8459857af77e32a60230bce58f6ddbe54bb4603c8ec7e24ace67b07e028f"
+    },
+    {
+      "name": "impact review of a study-scoped plan",
+      "subject": {
+        "schemaVersion": "training-impact-review-subject/1",
+        "kind": "impact-review",
+        "context": {
+          "studyId": 100
+        },
+        "planId": "5a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+        "reviewedRevision": 1,
+        "planHash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "sourceObservationHash": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "proposerUserId": 11,
+        "disposition": "accepted"
+      },
+      "canonical": "{\"context\":{\"studyId\":100},\"disposition\":\"accepted\",\"kind\":\"impact-review\",\"planHash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"planId\":\"5a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d\",\"proposerUserId\":11,\"reviewedRevision\":1,\"schemaVersion\":\"training-impact-review-subject/1\",\"sourceObservationHash\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}",
+      "subjectHash": "84c6e0eaeb975450c89d65d34f36e3b2319dddf60a4257408a5eb6e4da45fd1c"
+    }
+  ]
+}

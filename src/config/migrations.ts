@@ -352,6 +352,28 @@ const MIGRATIONS: string[] = [
     FOR EACH STATEMENT EXECUTE FUNCTION acc_training_immutable_history()`,
   `ALTER TABLE acc_training_effort_intervals ENABLE ALWAYS TRIGGER acc_training_effort_intervals_guard`,
   `ALTER TABLE acc_training_effort_intervals ENABLE ALWAYS TRIGGER acc_training_effort_intervals_truncate_guard`,
+  // Part 11 signed impact plan reviews (FX-TRN-01). An accepted review may carry the reviewer's EDC-confirmed
+  // signature over the exact plan; its binding names the plan. Both CHECKs are replaced once, when they do not yet
+  // name impact-review, so a later startup neither rescans nor relocks the table; existing rows already satisfy them.
+  `ALTER TABLE acc_training_decision_signatures ADD COLUMN IF NOT EXISTS impact_plan_id UUID REFERENCES acc_training_impact_plans(id)`,
+  `DO $$ BEGIN
+    IF NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='acc_training_decision_signatures'::regclass
+      AND conname='acc_training_decision_signatures_decision_check' AND pg_get_constraintdef(oid) LIKE '%impact-review%') THEN
+      ALTER TABLE acc_training_decision_signatures DROP CONSTRAINT IF EXISTS acc_training_decision_signatures_decision_check;
+      ALTER TABLE acc_training_decision_signatures ADD CONSTRAINT acc_training_decision_signatures_decision_check
+        CHECK(decision IN ('completion-attestation','verification','material-approval','matrix-approval','impact-review'));
+    END IF;
+    IF NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='acc_training_decision_signatures'::regclass
+      AND conname='acc_training_signature_shape' AND pg_get_constraintdef(oid) LIKE '%impact-review%') THEN
+      ALTER TABLE acc_training_decision_signatures DROP CONSTRAINT IF EXISTS acc_training_signature_shape;
+      ALTER TABLE acc_training_decision_signatures ADD CONSTRAINT acc_training_signature_shape CHECK(
+        decision IN ('completion-attestation','verification') AND record_id IS NOT NULL AND assessment_cycle_id IS NOT NULL AND draft_id IS NULL AND impact_plan_id IS NULL
+        OR decision='material-approval' AND draft_id IS NOT NULL AND record_id IS NULL AND assessment_cycle_id IS NULL AND impact_plan_id IS NULL
+        OR decision='impact-review' AND impact_plan_id IS NOT NULL AND record_id IS NULL AND assessment_cycle_id IS NULL AND draft_id IS NULL);
+    END IF;
+  END $$`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_training_signature_impact ON acc_training_decision_signatures
+    (impact_plan_id) WHERE decision='impact-review'`,
 ];
 
 /** The ordered startup statements, read-only, for offline guard checks. */

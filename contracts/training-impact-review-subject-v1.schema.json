@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.accuratrials.com/training/training-impact-review-subject/1",
+  "title": "training-impact-review-subject/1",
+  "description": "What a training manager signs, with password re-entry in the EDC, when accepting an independent review of a training impact plan (decision impact-review of training-signature-receipt/1). The training service produces it (GET /api/training/signature-subject?kind=impact-review&planId=...); the EDC recomputes its hash before signing. Hash: hex SHA-256 of canonical JSON (object keys sorted, arrays in order, JSON.stringify scalars), as for training-signature-subject/1. planHash is the canonical hash of the retained training-impact-plan/1 request and so covers every affected action; no learner, participant or arm id appears in the subject. The reviewer is never the proposer.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "kind", "context", "planId", "reviewedRevision", "planHash", "sourceObservationHash", "proposerUserId", "disposition"],
+  "properties": {
+    "schemaVersion": { "const": "training-impact-review-subject/1" },
+    "kind": { "const": "impact-review" },
+    "context": {
+      "description": "The plan's exact study, or site, scope.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["studyId"],
+      "properties": {
+        "studyId": { "$ref": "#/$defs/NativeId" },
+        "siteId": { "$ref": "#/$defs/NativeId" }
+      }
+    },
+    "planId": { "type": "string", "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$" },
+    "reviewedRevision": { "description": "The plan revision the review was made against (the proposed head).", "$ref": "#/$defs/NativeId" },
+    "planHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "sourceObservationHash": { "description": "The EDC's native impact source observation the plan was proposed against.", "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "proposerUserId": { "$ref": "#/$defs/NativeId" },
+    "disposition": { "const": "accepted" }
+  },
+  "$defs": {
+    "NativeId": { "type": "integer", "minimum": 1, "maximum": 2147483647 }
+  }
+}

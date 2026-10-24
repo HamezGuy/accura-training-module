@@ -11,7 +11,8 @@ import {nativeTrainingAuthority} from '../fixtures/native-training-authority';
 import {trainingDutyHash} from '../../src/services/training-obligations.service';
 import * as certificateService from '../../src/services/certificate.service';
 import {trainingEvidenceHash} from '../../src/services/audit.service';
-import {bindSignatureReceipt,materialApprovalSubject} from '../../src/services/training-signatures.service';
+import {bindSignatureReceipt,impactReviewBinding,impactReviewSubject,materialApprovalSubject,readSignatureReceipt} from '../../src/services/training-signatures.service';
+import {resolveSignature} from '../../src/services/training-authority.service';
 import {transaction} from '../../src/config/database';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -286,7 +287,7 @@ owned('native obligation scope, durable assignment and completion evidence',()=>
   // is the stand-in above until the EDC head carries training-signature-migration.ts; then the compiled EDC
   // authority answers from its own table and every case below runs against it.
   const contracts=new Ajv2020({allErrors:true,strict:true});
-  for(const name of ['training-signature-subject-v1.schema.json','training-duty-readiness-v2.schema.json','training-effort-source-v1.schema.json','training-effort-observation-request-v1.schema.json'])contracts.addSchema(JSON.parse(fs.readFileSync(path.join(__dirname,'../../contracts',name),'utf8')));
+  for(const name of ['training-signature-subject-v1.schema.json','training-impact-review-subject-v1.schema.json','training-duty-readiness-v2.schema.json','training-effort-source-v1.schema.json','training-effort-observation-request-v1.schema.json'])contracts.addSchema(JSON.parse(fs.readFileSync(path.join(__dirname,'../../contracts',name),'utf8')));
   const conforms=(id:string,value:unknown)=>{const validate=contracts.getSchema(`https://schemas.accuratrials.com/training/${id}`)!;return validate(value)?'valid':JSON.stringify(validate.errors);};
   const site={studyId:100,siteId:101},names:Record<number,string>={11:'manager',22:'learner',33:'reviewer',44:'outside'};
   const subjectQuery=(kind:string,recordId:number)=>`kind=${kind}&recordId=${recordId}&studyId=100&siteId=101`;
@@ -394,6 +395,55 @@ owned('native obligation scope, durable assignment and completion evidence',()=>
     await expect(insert(7003,'matrix-approval',null)).rejects.toThrow('acc_training_signature_shape');
     await expect(insert(7004,'completion-attestation',draftId)).rejects.toThrow('acc_training_signature_shape');
     expect((await bindings()).map(row=>[row.decision,row.edc_signature_id])).toEqual([['material-approval','7001']]);
+  });
+  test('an impact review binds by plan through op signature on the real table; the row shape and plan slot refuse a misplaced or second signature',async()=>{
+    // The plan row is inserted directly: proposing and reviewing it needs the EDC's native impact source (its native
+    // impact suite runs those routes). Synthetic values only.
+    const planId=randomUUID(),plan={schemaVersion:'training-impact-plan/1',reason:'SYNTHETIC ENGINEERING STUDY. NOT A REAL TRIAL.'},planHash=trainingDutyHash(plan);
+    const sourceObservationHash=`sha256:${'e'.repeat(64)}`;
+    await nativePool.query(`INSERT INTO acc_training_impact_plans(id,idempotency_key,created_by,plan,plan_hash,source_observation,status,revision,reviewed_by)
+      VALUES($1,$2,11,$3::jsonb,$4,$5::jsonb,'reviewed',2,33)`,[planId,randomUUID(),JSON.stringify(plan),planHash,JSON.stringify({sourceObservationHash})]);
+    const subject=impactReviewSubject({planId,reviewedRevision:1,planHash,sourceObservationHash,proposerUserId:11,context:site}),subjectHash=trainingEvidenceHash(subject);
+    expect(conforms('training-impact-review-subject/1',subject)).toBe('valid');
+    async function sign(signer:number){
+      const row:any={signatureId:nextSignatureId++,requestKey:randomUUID(),decision:'impact-review',studyId:site.siteId,subject,subjectHash,
+        meaning:'SYNTHETIC ENGINEERING STUDY. NOT A REAL TRIAL. impact-review',signerUserId:signer,signerUsername:names[signer],signerFullName:`Synthetic ${names[signer]}`,
+        signedAt:new Date().toISOString(),effortRequestId:null};
+      if(authority.signatureMigration){
+        const inserted=await nativePool.query(`INSERT INTO acc_esignature_training_decision(request_key,decision,study_id,subject,subject_hash,meaning,signer_user_id,
+          signer_username,signer_full_name,signed_at,effort_request_id) VALUES($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9,$10,$11) RETURNING signature_id`,
+          [row.requestKey,row.decision,row.studyId,JSON.stringify(subject),subjectHash,row.meaning,signer,row.signerUsername,row.signerFullName,row.signedAt,null]);
+        row.signatureId=Number(inserted.rows[0].signature_id);
+      }else edcSignatures.set(row.signatureId,row);
+      return readSignatureReceipt({schemaVersion:'training-signature-receipt/1',signatureId:row.signatureId,requestKey:row.requestKey,decision:'impact-review',meaning:row.meaning,
+        signerUserId:signer,signerUsername:row.signerUsername,signerFullName:row.signerFullName,signedAt:row.signedAt,context:site,subjectHash,edcEffort:null});
+    }
+    const reviewer={actorUserId:33,accessToken:token(33)},expected={decision:'impact-review' as const,subject,subjectHash,signerUserId:33,impactPlanId:planId};
+    const bind=(receipt:any)=>transaction(async client=>bindSignatureReceipt(client,receipt,await resolveSignature(reviewer,receipt,subject),expected));
+    const first=await sign(33);
+    expect(await bind(first)).toMatchObject({replayed:false,binding:{signatureId:first.signatureId,decision:'impact-review',impactPlanId:planId,recordId:null,draftId:null}});
+    expect(await bind(first)).toMatchObject({replayed:true});
+    // Only the signer can have the EDC confirm a signature; a second signature for the signed plan binds nothing.
+    await expect(resolveSignature({actorUserId:11,accessToken:token(11)},first,subject)).rejects.toThrow();
+    await expect(bind(await sign(33))).rejects.toMatchObject({statusCode:409});
+    expect(await transaction(client=>impactReviewBinding(client,planId))).toMatchObject({signatureId:first.signatureId,signerUserId:33,subjectHash});
+    const insert=(signatureId:number,decision:string,plan:string|null,cycle:string|null=null)=>nativePool.query(`INSERT INTO acc_training_decision_signatures(edc_signature_id,decision,
+      request_key,signer_user_id,signed_at,context,subject,subject_hash,receipt,edc_observation_hash,record_id,assessment_cycle_id,draft_id,impact_plan_id)
+      VALUES($1,$2,$3,33,NOW(),'{}'::jsonb,'{}'::jsonb,$4,'{}'::jsonb,'synthetic',NULL,$5,NULL,$6)`,[signatureId,decision,randomUUID(),'f'.repeat(64),cycle,plan]);
+    await expect(insert(7101,'impact-review',null)).rejects.toThrow('acc_training_signature_shape');
+    await expect(insert(7102,'impact-review',planId,randomUUID())).rejects.toThrow('acc_training_signature_shape');
+    await expect(insert(7103,'matrix-approval',planId)).rejects.toThrow('acc_training_signature_shape');
+    await expect(insert(7104,'impact-review',planId)).rejects.toThrow('idx_training_signature_impact');
+    await expect(insert(7105,'impact-review',randomUUID())).rejects.toThrow('impact_plan_id');
+    await expect(insert(7106,'publication',planId)).rejects.toThrow('acc_training_decision_signatures_decision_check');
+    expect((await bindings()).map(row=>[row.decision,row.impact_plan_id])).toEqual([['impact-review',planId]]);
+    for(const sql of ['UPDATE acc_training_decision_signatures SET impact_plan_id=NULL','DELETE FROM acc_training_decision_signatures'])
+      await expect(nativePool.query(sql)).rejects.toThrow('Training history is append-only');
+    // Each startup keeps the widened constraints once: they are not replaced again.
+    const constraints=async()=>(await nativePool.query(`SELECT conname,oid::text AS oid,pg_get_constraintdef(oid) AS def FROM pg_constraint
+      WHERE conrelid='acc_training_decision_signatures'::regclass AND conname IN ('acc_training_signature_shape','acc_training_decision_signatures_decision_check') ORDER BY conname`)).rows;
+    const before=await constraints();expect(before).toHaveLength(2);for(const c of before)expect(c.def).toContain('impact-review');
+    await runMigrations();expect(await constraints()).toEqual(before);
   });
   test('the compiled EDC authority confirms signatures from its own table',async()=>{
     if(!authority.signatureMigration){

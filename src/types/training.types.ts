@@ -261,9 +261,10 @@ export interface TrainingMaterialDraftRequest {
   expectedContentRevision:number;expectedDraftId:string|null;source:TrainingMaterialSource;reason:string;material:TrainingMaterial;
 }
 
-/** Part 11 signature decisions on training (contracts/training-signature-subject-v1.schema.json).
- * Matrix approval is reserved for the curriculum matrix (T-1); nothing produces or binds it yet. */
-export type TrainingSignatureDecision = 'completion-attestation' | 'verification' | 'material-approval' | 'matrix-approval';
+/** Part 11 signature decisions on training (contracts/training-signature-subject-v1.schema.json; impact review:
+ * contracts/training-impact-review-subject-v1.schema.json). Matrix approval is reserved for the curriculum matrix
+ * (T-1); nothing produces or binds it yet. */
+export type TrainingSignatureDecision = 'completion-attestation' | 'verification' | 'material-approval' | 'matrix-approval' | 'impact-review';
 export type TrainingRecordSignatureDecision = 'completion-attestation' | 'verification';
 /** Where the person signs: the study, or the site, of an assigned obligation or of the material. Never an arm. */
 export interface TrainingSignatureContext { studyId: number; siteId?: number }
@@ -278,7 +279,13 @@ export interface TrainingMaterialSignatureSubject {
   schemaVersion: 'training-signature-subject/1'; kind: 'material-approval'; context: TrainingSignatureContext;
   draftId: string; draftRevision: number; requestHash: string; courseId: number; authorUserId: number; sourceHash: string; disposition: 'accepted';
 }
-export type TrainingSignatureSubject = TrainingRecordSignatureSubject | TrainingMaterialSignatureSubject;
+/** training-impact-review-subject/1: an accepted independent review of one exact proposed impact plan, at the plan
+ * revision it was reviewed in. The plan hash covers the affected actions; no learner or arm id appears. */
+export interface TrainingImpactReviewSignatureSubject {
+  schemaVersion: 'training-impact-review-subject/1'; kind: 'impact-review'; context: TrainingSignatureContext;
+  planId: string; reviewedRevision: number; planHash: string; sourceObservationHash: string; proposerUserId: number; disposition: 'accepted';
+}
+export type TrainingSignatureSubject = TrainingRecordSignatureSubject | TrainingMaterialSignatureSubject | TrainingImpactReviewSignatureSubject;
 /** training-signature-receipt/1, produced by the EDC proxy after a password re-entry signature. Only the proxy adds
  * it to a forwarded body; this service binds it only after the EDC confirms the same signature (op `signature`). */
 export interface TrainingSignatureReceipt {
@@ -296,7 +303,7 @@ export interface TrainingSignatureConfirmation {
 export interface TrainingSignatureBinding {
   id: number; signatureId: number; decision: TrainingSignatureDecision; requestKey: string; signerUserId: number; signedAt: string;
   context: TrainingSignatureContext; subject: TrainingSignatureSubject; subjectHash: string; receipt: TrainingSignatureReceipt;
-  edcObservationHash: string; recordId: number | null; assessmentCycleId: string | null; draftId: string | null; createdAt: string;
+  edcObservationHash: string; recordId: number | null; assessmentCycleId: string | null; draftId: string | null; impactPlanId: string | null; createdAt: string;
 }
 /** A cited signature in training-duty-readiness/2; the EDC re-hashes the subject against its own signature row. */
 export interface TrainingSignatureReference { signatureId: number; subjectHash: string; subject: TrainingSignatureSubject }

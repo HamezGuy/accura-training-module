@@ -1,10 +1,11 @@
 import type {TransactionClient} from '../config/database';
-import type {TrainingMaterialSignatureSubject,TrainingRecord,TrainingRecordSignatureDecision,TrainingRecordSignatureSubject,TrainingSignatureBinding,
+import type {TrainingImpactReviewSignatureSubject,TrainingMaterialSignatureSubject,TrainingRecord,TrainingRecordSignatureDecision,TrainingRecordSignatureSubject,TrainingSignatureBinding,
  TrainingSignatureConfirmation,TrainingSignatureContext,TrainingSignatureDecision,TrainingSignatureReceipt,TrainingSignatureReference,TrainingSignatureSubject} from '../types/training.types';
 
 /**
  * Part 11 signatures on training decisions: training-signature-subject/1 (this service computes the subject) and
- * training-signature-receipt/1 (the EDC produces the receipt). A person signs in the EDC with password re-entry; the
+ * training-signature-receipt/1 (the EDC produces the receipt); an accepted impact plan review signs
+ * training-impact-review-subject/1 with the same receipt. A person signs in the EDC with password re-entry; the
  * EDC keeps the signature row and its hash-chained audit. Once the EDC confirms the receipt (authority op
  * `signature`), the decision's own transaction keeps an append-only binding here. The subject hash is
  * trainingEvidenceHash (audit.service), the canonical JSON the duty policy hash already uses.
@@ -15,12 +16,14 @@ import type {TrainingMaterialSignatureSubject,TrainingRecord,TrainingRecordSigna
  */
 export const SIGNATURE_SUBJECT_VERSION='training-signature-subject/1';
 const RECEIPT_VERSION='training-signature-receipt/1';
-const DECISIONS:TrainingSignatureDecision[]=['completion-attestation','verification','material-approval','matrix-approval'];
+export const IMPACT_REVIEW_SUBJECT_VERSION='training-impact-review-subject/1';
+const DECISIONS:TrainingSignatureDecision[]=['completion-attestation','verification','material-approval','matrix-approval','impact-review'];
 const RECORD_DECISIONS:TrainingSignatureDecision[]=['completion-attestation','verification'];
 const RECEIPT_KEYS=['schemaVersion','signatureId','requestKey','decision','meaning','signerUserId','signerUsername','signerFullName','signedAt','context','subjectHash','edcEffort'];
 const UUID_V4=/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 const UUID=/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 const SHA=/^[a-f0-9]{64}$/;
+const OBSERVATION=/^sha256:[a-f0-9]{64}$/;
 const INSTANT=/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,6})?(?:Z|[+-]\d\d:\d\d)$/;
 const nativeId=(v:unknown):v is number=>Number.isSafeInteger(v)&&Number(v)>0&&Number(v)<=2147483647;
 const edcId=(v:unknown):v is number=>Number.isSafeInteger(v)&&Number(v)>0;
@@ -57,6 +60,15 @@ export function materialApprovalSubject(input:{draftId:string;draftRevision:numb
   requestHash:input.requestHash,courseId:input.courseId,authorUserId:input.authorUserId,sourceHash:input.sourceHash,disposition:'accepted'};
 }
 
+/** The subject of an accepted impact plan review: the exact proposed plan (its hash covers every affected action) and
+ * the native source observation it was proposed against, at the revision it was reviewed in. No learner or arm id. */
+export function impactReviewSubject(input:{planId:string;reviewedRevision:number;planHash:string;sourceObservationHash:string;proposerUserId:number;context:TrainingSignatureContext}):TrainingImpactReviewSignatureSubject{
+ if(typeof input.planId!=='string'||!UUID.test(input.planId)||!nativeId(input.reviewedRevision)||typeof input.planHash!=='string'||!SHA.test(input.planHash)
+  ||typeof input.sourceObservationHash!=='string'||!OBSERVATION.test(input.sourceObservationHash)||!nativeId(input.proposerUserId))fail('Retained impact plan identity is incomplete');
+ return {schemaVersion:IMPACT_REVIEW_SUBJECT_VERSION,kind:'impact-review',context:signatureContext(input.context),planId:input.planId.toLowerCase(),reviewedRevision:input.reviewedRevision,
+  planHash:input.planHash,sourceObservationHash:input.sourceObservationHash,proposerUserId:input.proposerUserId,disposition:'accepted'};
+}
+
 /** Exact training-signature-receipt/1. A malformed receipt refuses the decision: it is never dropped, because a
  * dropped signature would leave an unsigned decision its signer believes is signed. */
 export function readSignatureReceipt(value:unknown):TrainingSignatureReceipt{
@@ -75,14 +87,14 @@ export function readSignatureReceipt(value:unknown):TrainingSignatureReceipt{
 
 interface BindingRow {id:string|number;edcSignatureId:string|number;decision:TrainingSignatureDecision;requestKey:string;signerUserId:number;signedAt:string|Date;
  context:TrainingSignatureContext;subject:TrainingSignatureSubject;subjectHash:string;receipt:TrainingSignatureReceipt;edcObservationHash:string;
- recordId:number|null;assessmentCycleId:string|null;draftId:string|null;createdAt:string|Date}
+ recordId:number|null;assessmentCycleId:string|null;draftId:string|null;impactPlanId?:string|null;createdAt:string|Date}
 function bindingOf(row:BindingRow):TrainingSignatureBinding{
  // BIGINT columns arrive as text from pg; refuse any value that is not an exact safe integer.
  const id=Number(row.id),signatureId=Number(row.edcSignatureId),signedAt=instant(row.signedAt),createdAt=instant(row.createdAt);
  if(!edcId(id)||!edcId(signatureId)||!signedAt||!createdAt||!DECISIONS.includes(row.decision)||!object(row.context)||!object(row.subject)||!object(row.receipt)||typeof row.subjectHash!=='string'||!SHA.test(row.subjectHash))
   fail('Retained training signature integrity failed');
  return {id,signatureId,decision:row.decision,requestKey:row.requestKey,signerUserId:row.signerUserId,signedAt,context:row.context,subject:row.subject,subjectHash:row.subjectHash,
-  receipt:row.receipt,edcObservationHash:row.edcObservationHash,recordId:row.recordId,assessmentCycleId:row.assessmentCycleId,draftId:row.draftId,createdAt};
+  receipt:row.receipt,edcObservationHash:row.edcObservationHash,recordId:row.recordId,assessmentCycleId:row.assessmentCycleId,draftId:row.draftId,impactPlanId:row.impactPlanId??null,createdAt};
 }
 
 /** Checks a receipt passes before its decision writes anything or calls the EDC; binding repeats them. */
@@ -95,7 +107,7 @@ export function checkSignedDecision(receipt:TrainingSignatureReceipt,decision:Tr
 /** What the caller recomputed inside its decision transaction, with the decision rows it holds locked. */
 export interface SignatureExpectation {
  decision:TrainingSignatureDecision;subject:TrainingSignatureSubject;subjectHash:string;signerUserId:number;
- recordId?:number;assessmentCycleId?:string;draftId?:string;
+ recordId?:number;assessmentCycleId?:string;draftId?:string;impactPlanId?:string;
 }
 /** Bind an EDC-confirmed signature to its decision. The receipt, the EDC's own row and the recomputed subject must
  * agree exactly. The same receipt again replays its binding; another signature for a signed decision is refused,
@@ -103,9 +115,10 @@ export interface SignatureExpectation {
 export async function bindSignatureReceipt(client:Pick<TransactionClient,'query'>,receipt:TrainingSignatureReceipt,confirmation:TrainingSignatureConfirmation,
  expected:SignatureExpectation):Promise<{binding:TrainingSignatureBinding;replayed:boolean}>{
  if(expected.decision==='matrix-approval')fail('Matrix approval signatures are reserved for the curriculum matrix');
- const forRecord=RECORD_DECISIONS.includes(expected.decision),context=expected.subject.context;
- if(forRecord?!nativeId(expected.recordId)||typeof expected.assessmentCycleId!=='string'||expected.draftId!==undefined
-  :typeof expected.draftId!=='string'||expected.recordId!==undefined||expected.assessmentCycleId!==undefined)fail('The signed training decision target is incomplete',500);
+ const forRecord=RECORD_DECISIONS.includes(expected.decision),forPlan=expected.decision==='impact-review',context=expected.subject.context;
+ if(forRecord?!nativeId(expected.recordId)||typeof expected.assessmentCycleId!=='string'||expected.draftId!==undefined||expected.impactPlanId!==undefined
+  :forPlan?typeof expected.impactPlanId!=='string'||!UUID.test(expected.impactPlanId)||expected.recordId!==undefined||expected.assessmentCycleId!==undefined||expected.draftId!==undefined
+  :typeof expected.draftId!=='string'||expected.recordId!==undefined||expected.assessmentCycleId!==undefined||expected.impactPlanId!==undefined)fail('The signed training decision target is incomplete',500);
  if(expected.subject.kind!==expected.decision)fail('The signed training decision target is incomplete',500);
  checkSignedDecision(receipt,expected.decision,expected.signerUserId,expected.subjectHash);
  if(receipt.context.studyId!==context.studyId||receipt.context.siteId!==context.siteId)fail('The signature context differs from the signed subject');
@@ -113,19 +126,19 @@ export async function bindSignatureReceipt(client:Pick<TransactionClient,'query'
   ||confirmation.meaning!==receipt.meaning||confirmation.signerUserId!==receipt.signerUserId||confirmation.signerUsername!==receipt.signerUsername||confirmation.signerFullName!==receipt.signerFullName
   ||instant(confirmation.signedAt)!==instant(receipt.signedAt)||confirmation.studyId!==(context.siteId??context.studyId)||confirmation.effortRequestId!==(receipt.edcEffort?.requestId??null))
   fail('The signature receipt does not match the native EDC signature');
- const target=[expected.recordId??null,expected.assessmentCycleId??null,expected.draftId??null];
+ const target=[expected.recordId??null,expected.assessmentCycleId??null,expected.draftId??null,expected.impactPlanId?.toLowerCase()??null];
  const prior=(await client.query<BindingRow>(`SELECT * FROM acc_training_decision_signatures WHERE edc_signature_id=$1
-   OR decision=$2 AND (record_id=$3 AND assessment_cycle_id=$4 OR draft_id=$5) ORDER BY id`,[receipt.signatureId,expected.decision,...target])).rows.map(bindingOf);
+   OR decision=$2 AND (record_id=$3 AND assessment_cycle_id=$4 OR draft_id=$5 OR impact_plan_id=$6) ORDER BY id`,[receipt.signatureId,expected.decision,...target])).rows.map(bindingOf);
  if(prior.length){
   const row=prior[0];
   if(prior.length!==1||row.signatureId!==receipt.signatureId||row.decision!==expected.decision||row.subjectHash!==expected.subjectHash||row.signerUserId!==expected.signerUserId
-   ||row.recordId!==(expected.recordId??null)||row.assessmentCycleId!==(expected.assessmentCycleId??null)||row.draftId!==(expected.draftId??null))
+   ||row.recordId!==(expected.recordId??null)||row.assessmentCycleId!==(expected.assessmentCycleId??null)||row.draftId!==(expected.draftId??null)||row.impactPlanId!==target[3])
    fail(prior.some(binding=>binding.signatureId===receipt.signatureId)?'This EDC signature is already bound to another training decision':'This training decision already carries a different signature');
   return {binding:row,replayed:true};
  }
  try{
   const row=(await client.query<BindingRow>(`INSERT INTO acc_training_decision_signatures(edc_signature_id,decision,request_key,signer_user_id,signed_at,context,subject,
-    subject_hash,receipt,edc_observation_hash,record_id,assessment_cycle_id,draft_id) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8,$9::jsonb,$10,$11,$12,$13) RETURNING *`,
+    subject_hash,receipt,edc_observation_hash,record_id,assessment_cycle_id,draft_id,impact_plan_id) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8,$9::jsonb,$10,$11,$12,$13,$14) RETURNING *`,
    [receipt.signatureId,expected.decision,receipt.requestKey,receipt.signerUserId,receipt.signedAt,JSON.stringify(context),JSON.stringify(expected.subject),expected.subjectHash,
     JSON.stringify(receipt),confirmation.observationHash,...target])).rows[0];
   return {binding:bindingOf(row),replayed:false};
@@ -140,6 +153,11 @@ export async function signatureBindings(client:Pick<TransactionClient,'query'>,s
  if(!selection.recordIds.length&&!selection.draftIds.length)return [];
  return (await client.query<BindingRow>(`SELECT * FROM acc_training_decision_signatures WHERE decision IN ('completion-attestation','verification') AND record_id=ANY($1::integer[])
    OR decision='material-approval' AND draft_id=ANY($2::uuid[]) ORDER BY id`,[selection.recordIds,selection.draftIds])).rows.map(bindingOf);
+}
+/** The impact review binding of one plan, if any; the partial unique index admits at most one. */
+export async function impactReviewBinding(client:Pick<TransactionClient,'query'>,planId:string):Promise<TrainingSignatureBinding|undefined>{
+ const rows=(await client.query<BindingRow>("SELECT * FROM acc_training_decision_signatures WHERE decision='impact-review' AND impact_plan_id=$1 ORDER BY id",[planId.toLowerCase()])).rows.map(bindingOf);
+ if(rows.length>1)fail('Retained training signature integrity failed');return rows[0];
 }
 /** The binding of one decision slot: a record's assessment cycle, or a draft. */
 export function bindingFor(bindings:TrainingSignatureBinding[],decision:TrainingSignatureDecision,target:{recordId:number;assessmentCycleId:string|null|undefined}|{draftId:string}){

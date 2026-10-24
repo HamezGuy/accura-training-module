@@ -12,9 +12,10 @@ export function signatureStore() {
   const rows: any[] = []; let next = 1;
   const query = async (sql: string, params: any[] = []): Promise<{ rows: any[]; rowCount: number } | undefined> => {
     if (sql.startsWith('SELECT * FROM acc_training_decision_signatures WHERE edc_signature_id=$1')) {
-      const [signatureId, decision, recordId, cycleId, draftId] = params;
+      const [signatureId, decision, recordId, cycleId, draftId, planId] = params;
       const found = rows.filter(r => String(r.edcSignatureId) === String(signatureId) || r.decision === decision
-        && (recordId !== null && cycleId !== null && r.recordId === recordId && r.assessmentCycleId === cycleId || draftId !== null && r.draftId === draftId));
+        && (recordId !== null && cycleId !== null && r.recordId === recordId && r.assessmentCycleId === cycleId || draftId !== null && r.draftId === draftId
+          || planId !== null && r.impactPlanId === planId));
       return { rows: found, rowCount: found.length };
     }
     if (sql.startsWith('SELECT * FROM acc_training_decision_signatures WHERE decision IN')) {
@@ -22,10 +23,14 @@ export function signatureStore() {
       const found = rows.filter(r => r.recordId !== null && recordIds.includes(r.recordId) || r.draftId !== null && draftIds.includes(r.draftId));
       return { rows: found, rowCount: found.length };
     }
+    if (sql.startsWith("SELECT * FROM acc_training_decision_signatures WHERE decision='impact-review' AND impact_plan_id=$1")) {
+      const found = rows.filter(r => r.decision === 'impact-review' && r.impactPlanId === params[0]);
+      return { rows: found, rowCount: found.length };
+    }
     if (sql.startsWith('INSERT INTO acc_training_decision_signatures')) {
-      const [edc, decision, requestKey, signer, signedAt, context, subject, subjectHash, stored, observation, recordId, cycleId, draftId] = params;
+      const [edc, decision, requestKey, signer, signedAt, context, subject, subjectHash, stored, observation, recordId, cycleId, draftId, planId] = params;
       const row = { id: String(next++), edcSignatureId: String(edc), decision, requestKey, signerUserId: signer, signedAt: new Date(signedAt), context: JSON.parse(context),
-        subject: JSON.parse(subject), subjectHash, receipt: JSON.parse(stored), edcObservationHash: observation, recordId, assessmentCycleId: cycleId, draftId, createdAt: new Date() };
+        subject: JSON.parse(subject), subjectHash, receipt: JSON.parse(stored), edcObservationHash: observation, recordId, assessmentCycleId: cycleId, draftId, impactPlanId: planId, createdAt: new Date() };
       rows.push(row); return { rows: [row], rowCount: 1 };
     }
     return undefined;
@@ -64,11 +69,13 @@ export const signatureDraft = { draftId: '9D8C7B6A-5F4E-4D3C-8B2A-1F0E9D8C7B6A',
 const contracts = path.join(__dirname, '../../contracts');
 const json = (name: string) => JSON.parse(fs.readFileSync(path.join(contracts, name), 'utf8'));
 export const signatureVectors = json('training-signature-subject-v1.vectors.json').vectors as Array<{ name: string; subject: any; canonical: string; subjectHash: string }>;
+export const impactReviewVectors = json('training-impact-review-subject-v1.vectors.json').vectors as Array<{ name: string; subject: any; canonical: string; subjectHash: string }>;
 const ajv = new Ajv2020({ allErrors: true, strict: true });
 ajv.addSchema(json('training-signature-subject-v1.schema.json'));
 ajv.addSchema(json('training-duty-readiness-v2.schema.json'));
+ajv.addSchema(json('training-impact-review-subject-v1.schema.json'));
 /** 'valid', or the validator's errors, for a value against one of this repository's own contract schemas. */
-export function conformsTo(contract: 'training-signature-subject/1' | 'training-duty-readiness/2', value: unknown): string {
+export function conformsTo(contract: 'training-signature-subject/1' | 'training-duty-readiness/2' | 'training-impact-review-subject/1', value: unknown): string {
   const validate = ajv.getSchema(`https://schemas.accuratrials.com/training/${contract}`);
   if (!validate) throw new Error(`No schema for ${contract}`);
   return validate(value) ? 'valid' : JSON.stringify(validate.errors);
