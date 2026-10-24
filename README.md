@@ -85,7 +85,22 @@ npm start
 
 - **21 CFR Part 11 §11.10(i)** — Training documentation
 - **HIPAA §164.308(a)(5)** — Security awareness training
-- **ICH E6 (GCP)** — Investigator qualifications and training
+- **ICH E6(R3) (GCP)** — Investigator qualifications and training
+
+## Regulatory references pending review
+
+The seed courses cite ICH E6(R3) where they cited ICH E6(R2) or an unversioned ICH E6: `seed/default-courses.sql:15`, `:18`, `:20`, `:23`, `:25`, `:26`, `:27`, `:28`; `seed/content-gcp.sql:3`, `:5`, `:6`, `:11`, `:16`, `:17`, `:23`; `seed/slides-data-entry.sql:8`; `seed/content/all-quizzes.ts:171`, `:175`; `seed/content/rave-courses.ts:181`; `seed/content/slides-part3.ts:25`; and the list above. The E6(R2) section numbers they carried (4.3, 4.8, 6.4.9, 8 and 8.3.13) were removed, not renumbered: the E6(R3) text is not in these repositories, so no E6(R3) location is invented. Generic "ICH-GCP" wording is unchanged.
+
+Every statement keeps its earlier meaning, which follows the E6(R2) wording. A qualified reviewer must confirm or reword the statements below against the E6(R3) text before these materials train anyone for real work:
+
+| Where | Statement | Why it needs review |
+|---|---|---|
+| `seed/content-gcp.sql:6`, `:8`, `:11`, `:21`; `seed/content/all-quizzes.ts:175` | Essential documents are retained for at least 2 years after the last marketing approval in an ICH region or the formal discontinuation of development (slides, knowledge check gcp-3, quiz explanations) | This is the E6(R2) retention period; E6(R3) may state retention differently, for example by reference to applicable regulatory requirements |
+| `seed/content-gcp.sql:5`, `:17`, `:22`; `seed/content/rave-courses.ts:183`, `:186` | Consent is written, signed and dated by the subject or a legally authorized representative | E6(R3) may describe further ways to obtain and document consent, for example electronic consent |
+| `seed/content/slides-part3.ts:25`; `seed/default-courses.sql:23` | Monitors verify that CRF data are consistent with the source documents (the SDV course previously cited E6(R2) 6.4.9) | E6(R3) monitoring wording may differ, for example a risk-proportionate approach to source data verification |
+| `seed/default-courses.sql:28`; `seed/content-gcp.sql:3`, `:6`, `:18`; `seed/content/rave-courses.ts:184`, `:185` | The terms "essential documents" and "trial subjects" | E6(R3) may use other terms, for example essential records and trial participants |
+
+Seeds are authoring inputs for a new database. `npm run seed` loads only `seed/default-courses.sql`, and the slide and quiz files load only when an operator runs them. This change edits no course in any existing database: a course edit bumps its content revision and requires retraining (see "Revision-bound learner workflow").
 
 ## License
 
