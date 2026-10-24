@@ -289,6 +289,34 @@ const MIGRATIONS: string[] = [
   `ALTER TABLE acc_training_impact_events ENABLE ALWAYS TRIGGER acc_training_impact_events_truncate_guard`,
   `ALTER TABLE acc_training_material_publications ENABLE ALWAYS TRIGGER acc_training_material_publications_truncate_guard`,
   `ALTER TABLE acc_training_material_events ENABLE ALWAYS TRIGGER acc_training_material_events_truncate_guard`,
+  // Part 11 signatures on training decisions (T-3). A person signs in the EDC,
+  // which keeps the signature and its hash-chained audit; this append-only
+  // binding records which decision the EDC-confirmed signature belongs to.
+  // Matrix approval is reserved for the curriculum matrix (T-1) and no row
+  // shape admits it yet.
+  `CREATE TABLE IF NOT EXISTS acc_training_decision_signatures (
+    id BIGSERIAL PRIMARY KEY, edc_signature_id BIGINT NOT NULL UNIQUE CHECK(edc_signature_id>0),
+    decision TEXT NOT NULL CHECK(decision IN ('completion-attestation','verification','material-approval','matrix-approval')),
+    request_key UUID NOT NULL, signer_user_id INTEGER NOT NULL CHECK(signer_user_id>0), signed_at TIMESTAMPTZ NOT NULL,
+    context JSONB NOT NULL CHECK(jsonb_typeof(context)='object'), subject JSONB NOT NULL CHECK(jsonb_typeof(subject)='object'),
+    subject_hash TEXT NOT NULL CHECK(subject_hash ~ '^[a-f0-9]{64}$'), receipt JSONB NOT NULL CHECK(jsonb_typeof(receipt)='object'),
+    edc_observation_hash TEXT NOT NULL, record_id INTEGER REFERENCES acc_training_records(id), assessment_cycle_id UUID,
+    draft_id UUID REFERENCES acc_training_material_drafts(id), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT acc_training_signature_shape CHECK(
+      decision IN ('completion-attestation','verification') AND record_id IS NOT NULL AND assessment_cycle_id IS NOT NULL AND draft_id IS NULL
+      OR decision='material-approval' AND draft_id IS NOT NULL AND record_id IS NULL AND assessment_cycle_id IS NULL))`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_training_signature_record ON acc_training_decision_signatures
+    (decision,record_id,assessment_cycle_id) WHERE decision IN ('completion-attestation','verification')`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_training_signature_draft ON acc_training_decision_signatures
+    (draft_id) WHERE decision='material-approval'`,
+  `DROP TRIGGER IF EXISTS acc_training_decision_signatures_guard ON acc_training_decision_signatures`,
+  `CREATE TRIGGER acc_training_decision_signatures_guard BEFORE UPDATE OR DELETE ON acc_training_decision_signatures
+    FOR EACH ROW EXECUTE FUNCTION acc_training_immutable_history()`,
+  `DROP TRIGGER IF EXISTS acc_training_decision_signatures_truncate_guard ON acc_training_decision_signatures`,
+  `CREATE TRIGGER acc_training_decision_signatures_truncate_guard BEFORE TRUNCATE ON acc_training_decision_signatures
+    FOR EACH STATEMENT EXECUTE FUNCTION acc_training_immutable_history()`,
+  `ALTER TABLE acc_training_decision_signatures ENABLE ALWAYS TRIGGER acc_training_decision_signatures_guard`,
+  `ALTER TABLE acc_training_decision_signatures ENABLE ALWAYS TRIGGER acc_training_decision_signatures_truncate_guard`,
 ];
 
 /** The ordered startup statements, read-only, for offline guard checks. */

@@ -446,7 +446,7 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
 
   // Statement guards fire whether or not a table holds rows; the log and record history hold real ones here.
   const historyTables = ['acc_training_audit_log', 'acc_training_obligation_events', 'acc_training_record_history',
-    'acc_training_impact_events', 'acc_training_material_publications', 'acc_training_material_events'];
+    'acc_training_impact_events', 'acc_training_material_publications', 'acc_training_material_events', 'acc_training_decision_signatures'];
   const tamper = (id: number) => [`UPDATE acc_training_audit_log SET action='tampered' WHERE id=${id}`, `DELETE FROM acc_training_audit_log WHERE id=${id}`];
 
   test('the audit log refuses UPDATE, DELETE and TRUNCATE and every history table refuses TRUNCATE, also by cascade', async () => {
@@ -461,7 +461,7 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
     await runMigrations();
     const guards = (await fixturePool.query(`SELECT c.relname, t.tgname, t.tgenabled FROM pg_trigger t
       JOIN pg_class c ON c.oid = t.tgrelid WHERE NOT t.tgisinternal AND t.tgname ~ '^acc_training_.*_guard$' ORDER BY 1, 2`)).rows;
-    expect(guards).toHaveLength(14);
+    expect(guards).toHaveLength(16);
     expect(guards.filter(guard => guard.tgenabled !== 'A')).toEqual([]);
   });
 
