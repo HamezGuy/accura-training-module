@@ -1,18 +1,26 @@
+import { createHash } from 'crypto';
 import nodemailer from 'nodemailer';
 import os from 'os';
 import { logger } from '../config/logger';
+import { escapeHtml } from './html-escape';
 
+// The digest leaves the service by mail, so it carries no message or stack:
+// only the error name, status code, time and a SHA-256 fingerprint of message
+// plus stack that matches the local log entry.
 interface BufferedError {
-  message: string;
-  stack: string;
+  name: string;
+  statusCode: number | null;
+  fingerprint: string;
   timestamp: string;
 }
 
 const SERVICE_NAME = 'accura-training-module';
 const FLUSH_INTERVAL_MS = 5 * 60 * 1000;
 const RECIPIENT = 'info@accuratrials.com';
+const MAX_BUFFERED = 100;
 
 let buffer: BufferedError[] = [];
+let dropped = 0;
 let flushTimer: NodeJS.Timeout | null = null;
 let transporter: nodemailer.Transporter | null = null;
 let inFlight: Promise<void> | null = null;
@@ -37,35 +45,35 @@ function getTransporter(): nodemailer.Transporter {
   return transporter;
 }
 
-function buildHtml(errors: BufferedError[]): string {
+function buildHtml(errors: BufferedError[], droppedCount: number): string {
+  const cell = 'padding:6px;border:1px solid #ddd';
   const rows = errors
     .map(
       (e) =>
         `<tr>
-          <td style="padding:6px;border:1px solid #ddd;white-space:nowrap">${e.timestamp}</td>
-          <td style="padding:6px;border:1px solid #ddd">${e.message}</td>
+          <td style="${cell};white-space:nowrap">${escapeHtml(e.timestamp)}</td>
+          <td style="${cell}">${escapeHtml(e.name)}</td>
+          <td style="${cell}">${e.statusCode === null ? '' : escapeHtml(String(e.statusCode))}</td>
+          <td style="${cell};font-family:monospace">${escapeHtml(e.fingerprint)}</td>
         </tr>`
     )
     .join('');
 
-  const stacks = errors
-    .map(
-      (e) =>
-        `<h4 style="margin:16px 0 4px">${e.timestamp} — ${e.message}</h4>
-         <pre style="background:#f5f5f5;padding:12px;overflow:auto;font-size:12px">${e.stack}</pre>`
-    )
-    .join('');
+  const droppedNote = droppedCount > 0
+    ? `<p>${droppedCount} further error(s) were not buffered because the digest buffer was full.</p>`
+    : '';
 
   return `
-    <h2>${errors.length} error(s) from ${SERVICE_NAME} on ${os.hostname()}</h2>
+    <h2>${errors.length} error(s) from ${escapeHtml(SERVICE_NAME)} on ${escapeHtml(os.hostname())}</h2>
+    ${droppedNote}
     <table style="border-collapse:collapse;width:100%">
-      <tr><th style="padding:6px;border:1px solid #ddd;text-align:left">Time</th>
-          <th style="padding:6px;border:1px solid #ddd;text-align:left">Message</th></tr>
+      <tr><th style="${cell};text-align:left">Time</th>
+          <th style="${cell};text-align:left">Error</th>
+          <th style="${cell};text-align:left">Status</th>
+          <th style="${cell};text-align:left">Fingerprint (SHA-256 of message and stack)</th></tr>
       ${rows}
     </table>
-    <hr/>
-    <h3>Stack Traces</h3>
-    ${stacks}`;
+    <p>Messages and stacks stay in the service log; find them by fingerprint.</p>`;
 }
 
 function flush(): Promise<void> {
@@ -77,10 +85,13 @@ async function flushBuffered(): Promise<void> {
   if (buffer.length === 0) return;
 
   const errors = [...buffer];
+  const droppedCount = dropped;
   buffer = [];
+  dropped = 0;
 
   if (!smtpConfigured()) {
     logger.warn(`ErrorReporter: ${errors.length} error(s) buffered but SMTP not configured — logged locally only`);
+    if (droppedCount > 0) logger.warn(`ErrorReporter: ${droppedCount} further error(s) were not buffered because the digest buffer was full`);
     return;
   }
 
@@ -89,26 +100,37 @@ async function flushBuffered(): Promise<void> {
       from: process.env.SMTP_FROM || 'errors@accuratrials.com',
       to: RECIPIENT,
       subject: `[AccuraTrials ${SERVICE_NAME}] ${errors.length} error(s) on ${os.hostname()}`,
-      html: buildHtml(errors),
+      html: buildHtml(errors, droppedCount),
     });
     logger.info(`ErrorReporter: sent digest with ${errors.length} error(s)`);
   } catch (err) {
     logger.error('ErrorReporter: failed to send error digest email', {
       error: err instanceof Error ? err.message : String(err),
     });
-    buffer.unshift(...errors);
+    // Requeue oldest first, then keep the buffer within its bound.
+    buffer = [...errors, ...buffer];
+    dropped += droppedCount + Math.max(0, buffer.length - MAX_BUFFERED);
+    buffer = buffer.slice(0, MAX_BUFFERED);
     throw err;
   }
 }
 
 export function reportError(error: unknown): void {
   const err = error instanceof Error ? error : new Error(String(error));
-  buffer.push({
-    message: err.message,
-    stack: err.stack || 'No stack trace',
-    timestamp: new Date().toISOString(),
-  });
-  logger.error('ErrorReporter: captured error', { error: err.message });
+  const stack = err.stack || 'No stack trace';
+  const fingerprint = createHash('sha256').update(`${err.message}\n${stack}`, 'utf8').digest('hex');
+  const statusCode = (err as { statusCode?: unknown }).statusCode;
+  if (buffer.length < MAX_BUFFERED) {
+    buffer.push({
+      name: String(err.name),
+      statusCode: Number.isSafeInteger(statusCode) ? statusCode as number : null,
+      fingerprint,
+      timestamp: new Date().toISOString(),
+    });
+  } else {
+    dropped += 1;
+  }
+  logger.error('ErrorReporter: captured error', { error: err.message, fingerprint });
 }
 
 export function startErrorReporter(): void {
