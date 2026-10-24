@@ -554,5 +554,20 @@ describe('Training API Integration', () => {
       // The service applies the EDC rule; an unusable value is passed as stated and falls through there, never refused here.
       expect(mockAttestTraining.mock.calls.at(-1)![4]).toEqual({ workStartedAt: 'not an instant', actorRole: 'coordinator' });
     });
+    test('the effort observation is a machine route ahead of human authentication, 503 whatever the request while the ledger is off', async () => {
+      const route = '/api/training/effort-source/observe';
+      for (const call of [request(app).post(route).send({}), request(app).post(`${route}?studyId=1`).set('Authorization', bearer()).send({ any: 'thing' })]) {
+        const off = await call;
+        expect([off.status, off.body.error.code, off.headers['cache-control']]).toEqual([503, 'TRAINING_EFFORT_DISABLED', 'no-store']);
+      }
+      process.env.TRAINING_EFFORT_LEDGER_ENABLED = 'true';
+      try {
+        // A human bearer is not a machine credential, and nothing reaches the native authority before the request is exact.
+        expect((await request(app).post(route).set('Authorization', bearer()).send({})).body.error.code).toBe('TRAINING_EFFORT_SERVICE_CREDENTIAL_REQUIRED');
+        expect((await request(app).post(`${route}?studyId=1`).set('x-api-key', 'atk_synthetic').send({})).body.error.code).toBe('TRAINING_EFFORT_INVALID_REQUEST');
+        expect((await request(app).post(route).set('x-api-key', 'atk_synthetic').send({ schemaVersion: 'training-effort-observation-request/1' })).status).toBe(400);
+        expect(globalThis.fetch).not.toHaveBeenCalled();
+      } finally { delete process.env.TRAINING_EFFORT_LEDGER_ENABLED; }
+    });
   });
 });

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.accuratrials.com/training/training-effort-observation-request/1",
+  "title": "training-effort-observation-request/1",
+  "description": "The request body of the machine route POST /api/training/effort-source/observe, sent by Command Center through the EDC-proxied machine path with an atk_ key of scope training:due-source:read in x-api-key. The training service answers TrainingEffortServiceObservationV1@1.0.0, whose data member is TrainingEffortSourceV1@1.0.0 (training-effort-source-v1.schema.json). scope is a root study only. expectedAuthorityHash, when sent, pins the EDC service authority the caller observed before (the authorityHash of a previous answer); a changed authority is refused. The route answers 503 TRAINING_EFFORT_DISABLED unless the training service runs with TRAINING_EFFORT_LEDGER_ENABLED=true.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "requestId", "installationId", "scope"],
+  "properties": {
+    "schemaVersion": { "const": "training-effort-observation-request/1" },
+    "requestId": { "type": "string", "pattern": "^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$" },
+    "installationId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$" },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["studyId"],
+      "properties": { "studyId": { "type": "integer", "minimum": 1, "maximum": 2147483647 } }
+    },
+    "expectedAuthorityHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+  }
+}

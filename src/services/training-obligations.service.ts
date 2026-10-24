@@ -122,6 +122,37 @@ export function obligationReadiness(obligation: TrainingObligation, course: Trai
   return 'complete';
 }
 
+/** The records of exact learner and course pairs in the caller's snapshot, keyed `userId:courseId`, each verified
+ * against its retained assessment history. Only the selected pairs are read, never the Cartesian product of their
+ * learners and courses. One integrity failure refuses the whole read. */
+export async function verifiedRecords(client: TransactionClient, rows: Array<{ userId: number; courseId: number }>): Promise<Map<string, TrainingRecord>> {
+  const pairs = [...new Map(rows.map(row => [`${row.userId}:${row.courseId}`, { user_id: row.userId, course_id: row.courseId }])).values()];
+  const records = (await client.query<TrainingRecord>(`SELECT r.* FROM acc_training_records r JOIN
+      jsonb_to_recordset($1::jsonb) AS selected(user_id integer,course_id integer)
+      ON r.user_id=selected.user_id AND r.course_id=selected.course_id`, [JSON.stringify(pairs)])).rows;
+  for (const record of records) await verifyRecordAssessment(client, record);
+  return new Map(records.map(row => [`${row.userId}:${row.courseId}`, row]));
+}
+
+/** Readiness of assigned obligations from retained rows alone, in the caller's snapshot (the T-4 arm lead time): the
+ * learner's verified record and the course, with a governed course current while its retained publication is
+ * (publishedMaterial). The native scope and material source are not re-observed, so this is never duty readiness. */
+export async function retainedObligationReadiness(client: TransactionClient, obligations: TrainingObligation[], now: number) {
+  const courses = new Map((await client.query<TrainingCourse>('SELECT * FROM acc_training_courses WHERE id=ANY($1::integer[])',
+    [[...new Set(obligations.map(row => row.courseId))]])).rows.map(row => [row.id, row]));
+  const records = await verifiedRecords(client, obligations);
+  const custody = new Map<number, boolean>();
+  for (const course of courses.values()) if (course.materialScope) {
+    try { await publishedMaterial(client, course); custody.set(course.id, true); }
+    catch (error) { if (![404, 409].includes((error as {statusCode?: number}).statusCode ?? 0)) throw error; custody.set(course.id, false); }
+  }
+  return new Map(obligations.map(row => {
+    const course = courses.get(row.courseId); if (!course) fail('Training course evidence is missing');
+    const record = records.get(`${row.userId}:${row.courseId}`) ?? null;
+    return [row.id, { readiness: obligationReadiness(row, { ...course, materialReady: custody.get(course.id) }, record, 'current', now), record }] as const;
+  }));
+}
+
 async function admitRead(authority: TrainingAuthorityContext, userId: number) {
   if (!id(userId)) fail('An exact learner ID is required', 400);
   const admitted = await authorizeTrainingTargets(authority, 'records:read', [userId]);

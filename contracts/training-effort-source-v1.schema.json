@@ -1,0 +1,194 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.accuratrials.com/training/TrainingEffortSourceV1@1.0.0",
+  "title": "TrainingEffortSourceV1@1.0.0",
+  "description": "Training effort of one root study, observed by the training service in one REPEATABLE READ READ ONLY snapshot (the data member of TrainingEffortServiceObservationV1@1.0.0, POST /api/training/effort-source/observe). hours: time from the recorded effort intervals (one per graded quiz attempt, completion attestation and verification, recorded only while TRAINING_EFFORT_LEDGER_ENABLED=true), by role and kind for the platform and for each arm whose class the EDC declares regimen or cohort. arms: every Arm-type group of the root from the EDC's op arms census, with the lead time from its EDC onboarding event to fully trained staff; arms of any other class are withheld, with no values and no counts. No learner or actor identity appears. sourceHash is the hex SHA-256 of the canonical JSON (object keys sorted, arrays in order, JSON.stringify scalars) of the document without asOf and sourceHash.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "scope", "asOf", "dataClass", "definitions", "hours", "arms", "counts", "limitations", "sourceHash"],
+  "properties": {
+    "schemaVersion": { "const": "TrainingEffortSourceV1@1.0.0" },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["studyId"],
+      "properties": { "studyId": { "$ref": "#/$defs/NativeId" } }
+    },
+    "asOf": { "$ref": "#/$defs/Instant" },
+    "dataClass": { "description": "synthetic only when the training service runs with TRAINING_DATA_CLASS=synthetic (a synthetic test stack); otherwise not-stated.", "enum": ["synthetic", "not-stated"] },
+    "definitions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["learning", "attestation", "verification", "startBasis", "roleBasis", "hours", "leadTime", "disclosure"],
+      "properties": {
+        "learning": { "type": "string", "minLength": 1 },
+        "attestation": { "type": "string", "minLength": 1 },
+        "verification": { "type": "string", "minLength": 1 },
+        "startBasis": { "type": "string", "minLength": 1 },
+        "roleBasis": { "type": "string", "minLength": 1 },
+        "hours": { "type": "string", "minLength": 1 },
+        "leadTime": { "type": "string", "minLength": 1 },
+        "disclosure": { "type": "string", "minLength": 1 }
+      }
+    },
+    "hours": { "type": "array", "items": { "oneOf": [{ "$ref": "#/$defs/PlatformHours" }, { "$ref": "#/$defs/ArmHours" }] } },
+    "arms": { "type": "array", "maxItems": 500, "items": { "oneOf": [{ "$ref": "#/$defs/DisclosedArm" }, { "$ref": "#/$defs/WithheldArm" }] } },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["intervals", "throughIntervalId"],
+      "properties": {
+        "intervals": { "description": "Intervals of this study in the snapshot, at most 100,000 (a larger census is refused whole).", "type": "integer", "minimum": 0, "maximum": 100000 },
+        "throughIntervalId": { "description": "The highest interval id counted; null when none.", "oneOf": [{ "type": "integer", "minimum": 1 }, { "type": "null" }] }
+      }
+    },
+    "limitations": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+    "sourceHash": { "$ref": "#/$defs/Sha256Hex" }
+  },
+  "$defs": {
+    "NativeId": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+    "Sha256Hex": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "Instant": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$" },
+    "Role": {
+      "description": "The canonical native role. Learning and attestation take the served obligation's role; verification the verifier's platform role, null when the decision did not state it.",
+      "oneOf": [{ "type": "string", "pattern": "^[a-z][a-z_]{0,63}$" }, { "type": "null" }]
+    },
+    "Kind": { "enum": ["learning", "attestation", "verification"] },
+    "Hours": { "description": "Sum of ended_at minus work_started_at over the row's intervals with a known start, in hours to 3 decimals.", "type": "number", "minimum": 0 },
+    "Count": { "type": "integer", "minimum": 0 },
+    "PlatformHours": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["level", "armId", "role", "roleBasis", "kind", "hours", "intervals", "unknownIntervals", "actors", "disclosure"],
+      "properties": {
+        "level": { "const": "platform" },
+        "armId": { "type": "null" },
+        "role": { "$ref": "#/$defs/Role" },
+        "roleBasis": { "enum": ["obligation-role", "actor-platform-role"] },
+        "kind": { "$ref": "#/$defs/Kind" },
+        "hours": { "$ref": "#/$defs/Hours" },
+        "intervals": { "type": "integer", "minimum": 1 },
+        "unknownIntervals": { "$ref": "#/$defs/Count" },
+        "actors": { "type": "integer", "minimum": 1 },
+        "disclosure": { "const": "platform" }
+      }
+    },
+    "ArmHours": {
+      "description": "The whole of every interval that served this arm, so the arm rows of one interval can sum to more than the platform row.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["level", "armId", "role", "roleBasis", "kind", "hours", "intervals", "unknownIntervals", "actors", "disclosure"],
+      "properties": {
+        "level": { "const": "arm" },
+        "armId": { "$ref": "#/$defs/NativeId" },
+        "role": { "$ref": "#/$defs/Role" },
+        "roleBasis": { "enum": ["obligation-role", "actor-platform-role"] },
+        "kind": { "$ref": "#/$defs/Kind" },
+        "hours": { "$ref": "#/$defs/Hours" },
+        "intervals": { "type": "integer", "minimum": 1 },
+        "unknownIntervals": { "$ref": "#/$defs/Count" },
+        "actors": { "type": "integer", "minimum": 1 },
+        "disclosure": { "const": "regimen-or-cohort" }
+      }
+    },
+    "ObligationCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["assigned", "complete"],
+      "properties": { "assigned": { "$ref": "#/$defs/Count" }, "complete": { "$ref": "#/$defs/Count" } }
+    },
+    "DisclosedArm": {
+      "description": "An arm whose class the EDC declares regimen or cohort.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["armId", "disclosureLevel", "onboardedAt", "onboardEventId", "leadTime"],
+      "properties": {
+        "armId": { "$ref": "#/$defs/NativeId" },
+        "disclosureLevel": { "enum": ["regimen", "cohort"] },
+        "onboardedAt": { "description": "created_at of the arm's EDC onboard event; null for an arm present from study start.", "oneOf": [{ "$ref": "#/$defs/Instant" }, { "type": "null" }] },
+        "onboardEventId": { "oneOf": [{ "type": "integer", "minimum": 1 }, { "type": "null" }] },
+        "leadTime": { "oneOf": [{ "$ref": "#/$defs/MeasuredLeadTime" }, { "$ref": "#/$defs/OpenLeadTime" }, { "$ref": "#/$defs/IncompleteLeadTime" }] }
+      }
+    },
+    "WithheldArm": {
+      "description": "An arm of any other class (treatment-assignment, or no declaration): nothing but its identity and declared level.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["armId", "disclosureLevel", "onboardedAt", "onboardEventId", "leadTime"],
+      "properties": {
+        "armId": { "$ref": "#/$defs/NativeId" },
+        "disclosureLevel": { "enum": ["treatment-assignment", null] },
+        "onboardedAt": { "type": "null" },
+        "onboardEventId": { "type": "null" },
+        "leadTime": { "$ref": "#/$defs/WithheldLeadTime" }
+      }
+    },
+    "MeasuredLeadTime": {
+      "description": "Every assigned obligation scoped to the arm is complete now: days from onboardedAt to trainedAt (0, with trainedBeforeOnboarding, when trainedAt is earlier).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "days", "startedAt", "trainedAt", "obligations", "learners", "sites", "trainedBeforeOnboarding", "reason"],
+      "properties": {
+        "status": { "const": "measured" },
+        "days": { "type": "number", "minimum": 0 },
+        "startedAt": { "$ref": "#/$defs/Instant" },
+        "trainedAt": { "$ref": "#/$defs/Instant" },
+        "obligations": { "$ref": "#/$defs/ObligationCounts" },
+        "learners": { "$ref": "#/$defs/Count" },
+        "sites": { "$ref": "#/$defs/Count" },
+        "trainedBeforeOnboarding": { "type": "boolean" },
+        "reason": { "type": "null" }
+      }
+    },
+    "OpenLeadTime": {
+      "description": "Some assigned obligation scoped to the arm is not complete: days elapsed from onboardedAt to asOf.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "days", "startedAt", "trainedAt", "obligations", "learners", "sites", "trainedBeforeOnboarding", "reason"],
+      "properties": {
+        "status": { "const": "open" },
+        "days": { "type": "number", "minimum": 0 },
+        "startedAt": { "$ref": "#/$defs/Instant" },
+        "trainedAt": { "type": "null" },
+        "obligations": { "$ref": "#/$defs/ObligationCounts" },
+        "learners": { "$ref": "#/$defs/Count" },
+        "sites": { "$ref": "#/$defs/Count" },
+        "trainedBeforeOnboarding": { "const": false },
+        "reason": { "type": "null" }
+      }
+    },
+    "IncompleteLeadTime": {
+      "description": "No lead time: the arm has no assigned arm-scoped obligation, or no EDC onboard event (present from study start).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "days", "startedAt", "trainedAt", "obligations", "learners", "sites", "trainedBeforeOnboarding", "reason"],
+      "properties": {
+        "status": { "const": "incomplete" },
+        "days": { "type": "null" },
+        "startedAt": { "type": "null" },
+        "trainedAt": { "type": "null" },
+        "obligations": { "$ref": "#/$defs/ObligationCounts" },
+        "learners": { "$ref": "#/$defs/Count" },
+        "sites": { "$ref": "#/$defs/Count" },
+        "trainedBeforeOnboarding": { "const": false },
+        "reason": { "enum": ["no assigned arm-scoped training obligations; coverage is T-2", "arm present from study start"] }
+      }
+    },
+    "WithheldLeadTime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "days", "startedAt", "trainedAt", "obligations", "learners", "sites", "trainedBeforeOnboarding", "reason"],
+      "properties": {
+        "status": { "const": "withheld" },
+        "days": { "type": "null" },
+        "startedAt": { "type": "null" },
+        "trainedAt": { "type": "null" },
+        "obligations": { "type": "null" },
+        "learners": { "type": "null" },
+        "sites": { "type": "null" },
+        "trainedBeforeOnboarding": { "type": "null" },
+        "reason": { "const": "per-arm values are given only for arms whose class is declared regimen or cohort" }
+      }
+    }
+  }
+}

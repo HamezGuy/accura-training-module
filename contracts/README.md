@@ -10,6 +10,8 @@ on every checkout. A change of meaning is a new version (`/2`), never an edit of
 | `training-signature-subject-v1.schema.json` | `training-signature-subject/1` | `GET /api/training/signature-subject` | EDC training proxy (hash check before signing), EDC readiness verifier, Command Center harness |
 | `training-signature-subject-v1.vectors.json` | hash vectors for `training-signature-subject/1` | this repository | this repository's tests and the EDC's tests: each side must reproduce `canonical` and `subjectHash` with its own canonicalizer |
 | `training-duty-readiness-v2.schema.json` | `training-duty-readiness/2` | `POST /api/training/duty-readiness` answering `training-duty-readiness-request/2` | EDC duty readiness consumer |
+| `training-effort-observation-request-v1.schema.json` | `training-effort-observation-request/1` | Command Center (the requester) | `POST /api/training/effort-source/observe` (this service) |
+| `training-effort-source-v1.schema.json` | `TrainingEffortSourceV1@1.0.0` | `POST /api/training/effort-source/observe`, the `data` of `TrainingEffortServiceObservationV1@1.0.0` | Command Center TA3 metrics register (plan item T-4/cc) |
 
 The subject hash is the hex SHA-256 of canonical JSON: object keys sorted by UTF-16 code unit, arrays in order,
 scalars and strings as `JSON.stringify` writes them. It is the same canonical form as `policyHash` and
@@ -58,3 +60,45 @@ signature is answered 404 with code `TRAINING_AUTHORITY_SIGNATURE_NOT_FOUND`.
 and the recorded verifier's signature, and, for governed material, the current publication's draft carries its
 reviewer's approval; otherwise it reads `signature_required`, whose blocker names no arm. A readiness request `/2`
 carries exactly a `/2` policy and a request `/1` exactly a `/1` policy.
+
+## Training effort (plan item T-4)
+
+Off unless this service runs with `TRAINING_EFFORT_LEDGER_ENABLED=true`; otherwise `POST
+/api/training/effort-source/observe` answers 503 `TRAINING_EFFORT_DISABLED` to every request, and the EDC forwards
+that machine path only with its own `ENABLE_TRAINING_EFFORT=true`.
+
+Request `training-effort-observation-request/1` (`x-api-key: atk_...` with scope `training:due-source:read`, no
+query): `{schemaVersion, requestId, installationId, scope: {studyId}, expectedAuthorityHash?}`, a root study only.
+
+The answer is `{success: true, data}` with `data` the envelope `TrainingEffortServiceObservationV1@1.0.0`, shaped
+like `TrainingDueServiceObservationV1@1.0.0`: `{schemaVersion, requestId, requestHash, installationId, scope,
+authority: {apiKeyId, serviceUserId, authorityHash, observedAt, expiresAt}, data, consistency:
+'current-observations-not-atomic', externalDeliveryConfirmed: false}`. `requestHash` is the hex SHA-256 of the
+canonical request; `authority` is the EDC service authority admitted on the transport (the EDC's last answer); the
+credential never appears. The inner `data` is `TrainingEffortSourceV1@1.0.0` (`training-effort-source-v1.schema.json`).
+
+How it is observed: the training service asks the EDC `POST /api/training-authority/resolve-due` (request
+`training-due-authority-request/1`, op `arms`, `scope: {studyId}` and no other selector) for the root's Arm-type
+census, `data: {scope, arms, armsObservationHash}` with exactly `{armId, classId, disclosureLevel, groupStatus,
+lifecycleState, onboardedAt, onboardEventId}` per arm in `armId` order and `armsObservationHash` =
+`sha256:` + the canonical hash of `{scope, arms}`; reads one REPEATABLE READ READ ONLY snapshot of its own effort
+intervals and arm-scoped obligations; computes the document against that census; and asks for the census again. A
+changed census is refused 409 `TRAINING_EFFORT_SOURCE_CHANGED`; a malformed one 503; the EDC's 500-arm bound passes
+through as 413 `TRAINING_EFFORT_TOO_LARGE`, as do this service's own bounds (100,000 intervals, 10,000 arm-scoped
+obligations). Other refusals: 400 `TRAINING_EFFORT_INVALID_REQUEST`, 401 `TRAINING_EFFORT_SERVICE_CREDENTIAL_REQUIRED`,
+401, 403 or 409 `TRAINING_EFFORT_AUTHORITY_REFUSED`, 409 `TRAINING_EFFORT_AUTHORITY_CHANGED`, 503
+`TRAINING_EFFORT_BUSY`, `_CANCELLED`, `_TIMEOUT` (the whole observation, local snapshot included, has 30 seconds)
+and `_UNAVAILABLE`. Nothing partial is ever answered.
+
+What the document says, and does not: hours come from the append-only effort intervals (one per graded quiz attempt,
+completion attestation and verification recorded while the switch is on), by role and kind, for the platform and
+for each arm whose class the EDC declares `regimen` or `cohort`. Learning and attestation take the served
+obligation's role, verification the verifier's platform role. An arm row takes the whole of every interval that
+served the arm. Lead time runs from the arm's EDC onboard event to `trainedAt`, the latest over the arm's assigned
+arm-scoped obligations of the later of the record's verification and the obligation's current revision, once all
+are complete; `open` reports days elapsed so far; `incomplete` names its reason. Every other arm (a
+`treatment-assignment` class, or no declaration) appears with its id and declared level only: no hours rows, no
+lead time, no counts. No learner or actor identity appears. Signed attestation and verification time is also EDC
+observed signed-action effort and must not be added to it. `limitations` lists the rest. `sourceHash` is the
+canonical hash of the document without `asOf` and `sourceHash`, so a later observation of unchanged rows, with no
+`open` arm, hashes the same.

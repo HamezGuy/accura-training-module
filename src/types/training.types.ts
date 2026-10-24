@@ -311,3 +311,26 @@ export interface TrainingEffortInput { workStartedAt?: string; actorRole?: strin
 /** One of the learner's assigned obligations for the course at capture; it attributes the interval to its study,
  * site, arm and role. */
 export interface TrainingEffortServed { obligationId: number; revision: number; role: string; scope: TrainingObligationScope }
+/** One Arm-type group of the root in the EDC's resolve-due op `arms` census, exactly as the EDC answers it. */
+export interface TrainingEffortArm {
+  armId: number; classId: number; disclosureLevel: 'regimen' | 'cohort' | 'treatment-assignment' | null;
+  groupStatus: number | null; lifecycleState: string | null; onboardedAt: string | null; onboardEventId: number | null;
+}
+export interface TrainingEffortHours {
+  level: 'platform' | 'arm'; armId: number | null; role: string | null; roleBasis: 'obligation-role' | 'actor-platform-role';
+  kind: TrainingEffortKind; hours: number; intervals: number; unknownIntervals: number; actors: number; disclosure: 'platform' | 'regimen-or-cohort';
+}
+export interface TrainingEffortLeadTime {
+  status: 'measured' | 'open' | 'incomplete' | 'withheld'; days: number | null; startedAt: string | null; trainedAt: string | null;
+  obligations: { assigned: number; complete: number } | null; learners: number | null; sites: number | null;
+  trainedBeforeOnboarding: boolean | null; reason: string | null;
+}
+/** TrainingEffortSourceV1@1.0.0 (contracts/training-effort-source-v1.schema.json): hours by role and regimen or cohort
+ * arm, and each arm's lead time from its EDC onboard event to fully trained staff, for one root study. */
+export interface TrainingEffortSource {
+  schemaVersion: 'TrainingEffortSourceV1@1.0.0'; scope: { studyId: number }; asOf: string; dataClass: 'synthetic' | 'not-stated';
+  definitions: Record<'learning' | 'attestation' | 'verification' | 'startBasis' | 'roleBasis' | 'hours' | 'leadTime' | 'disclosure', string>;
+  hours: TrainingEffortHours[];
+  arms: Array<{ armId: number; disclosureLevel: TrainingEffortArm['disclosureLevel']; onboardedAt: string | null; onboardEventId: number | null; leadTime: TrainingEffortLeadTime }>;
+  counts: { intervals: number; throughIntervalId: number | null }; limitations: string[]; sourceHash: string;
+}
