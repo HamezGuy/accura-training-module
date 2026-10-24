@@ -79,7 +79,11 @@ npm start
 | GET | `/api/training/user/:userId/records` | User records (admin) |
 | POST | `/api/training/start/:courseId` | Start training |
 | POST | `/api/training/submit-quiz/:courseId` | Submit quiz |
-| POST | `/api/training/verify/:recordId` | Verify completion (supervisor) |
+| POST | `/api/training/verify/:recordId` | Verify completion (supervisor); optional EDC signature receipt |
+| GET | `/api/training/signature-subject` | Exact subject a person signs in the EDC, and its binding status |
+| POST | `/api/training/attest/:recordId` | Learner completion attestation (EDC signature receipt required) |
+| POST | `/api/training/verify/:recordId/signature` | The recorded verifier signs an existing verification |
+| POST | `/api/training/material-drafts/:id/approval-signature` | The recorded reviewer signs an accepted material review |
 | GET | `/api/training/compliance` | Compliance report |
 | GET | `/api/training/expiring` | Expiring certifications |
 | GET | `/api/training/user/:userId/is-compliant` | Compliance check (inter-service) |
@@ -221,8 +225,10 @@ be configured. An older or unavailable authority fails closed for scope readines
 Scope checks are current remote observations, not a distributed transaction with
 the training database. Reports do not prove every clinical duty has an assigned
 curriculum; the sponsor must approve and populate the study training plan and
-validate it in deployment. Independent review here uses the existing authenticated
-training verification workflow; it is not a new signature/re-authentication policy.
+validate it in deployment. Independent review uses the authenticated training
+verification workflow. A scope whose reviewed packet carries `training-duty-policy/2`
+also requires the Part 11 signatures of "Part 11 signatures on training decisions"
+below, made in the EDC with password re-entry; a `/1` policy keeps today's rule.
 The matching native EDC lifecycle now consumes an independently reviewed,
 versioned `training-duty-policy/1` in its existing clinical decision packet.
 Structured authoring accounts for every active staff role and common plus each
@@ -456,3 +462,55 @@ Legacy summary-only records are explicitly not assessment-verified. Requiring
 exact historical assessment receipts for an existing staff qualification is a
 separate reviewed clinical policy decision; this upgrade does not manufacture
 past attempts or silently impose that new qualification hold.
+
+### Part 11 signatures on training decisions
+
+Learner completion attestation, independent verification and governed material
+approval can carry 21 CFR Part 11 signatures. People sign in the EDC with
+password re-entry; this service never signs, holds no credential and needs no
+flag, because a signature receipt exists only when the EDC's own training
+signature setting is on (its lane, T-3/edcapi, is still to land). The contracts,
+the routes and the authority op the EDC answers are in `contracts/README.md`.
+
+The EDC proxy first reads `GET /signature-subject` with the signer's bearer: the
+exact `training-signature-subject/1` of one completion (record, assessment cycle,
+passing assessment receipt, certificate, course version and content revision) or
+of one accepted material draft (request hash, author, source hash). Attestation
+is the learner's own; verification is never the learner's; material approval is
+never the author's. A completion is signed in the study or site of one of the
+learner's assigned obligations for that course; no arm and no participant data
+appear in a subject, receipt or refusal.
+
+The decision then arrives with the EDC's `training-signature-receipt/1`. In the
+decision's own transaction this service recomputes the subject, checks that the
+receipt names it, the decision and the person deciding, asks the EDC to confirm
+its own signature row (op `signature`, readable only by the signer), and inserts
+one row in the append-only `acc_training_decision_signatures` (row and TRUNCATE
+guards, ENABLE ALWAYS). The audit row is `training_completion_attested` or
+`training_signature_bound`; the verification audit now names the course version,
+content revision and assessment cycle verified. A malformed receipt is refused,
+never dropped into an unsigned decision. The same receipt again replays; another
+signature for an already signed decision is refused and stays in the EDC as a
+signature no decision consumed. `verify/:recordId/signature` and
+`approval-signature` let the person who already recorded a verification or a
+review sign it, without retraining or re-review. New publication receipts name
+`reviewSignature` (`null` when the review was unsigned).
+
+Under a reviewed `training-duty-policy/2` (`/1` plus `signatures:
+'part11-required'`), `training-duty-readiness/2` cites each pin's signatures, and
+a pin `/1` would call complete reads `signature_required` until the learner's
+attestation and the recorded verifier's signature of the record's current
+assessment cycle are bound, and, for governed material, the reviewer's approval of
+the current publication's draft. A binding that no longer matches its completion
+or publication refuses the observation. A restart is a new cycle and needs new
+signatures. Readiness `/1` is answered exactly as before.
+
+Not covered yet: matrix approval (reserved for the curriculum matrix, T-1); the
+bindings are not a table of `training-inspection-evidence/1` (the audit rows of
+record decisions are, through their record IDs; a `/2` inspection constituent is
+T-5's); the CC due feed still reports a verified but unsigned completion as
+satisfied; the meaning texts are the EDC's and await a person's approval. The
+owned obligations suite exercises the routes on real PostgreSQL against an EDC
+stand-in for op `signature`; with an EDC checkout that carries
+`src/services/database/training-signature-migration.ts`, the compiled EDC
+authority answers from its own table instead.

@@ -31,6 +31,17 @@ export function nativeTrainingAuthority(root: string, nativePool: Pool) {
   }
   const constants = compile(constantsPath, constantsSource, {});
   const service = compile(servicePath, serviceSource, { '../../config/database': { pool: null }, '../../constants/roles': constants });
+  // The EDC's signature table comes only from its own import-free migration source (T-3 there), compiled like the
+  // authority; a copied DDL never stands in for it. An older EDC head has no such file and no op `signature`.
+  const migrationPath = path.join(base, 'src/services/database/training-signature-migration.ts');
+  let signatureMigration: string[] | null = null;
+  if (fs.existsSync(migrationPath)) {
+    const migrationSource = fs.readFileSync(migrationPath, 'utf8');
+    sourceHashes[path.relative(base, migrationPath).replace(/\\/g, '/')] = createHash('sha256').update(migrationSource).digest('hex');
+    signatureMigration = Object.values(compile(migrationPath, migrationSource, {}))
+      .filter((value): value is string => typeof value === 'string' && value.includes('acc_esignature_training_decision'));
+    if (!signatureMigration.length) throw new Error('The EDC training signature migration exports no SQL for acc_esignature_training_decision.');
+  }
   const database = {
     async connect() {
       const client = await nativePool.connect();
@@ -43,5 +54,6 @@ export function nativeTrainingAuthority(root: string, nativePool: Pool) {
       };
     },
   };
-  return { sourceHashes, resolve: (actorUserId: number, input: unknown): Promise<unknown> => service.resolveTrainingAuthority(actorUserId, input, database) };
+  return { sourceHashes, signatureMigration,
+    resolve: (actorUserId: number, input: unknown): Promise<unknown> => service.resolveTrainingAuthority(actorUserId, input, database) };
 }

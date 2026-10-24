@@ -10,6 +10,12 @@ import {runMigrations} from '../../src/config/migrations';
 import {nativeTrainingAuthority} from '../fixtures/native-training-authority';
 import {trainingDutyHash} from '../../src/services/training-obligations.service';
 import * as certificateService from '../../src/services/certificate.service';
+import {trainingEvidenceHash} from '../../src/services/audit.service';
+import {bindSignatureReceipt,materialApprovalSubject} from '../../src/services/training-signatures.service';
+import {transaction} from '../../src/config/database';
+import fs from 'node:fs';
+import path from 'node:path';
+import Ajv2020 from 'ajv/dist/2020';
 
 jest.mock('../../src/config/environment',()=>({config:{database:{url:process.env['TRAINING_OBLIGATION_TEST_DATABASE_URL']??'postgresql://127.0.0.1:1/disabled',ssl:false},authority:{baseUrl:'https://authority.invalid',timeoutMs:1000},training:{certificateValidityDays:365}}}));
 jest.mock('../../src/config/logger',()=>({logger:{info:jest.fn(),error:jest.fn(),warn:jest.fn(),debug:jest.fn()}}));
@@ -19,6 +25,9 @@ owned('native obligation scope, durable assignment and completion evidence',()=>
   const app=express();app.use(express.json());app.use('/api/training',trainingRoutes);app.use(errorHandler);
   let authority:ReturnType<typeof nativeTrainingAuthority>,courseId:number,revision:number,questionId:number;
   let intercept:((input:any)=>Promise<void>)|undefined;
+  // Stand-in for the EDC's signature rows and its authority op `signature` while the EDC head has neither (both land
+  // with T-3/edcapi). It answers exactly the shape the training service checks, and only to the signer.
+  const edcSignatures=new Map<number,any>();let nextSignatureId=9001;
   const token=(userId:number)=>jwt.sign({userId},'synthetic-only-authority');
   const api=(userId=11)=>({get:(path:string)=>request(app).get(`/api/training${path}`).set('Authorization',`Bearer ${token(userId)}`),post:(path:string,body:object)=>request(app).post(`/api/training${path}`).set('Authorization',`Bearer ${token(userId)}`).send(body)});
   const payload=(extra:object={})=>({userId:22,courseId,contentRevision:revision,role:'coordinator',scope:{studyId:100,siteId:101,armId:5},dueAt:'2020-01-01T00:00:00Z',reason:'Protocol procedure for assigned arm responsibility',...extra});
@@ -32,6 +41,7 @@ owned('native obligation scope, durable assignment and completion evidence',()=>
       CREATE TABLE study_group_class(study_group_class_id integer PRIMARY KEY,study_id integer,group_class_type_id integer,status_id integer);
       CREATE TABLE study_group(study_group_id integer PRIMARY KEY,study_group_class_id integer,name text);
       CREATE FUNCTION reject_obligation_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'Owned audit failure'; END; $$`);
+    for(const sql of authority.signatureMigration??[])await nativePool.query(sql);
   }
   beforeAll(async()=>{
     const url=new URL(process.env['TRAINING_OBLIGATION_TEST_DATABASE_URL']!);
@@ -43,7 +53,7 @@ owned('native obligation scope, durable assignment and completion evidence',()=>
   });
   afterAll(async()=>{await pool.end();await nativePool.end();});
   beforeEach(async()=>{
-    intercept=undefined;
+    intercept=undefined;edcSignatures.clear();
     // This entire database was created empty and validated as owned above.
     // Recreate its disposable schema; never disable the production history guard.
     await nativePool.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public');
@@ -67,6 +77,11 @@ owned('native obligation scope, durable assignment and completion evidence',()=>
         const claims=jwt.verify(new Headers(options?.headers).get('Authorization')!.slice(7),'synthetic-only-authority') as {userId:number};
         if(String(url).endsWith('/api/training-authority/resolve')){
           const input=JSON.parse(String(options?.body));await intercept?.(input);
+          if(input.op==='signature'&&!authority.signatureMigration){const row=edcSignatures.get(input.signatureId);
+            if(!row||row.requestKey!==input.requestKey||row.decision!==input.decision||row.subjectHash!==input.subjectHash)return new Response(JSON.stringify({success:false,error:{code:'TRAINING_AUTHORITY_SIGNATURE_NOT_FOUND'}}),{status:404,headers:{'content-type':'application/json'}});
+            if(row.signerUserId!==claims.userId)return new Response(JSON.stringify({success:false,error:{code:'TRAINING_AUTHORITY_FORBIDDEN'}}),{status:403,headers:{'content-type':'application/json'}});
+            return new Response(JSON.stringify({success:true,data:{schemaVersion:'training-authority/1',op:input.op,action:input.action,actorUserId:claims.userId,observedAt:new Date().toISOString(),
+              scopeFingerprint:`sha256:${'5'.repeat(64)}`,consistency:'current-page-observations-not-atomic',complete:true,observationHash:`sha256:${trainingEvidenceHash(row)}`,signature:row}}),{status:200,headers:{'content-type':'application/json'}});}
           const data=await authority.resolve(claims.userId,input);return new Response(JSON.stringify({success:true,data}),{status:200,headers:{'content-type':'application/json'}});
         }
         const native=(await nativePool.query('SELECT * FROM user_account WHERE user_id=$1 AND status_id=1',[claims.userId])).rows[0];
@@ -250,5 +265,128 @@ owned('native obligation scope, durable assignment and completion evidence',()=>
     p.assignments[1].obligations[0].revision++;expect((await api(22).post('/duty-readiness',req)).body.data.ready).toBe(false);p.assignments[1].obligations[0].revision--;
     expect((await api().post(`/obligations/${row.id}/withdraw`,{expectedRevision:1,reason:'Duty removed'})).status).toBe(200);expect((await api(22).post('/duty-readiness',req)).body.data.ready).toBe(false);
     expect((await api(22).post('/duty-readiness',{...req,policy:{...p,assignments:[]}})).status).toBe(400);
+  });
+
+  // Part 11 signatures on training decisions (T-3). The EDC side (its signature rows and authority op `signature`)
+  // is the stand-in above until the EDC head carries training-signature-migration.ts; then the compiled EDC
+  // authority answers from its own table and every case below runs against it.
+  const contracts=new Ajv2020({allErrors:true,strict:true});
+  for(const name of ['training-signature-subject-v1.schema.json','training-duty-readiness-v2.schema.json'])contracts.addSchema(JSON.parse(fs.readFileSync(path.join(__dirname,'../../contracts',name),'utf8')));
+  const conforms=(id:string,value:unknown)=>{const validate=contracts.getSchema(`https://schemas.accuratrials.com/training/${id}`)!;return validate(value)?'valid':JSON.stringify(validate.errors);};
+  const site={studyId:100,siteId:101},names:Record<number,string>={11:'manager',22:'learner',33:'reviewer',44:'outside'};
+  const subjectQuery=(kind:string,recordId:number)=>`kind=${kind}&recordId=${recordId}&studyId=100&siteId=101`;
+  /** The EDC proxy's part: read the subject with the signer's own bearer, check its hash, keep the password re-entry
+   * signature row, and forward the receipt. Synthetic users and meanings only. */
+  async function edcSign(signer:number,query:string,decision:string){
+    const read=await api(signer).get(`/signature-subject?${query}`);expect(read.status).toBe(200);
+    expect(trainingEvidenceHash(read.body.data.subject)).toBe(read.body.data.subjectHash);expect(conforms('training-signature-subject/1',read.body.data.subject)).toBe('valid');
+    const row:any={signatureId:nextSignatureId++,requestKey:randomUUID(),decision,studyId:site.siteId,subject:read.body.data.subject,subjectHash:read.body.data.subjectHash,
+      meaning:`SYNTHETIC ENGINEERING STUDY. NOT A REAL TRIAL. ${decision}`,signerUserId:signer,signerUsername:names[signer],signerFullName:`Synthetic ${names[signer]}`,
+      signedAt:new Date().toISOString(),effortRequestId:randomUUID()};
+    if(authority.signatureMigration){
+      const inserted=await nativePool.query(`INSERT INTO acc_esignature_training_decision(request_key,decision,study_id,subject,subject_hash,meaning,signer_user_id,
+        signer_username,signer_full_name,signed_at,effort_request_id) VALUES($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9,$10,$11) RETURNING signature_id`,
+        [row.requestKey,decision,row.studyId,JSON.stringify(row.subject),row.subjectHash,row.meaning,signer,row.signerUsername,row.signerFullName,row.signedAt,row.effortRequestId]);
+      row.signatureId=Number(inserted.rows[0].signature_id);
+    }else edcSignatures.set(row.signatureId,row);
+    return {schemaVersion:'training-signature-receipt/1',signatureId:row.signatureId,requestKey:row.requestKey,decision,meaning:row.meaning,signerUserId:signer,signerUsername:row.signerUsername,
+      signerFullName:row.signerFullName,signedAt:row.signedAt,context:site,subjectHash:row.subjectHash,edcEffort:{requestId:row.effortRequestId,workStartedAt:null,startBasis:'not-supplied'}};
+  }
+  const bindings=async()=>(await nativePool.query('SELECT * FROM acc_training_decision_signatures ORDER BY id')).rows;
+  test('the learner attests once through the real route; the binding is append-only and the same receipt replays',async()=>{
+    await assign();const recordId=await complete(),query=subjectQuery('completion-attestation',recordId);
+    expect((await api(22).get(`/signature-subject?${query}`)).body.data.binding).toEqual({status:'unbound'});
+    const receipt=await edcSign(22,query,'completion-attestation');
+    const attested=await api(22).post(`/attest/${recordId}`,{signatureReceipt:receipt});expect(attested.status).toBe(200);
+    expect(attested.body.data).toMatchObject({attested:true,replayed:false,signature:{signatureId:receipt.signatureId,subjectHash:receipt.subjectHash}});
+    expect((await api(22).post(`/attest/${recordId}`,{signatureReceipt:receipt})).body.data).toMatchObject({attested:true,replayed:true});
+    const rows=await bindings();expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({decision:'completion-attestation',signer_user_id:22,record_id:recordId,edc_signature_id:String(receipt.signatureId),subject_hash:receipt.subjectHash,draft_id:null});
+    expect((await nativePool.query("SELECT details FROM acc_training_audit_log WHERE action='training_completion_attested' AND record_id=$1",[recordId])).rows.map(r=>r.details.signatureId)).toEqual([receipt.signatureId]);
+    expect((await api(22).get(`/signature-subject?${query}`)).body.data.binding).toMatchObject({status:'bound',signatureId:receipt.signatureId,requestKey:receipt.requestKey,signerUserId:22});
+    // A second signature for the attested completion, or another person's attestation, binds nothing.
+    expect((await api(22).post(`/attest/${recordId}`,{signatureReceipt:await edcSign(22,query,'completion-attestation')})).status).toBe(409);
+    expect((await api(33).post(`/attest/${recordId}`,{signatureReceipt:{...receipt,signerUserId:33}})).status).toBe(404);
+    expect(await bindings()).toEqual(rows);
+    for(const sql of ["UPDATE acc_training_decision_signatures SET subject_hash=repeat('0',64)",'DELETE FROM acc_training_decision_signatures','TRUNCATE acc_training_decision_signatures'])
+      await expect(nativePool.query(sql)).rejects.toThrow('Training history is append-only');
+  });
+  test('a signed verification binds the verifier\'s signature in its transaction; a learner never verifies their own completion',async()=>{
+    await assign();const recordId=await complete(),query=subjectQuery('verification',recordId);
+    const receipt=await edcSign(33,query,'verification');
+    const verified=await api(33).post(`/verify/${recordId}`,{notes:'Synthetic signed verification',signatureReceipt:receipt});expect(verified.status).toBe(200);
+    expect(verified.body.data).toMatchObject({verified:true,replayed:false,signature:{signatureId:receipt.signatureId,subjectHash:receipt.subjectHash}});
+    expect((await api(33).post(`/verify/${recordId}`,{notes:'Synthetic signed verification',signatureReceipt:receipt})).body.data).toMatchObject({verified:true,replayed:true});
+    const audit=(await nativePool.query("SELECT action,details FROM acc_training_audit_log WHERE record_id=$1 AND action IN ('training_verified','training_signature_bound') ORDER BY id",[recordId])).rows;
+    expect(audit.map(r=>r.action)).toEqual(['training_verified','training_signature_bound']);
+    expect(audit[0].details).toMatchObject({notes:'Synthetic signed verification',courseId,courseVersion:'1',contentRevision:revision,assessmentCycleId:expect.stringMatching(/^[a-f0-9-]{36}$/)});
+    expect((await bindings()).map(row=>[row.decision,row.signer_user_id])).toEqual([['verification',33]]);
+    // Even holding a verifier role, the learner is refused before any signature is read or bound.
+    await nativePool.query("UPDATE user_account_extended SET platform_role='monitor' WHERE user_id=22");
+    expect((await api(22).get(`/signature-subject?${query}`)).status).toBe(403);
+    expect((await api(22).post(`/verify/${recordId}`,{notes:'Self',signatureReceipt:{...receipt,signerUserId:22}})).status).toBe(403);
+    expect(await bindings()).toHaveLength(1);
+  });
+  test('the recorded verifier signs an unsigned verification afterwards; nobody else can, and the verification is never rewritten',async()=>{
+    await assign();const recordId=await complete();
+    expect((await api(33).post(`/verify/${recordId}`,{notes:'Unsigned synthetic verification'})).status).toBe(200);
+    const before=(await nativePool.query('SELECT verified_by,verified_at,notes,updated_at FROM acc_training_records WHERE id=$1',[recordId])).rows[0];
+    expect((await api(11).get(`/signature-subject?${subjectQuery('verification',recordId)}`)).status).toBe(409);
+    const receipt=await edcSign(33,subjectQuery('verification',recordId),'verification');
+    expect((await api(11).post(`/verify/${recordId}/signature`,{signatureReceipt:{...receipt,signerUserId:11}})).status).toBe(409);
+    const signed=await api(33).post(`/verify/${recordId}/signature`,{signatureReceipt:receipt});expect(signed.status).toBe(200);
+    expect(signed.body.data).toMatchObject({signed:true,replayed:false,signature:{signatureId:receipt.signatureId}});
+    expect((await nativePool.query('SELECT verified_by,verified_at,notes,updated_at FROM acc_training_records WHERE id=$1',[recordId])).rows[0]).toEqual(before);
+    expect((await bindings()).map(row=>row.decision)).toEqual(['verification']);
+  });
+  test('readiness /2 over real rows is signature_required until both signatures are bound, conforms to its schema, and /1 is unchanged',async()=>{
+    const row=await assign(),recordId=await complete();expect((await api(33).post(`/verify/${recordId}`,{notes:'Unsigned synthetic verification'})).status).toBe(200);
+    const policy2={...dutyPolicy(row),schemaVersion:'training-duty-policy/2',signatures:'part11-required'},request2=dutyRequest(policy2,{schemaVersion:'training-duty-readiness-request/2'});
+    const v1=(await api(22).post('/duty-readiness',dutyRequest(dutyPolicy(row)))).body.data;
+    expect(v1).toMatchObject({schemaVersion:'training-duty-readiness/1',ready:true});expect('signatures' in v1.assignments[1].obligations[0]).toBe(false);
+    let observed=(await api(22).post('/duty-readiness',request2)).body.data;
+    expect(observed).toMatchObject({schemaVersion:'training-duty-readiness/2',ready:false,blockers:[`Learner 22, obligation ${row.id}: signature_required.`]});
+    expect(conforms('training-duty-readiness/2',observed)).toBe('valid');
+    expect((await api(22).post(`/attest/${recordId}`,{signatureReceipt:await edcSign(22,subjectQuery('completion-attestation',recordId),'completion-attestation')})).status).toBe(200);
+    expect((await api(22).post('/duty-readiness',request2)).body.data.ready).toBe(false);
+    expect((await api(33).post(`/verify/${recordId}/signature`,{signatureReceipt:await edcSign(33,subjectQuery('verification',recordId),'verification')})).status).toBe(200);
+    observed=(await api(22).post('/duty-readiness',request2)).body.data;
+    expect(observed).toMatchObject({ready:true,blockers:[]});expect(conforms('training-duty-readiness/2',observed)).toBe('valid');
+    const cited=observed.assignments[1].obligations[0].signatures;
+    expect(cited.attestation.subject).toMatchObject({kind:'completion-attestation',recordId,learnerUserId:22,context:site});
+    expect(cited.verification.subject.kind).toBe('verification');expect(cited.materialApproval).toBeNull();
+    const {schemaVersion:_v,nonce:_n,observedAt:_o,consistency:_c,evidenceHash,...evidence}=observed;expect(trainingDutyHash(evidence)).toBe(evidenceHash);
+    // A /1 request never carries a /2 policy.
+    expect((await api(22).post('/duty-readiness',dutyRequest(policy2))).status).toBe(400);
+  });
+  test('material approval binds by draft on the real table; the row shape refuses reserved and incomplete decisions',async()=>{
+    const draftId=randomUUID(),requestHash='b'.repeat(64);
+    await nativePool.query(`INSERT INTO acc_training_material_drafts(id,course_id,created_by,idempotency_key,request,request_hash,author_authority_hash,status)
+      VALUES($1,$2,11,$3,'{}'::jsonb,$4,$5,'reviewed')`,[draftId,courseId,randomUUID(),requestHash,`sha256:${'8'.repeat(64)}`]);
+    const subject=materialApprovalSubject({draftId,draftRevision:1,requestHash,courseId,authorUserId:11,sourceHash:'c'.repeat(64),context:site}),subjectHash=trainingEvidenceHash(subject);
+    const signed=(signatureId:number):any=>({schemaVersion:'training-signature-receipt/1',signatureId,requestKey:randomUUID(),decision:'material-approval',meaning:'SYNTHETIC approval',
+      signerUserId:33,signerUsername:'reviewer',signerFullName:'Synthetic reviewer',signedAt:new Date().toISOString(),context:site,subjectHash,edcEffort:null});
+    const confirm=(r:any)=>({signatureId:r.signatureId,requestKey:r.requestKey,decision:r.decision,studyId:101,subjectHash,meaning:r.meaning,signerUserId:33,signerUsername:r.signerUsername,
+      signerFullName:r.signerFullName,signedAt:r.signedAt,effortRequestId:null,observationHash:`sha256:${'e'.repeat(64)}`});
+    const expected={decision:'material-approval' as const,subject,subjectHash,signerUserId:33,draftId},first=signed(7001);
+    expect(await transaction(client=>bindSignatureReceipt(client,first,confirm(first),expected))).toMatchObject({replayed:false,binding:{signatureId:7001,draftId,recordId:null}});
+    expect(await transaction(client=>bindSignatureReceipt(client,first,confirm(first),expected))).toMatchObject({replayed:true});
+    const second=signed(7002);
+    await expect(transaction(client=>bindSignatureReceipt(client,second,confirm(second),expected))).rejects.toMatchObject({statusCode:409});
+    const insert=(signatureId:number,decision:string,draft:string|null)=>nativePool.query(`INSERT INTO acc_training_decision_signatures(edc_signature_id,decision,request_key,signer_user_id,
+      signed_at,context,subject,subject_hash,receipt,edc_observation_hash,record_id,assessment_cycle_id,draft_id) VALUES($1,$2,$3,33,NOW(),'{}'::jsonb,'{}'::jsonb,$4,'{}'::jsonb,'synthetic',NULL,NULL,$5)`,
+      [signatureId,decision,randomUUID(),'f'.repeat(64),draft]);
+    await expect(insert(7003,'matrix-approval',null)).rejects.toThrow('acc_training_signature_shape');
+    await expect(insert(7004,'completion-attestation',draftId)).rejects.toThrow('acc_training_signature_shape');
+    expect((await bindings()).map(row=>[row.decision,row.edc_signature_id])).toEqual([['material-approval','7001']]);
+  });
+  test('the compiled EDC authority confirms signatures from its own table',async()=>{
+    if(!authority.signatureMigration){
+      console.info('SKIPPED compiled EDC op signature: the EDC checkout at TRAINING_NATIVE_AUTHORITY_ROOT has no src/services/database/training-signature-migration.ts yet (T-3/edcapi lands it and runs this case)');
+      return;
+    }
+    await assign();const recordId=await complete(),receipt=await edcSign(22,subjectQuery('completion-attestation',recordId),'completion-attestation');
+    expect((await api(22).post(`/attest/${recordId}`,{signatureReceipt:receipt})).status).toBe(200);
+    expect((await bindings()).map(row=>[row.decision,Number(row.edc_signature_id)])).toEqual([['completion-attestation',receipt.signatureId]]);
   });
 });
