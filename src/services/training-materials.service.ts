@@ -3,6 +3,7 @@ import {query,queryOne,transaction,TransactionClient} from '../config/database';
 import {logAudit,trainingEvidenceHash as hash,AuditAction} from './audit.service';
 import {observeMaterialSource,inspectImpactSource,resolveObligationScope,resolveSignature,TrainingAuthorityContext} from './training-authority.service';
 import {bindingFor,bindingStatus,bindSignatureReceipt,checkSignedDecision,materialApprovalSubject,readSignatureReceipt,signatureAuditDetails,signatureBindings} from './training-signatures.service';
+import {escapeHtml as escape} from './html-escape';
 import {TrainingCourse,TrainingMaterial,TrainingMaterialDraftRequest,TrainingMaterialSource,TrainingObligationScope,TrainingObligation} from '../types/training.types';
 
 const database={query,queryOne};
@@ -11,7 +12,6 @@ const id=(v:unknown):v is number=>Number.isSafeInteger(v)&&Number(v)>0&&Number(v
 function fail(message:string,statusCode=409):never{throw Object.assign(new Error(message),{statusCode});}
 function exact(v:unknown,keys:string[]):asserts v is Record<string,any>{if(!v||typeof v!=='object'||Array.isArray(v)||Object.keys(v).some(k=>!keys.includes(k)))fail('Unexpected material fields',400);}
 function text(v:unknown,max:number,empty=false):asserts v is string{if(typeof v!=='string'||(!empty&&!v.trim())||v.length>max)fail(`Supply ${empty?'0':'1'}–${max} characters`,400);}
-const escape=(v:string)=>v.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!));
 /** Text is retained verbatim. Escaping, never HTML interpretation, preserves the
  * authored words and units in the existing HTML learner without executable markup. */
 export const materialLessonHtml=(lesson:TrainingMaterial['lessons'][number])=>`<p>${escape(lesson.text).replace(/\r\n|\r|\n/g,'<br>')}</p>`+
