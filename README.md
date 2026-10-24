@@ -87,6 +87,7 @@ npm start
 | GET | `/api/training/compliance` | Compliance report |
 | GET | `/api/training/expiring` | Expiring certifications |
 | GET | `/api/training/user/:userId/is-compliant` | Compliance check (inter-service) |
+| POST | `/api/training/effort-source/observe` | Training effort observation, machine `x-api-key` only (off unless `TRAINING_EFFORT_LEDGER_ENABLED=true`) |
 
 ## Regulatory References
 
@@ -514,3 +515,52 @@ owned obligations suite exercises the routes on real PostgreSQL against an EDC
 stand-in for op `signature`; with an EDC checkout that carries
 `src/services/database/training-signature-migration.ts`, the compiled EDC
 authority answers from its own table instead.
+
+### Training effort intervals and arm lead time
+
+Off unless `TRAINING_EFFORT_LEDGER_ENABLED=true` (read at every request, never
+through the configuration module); with it unset nothing below is recorded or
+served, and no decision issues an extra query. Plan item T-4.
+
+With the switch on, each graded quiz attempt, learner completion attestation and
+verification writes one row in the append-only `acc_training_effort_intervals`
+(row and TRUNCATE guards, ENABLE ALWAYS) in that decision's own transaction, so a
+rolled-back decision records none and a replayed one (the same quiz request key,
+the same signature receipt) adds none. A row names the kind, the person, the
+record and assessment cycle, the learner's assigned obligations for the course at
+that moment (`served`, which attributes it to studies, sites, arms and roles), its
+start and end and the basis of its start:
+
+- `client-work-start`: the `X-Work-Started-At` the EDC proxy forwards, checked
+  again here by the EDC effort ledger's own rule (an explicit zone, at most 12
+  hours before and 2 minutes after the end; `checkedWorkStart` in
+  `src/services/training-effort.service.ts` is a port of the EDC's, tested on the
+  same vectors);
+- `server-cycle-start` (learning only): the later of the assessment cycle start
+  and the cycle's previous attempt, when within 12 hours;
+- `edc-signed-effort`: a signed attestation or verification ends at the EDC
+  signature and copies the receipt's stated start and EDC effort request id (each
+  EDC effort request is counted once);
+- `not-supplied`: no start; the interval counts but adds no hours.
+
+A start that fails the rule falls through to the next basis; effort never refuses
+a decision. A request key is unique per kind, person, record and cycle, so a
+client key reused in a new cycle, or by another person or kind, records its own
+interval. Signing a verification already recorded adds no second interval.
+
+`POST /api/training/effort-source/observe` (machine route, registered before human
+authentication; through the EDC proxy with an `atk_` key of scope
+`training:due-source:read`) answers `training-effort-observation-request/1` for one
+root study with `TrainingEffortServiceObservationV1@1.0.0`, on the due observer's
+transport: the EDC's `resolve-due` op `arms` census, one REPEATABLE READ READ ONLY
+snapshot computed against it, and the same census again, which must not have
+changed. Its `data`, `TrainingEffortSourceV1@1.0.0`, gives hours by role and kind
+for the platform and for each arm whose class the EDC declares regimen or cohort,
+and per arm the lead time from the arm's EDC onboard event to the moment its
+assigned arm-scoped obligations were all complete (`measured`, `open`, or
+`incomplete` with its reason); every other arm is withheld with no values and no
+counts, and no learner or actor identity appears. More than 100,000 intervals or
+10,000 arm-scoped obligations are refused whole (413). `TRAINING_DATA_CLASS=synthetic`
+labels the document synthetic on a test stack. The contracts and their
+limitations are in `contracts/README.md`. The intervals are not a table of
+`training-inspection-evidence/1`; a `/2` constituent is T-5's.

@@ -2,7 +2,7 @@ import express from 'express';
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
 import {Pool} from 'pg';
-import {randomUUID} from 'node:crypto';
+import {createHash,randomUUID} from 'node:crypto';
 import trainingRoutes from '../../src/routes/training.routes';
 import {errorHandler} from '../../src/middleware/errorHandler.middleware';
 import {pool} from '../../src/config/database';
@@ -28,6 +28,16 @@ owned('native obligation scope, durable assignment and completion evidence',()=>
   // Stand-in for the EDC's signature rows and its authority op `signature` while the EDC head has neither (both land
   // with T-3/edcapi). It answers exactly the shape the training service checks, and only to the signer.
   const edcSignatures=new Map<number,any>();let nextSignatureId=9001;
+  // Stand-in for the EDC's machine resolve-due authority, op arms only (T-4/edcapi lands the real op; its native suite
+  // tests it on a real EDC schema). It answers the exact training-due-authority/1 envelope the shared transport checks.
+  const EFFORT_KEY='atk_synthetic_effort_reader';let effortArms:any[]=[];
+  const dueServiceAuthority=(input:any,key:string|null)=>{
+    if(key!==EFFORT_KEY||input.op!=='arms')return new Response(JSON.stringify({success:false,error:{code:'TRAINING_DUE_SERVICE_DENIED'}}),{status:403,headers:{'content-type':'application/json'}});
+    const now=Date.now(),data={scope:input.scope,arms:effortArms,armsObservationHash:`sha256:${trainingDutyHash({scope:input.scope,arms:effortArms})}`};
+    return new Response(JSON.stringify({success:true,data:{schemaVersion:'training-due-authority/1',requestId:input.requestId,requestHash:trainingDutyHash(input),installationId:input.installationId,
+      scope:input.scope,serviceUserId:99,apiKeyId:7,authorityHash:'d'.repeat(64),op:input.op,complete:true,data,observedAt:new Date(now).toISOString(),
+      expiresAt:new Date(now+15000).toISOString(),consistency:'current-observations-not-atomic'}}),{status:200,headers:{'content-type':'application/json'}});
+  };
   const token=(userId:number)=>jwt.sign({userId},'synthetic-only-authority');
   const api=(userId=11)=>({get:(path:string)=>request(app).get(`/api/training${path}`).set('Authorization',`Bearer ${token(userId)}`),post:(path:string,body:object)=>request(app).post(`/api/training${path}`).set('Authorization',`Bearer ${token(userId)}`).send(body)});
   const payload=(extra:object={})=>({userId:22,courseId,contentRevision:revision,role:'coordinator',scope:{studyId:100,siteId:101,armId:5},dueAt:'2020-01-01T00:00:00Z',reason:'Protocol procedure for assigned arm responsibility',...extra});
@@ -53,7 +63,7 @@ owned('native obligation scope, durable assignment and completion evidence',()=>
   });
   afterAll(async()=>{await pool.end();await nativePool.end();});
   beforeEach(async()=>{
-    intercept=undefined;edcSignatures.clear();
+    intercept=undefined;edcSignatures.clear();effortArms=[];
     // This entire database was created empty and validated as owned above.
     // Recreate its disposable schema; never disable the production history guard.
     await nativePool.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public');
@@ -73,6 +83,7 @@ owned('native obligation scope, durable assignment and completion evidence',()=>
       VALUES($1,'Use current procedure?','true_false','[{"text":"Yes","isCorrect":true},{"text":"No","isCorrect":false}]') RETURNING id`,[courseId])).rows[0].id;
     revision=(await nativePool.query('SELECT content_revision FROM acc_training_courses WHERE id=$1',[courseId])).rows[0].content_revision;
     jest.spyOn(globalThis,'fetch').mockImplementation(async(url,options)=>{
+      if(String(url).endsWith('/api/training-authority/resolve-due'))return dueServiceAuthority(JSON.parse(String(options?.body)),new Headers(options?.headers).get('x-api-key'));
       try{
         const claims=jwt.verify(new Headers(options?.headers).get('Authorization')!.slice(7),'synthetic-only-authority') as {userId:number};
         if(String(url).endsWith('/api/training-authority/resolve')){
@@ -271,16 +282,16 @@ owned('native obligation scope, durable assignment and completion evidence',()=>
   // is the stand-in above until the EDC head carries training-signature-migration.ts; then the compiled EDC
   // authority answers from its own table and every case below runs against it.
   const contracts=new Ajv2020({allErrors:true,strict:true});
-  for(const name of ['training-signature-subject-v1.schema.json','training-duty-readiness-v2.schema.json'])contracts.addSchema(JSON.parse(fs.readFileSync(path.join(__dirname,'../../contracts',name),'utf8')));
+  for(const name of ['training-signature-subject-v1.schema.json','training-duty-readiness-v2.schema.json','training-effort-source-v1.schema.json','training-effort-observation-request-v1.schema.json'])contracts.addSchema(JSON.parse(fs.readFileSync(path.join(__dirname,'../../contracts',name),'utf8')));
   const conforms=(id:string,value:unknown)=>{const validate=contracts.getSchema(`https://schemas.accuratrials.com/training/${id}`)!;return validate(value)?'valid':JSON.stringify(validate.errors);};
   const site={studyId:100,siteId:101},names:Record<number,string>={11:'manager',22:'learner',33:'reviewer',44:'outside'};
   const subjectQuery=(kind:string,recordId:number)=>`kind=${kind}&recordId=${recordId}&studyId=100&siteId=101`;
   /** The EDC proxy's part: read the subject with the signer's own bearer, check its hash, keep the password re-entry
    * signature row, and forward the receipt. Synthetic users and meanings only. */
-  async function edcSign(signer:number,query:string,decision:string){
+  async function edcSign(signer:number,query:string,decision:string,requestKey:string=randomUUID()){
     const read=await api(signer).get(`/signature-subject?${query}`);expect(read.status).toBe(200);
     expect(trainingEvidenceHash(read.body.data.subject)).toBe(read.body.data.subjectHash);expect(conforms('training-signature-subject/1',read.body.data.subject)).toBe('valid');
-    const row:any={signatureId:nextSignatureId++,requestKey:randomUUID(),decision,studyId:site.siteId,subject:read.body.data.subject,subjectHash:read.body.data.subjectHash,
+    const row:any={signatureId:nextSignatureId++,requestKey,decision,studyId:site.siteId,subject:read.body.data.subject,subjectHash:read.body.data.subjectHash,
       meaning:`SYNTHETIC ENGINEERING STUDY. NOT A REAL TRIAL. ${decision}`,signerUserId:signer,signerUsername:names[signer],signerFullName:`Synthetic ${names[signer]}`,
       signedAt:new Date().toISOString(),effortRequestId:randomUUID()};
     if(authority.signatureMigration){
@@ -389,4 +400,125 @@ owned('native obligation scope, durable assignment and completion evidence',()=>
     expect((await api(22).post(`/attest/${recordId}`,{signatureReceipt:receipt})).status).toBe(200);
     expect((await bindings()).map(row=>[row.decision,Number(row.edc_signature_id)])).toEqual([['completion-attestation',receipt.signatureId]]);
   });
+
+  // Training effort (T-4): intervals in each decision's own transaction and the TrainingEffortSourceV1@1.0.0
+  // observation over the real rows. The switch is set per case and removed after it.
+  const efforts=async()=>(await nativePool.query('SELECT * FROM acc_training_effort_intervals ORDER BY id')).rows;
+  const withEffort=async(fn:()=>Promise<void>)=>{process.env.TRAINING_EFFORT_LEDGER_ENABLED='true';try{await fn();}finally{delete process.env.TRAINING_EFFORT_LEDGER_ENABLED;}};
+  const start=async()=>{const started=await api(22).post(`/start/${courseId}`,{contentRevision:revision});expect(started.status).toBe(200);return started.body.data as {id:number;assessmentCycleId:string};};
+  const quiz=(started:{id:number;assessmentCycleId:string},selected:number,requestId:string,stated?:string)=>{
+    const call=request(app).post(`/api/training/submit-quiz/${courseId}`).set('Authorization',`Bearer ${token(22)}`);
+    return (stated?call.set('X-Work-Started-At',stated):call).send({recordId:started.id,cycleId:started.assessmentCycleId,requestId,contentRevision:revision,answers:[{questionId,selectedOptions:[selected]}]});
+  };
+  test('each graded attempt, attestation and verification writes one interval in its transaction; replays add none; the rows are append-only',()=>withEffort(async()=>{
+    const obligation=await assign(),started=await start();
+    expect((await quiz(started,1,randomUUID())).body.data.passed).toBe(false);
+    const stated=new Date(Date.now()-20*60000).toISOString(),passKey=randomUUID();
+    expect((await quiz(started,0,passKey,stated)).body.data).toMatchObject({passed:true,replayed:false});
+    expect((await quiz(started,0,passKey,stated)).body.data).toMatchObject({passed:true,replayed:true});
+    const signed=await edcSign(22,subjectQuery('completion-attestation',started.id),'completion-attestation');
+    const attestation={...signed,edcEffort:{...signed.edcEffort,workStartedAt:new Date(Date.parse(signed.signedAt)-15*60000).toISOString(),startBasis:'client-work-start'}};
+    expect((await api(22).post(`/attest/${started.id}`,{signatureReceipt:attestation})).body.data).toMatchObject({attested:true,replayed:false});
+    expect((await api(22).post(`/attest/${started.id}`,{signatureReceipt:attestation})).body.data).toMatchObject({attested:true,replayed:true});
+    const verification=await edcSign(33,subjectQuery('verification',started.id),'verification');
+    expect((await api(33).post(`/verify/${started.id}`,{notes:'Synthetic signed verification',signatureReceipt:verification})).body.data).toMatchObject({verified:true,replayed:false});
+    expect((await api(33).post(`/verify/${started.id}`,{notes:'Synthetic signed verification',signatureReceipt:verification})).body.data).toMatchObject({replayed:true});
+    const rows=await efforts();
+    expect(rows.map(r=>[r.kind,r.actor_user_id,r.actor_role,r.learner_user_id,r.record_id,r.assessment_cycle_id,r.start_basis])).toEqual([
+      ['learning',22,null,22,started.id,started.assessmentCycleId,'server-cycle-start'],['learning',22,null,22,started.id,started.assessmentCycleId,'client-work-start'],
+      ['attestation',22,null,22,started.id,started.assessmentCycleId,'edc-signed-effort'],['verification',33,'monitor',22,started.id,started.assessmentCycleId,'not-supplied']]);
+    const retained=(await nativePool.query("SELECT assessment FROM acc_training_record_history WHERE event_kind='quiz_attempt' ORDER BY history_id")).rows.map(r=>r.assessment);
+    // Learning: the first attempt starts at the cycle start, the second at its stated start; each ends at its grading.
+    expect(rows[0].work_started_at.getTime()).toBeLessThanOrEqual(rows[0].ended_at.getTime());
+    expect([rows[0].ended_at.toISOString(),rows[1].work_started_at.toISOString(),rows[1].ended_at.toISOString(),rows[1].request_key]).toEqual([retained[0].assessedAt,stated,retained[1].assessedAt,passKey]);
+    // Signed decisions end at the EDC signature, keep its request key and copy, never mint, its EDC effort request.
+    expect([rows[2].work_started_at.toISOString(),rows[2].ended_at.toISOString(),rows[2].request_key,rows[2].edc_effort_request_id]).toEqual(
+      [attestation.edcEffort.workStartedAt,attestation.signedAt,attestation.requestKey,attestation.edcEffort.requestId]);
+    expect([rows[3].work_started_at,rows[3].ended_at.toISOString(),rows[3].request_key,rows[3].edc_effort_request_id]).toEqual([null,verification.signedAt,verification.requestKey,verification.edcEffort.requestId]);
+    for(const row of rows)expect(row.served).toEqual([{obligationId:obligation.id,revision:1,role:'coordinator',scope:{studyId:100,siteId:101,armId:5}}]);
+    // A second interval naming the same EDC effort request adds nothing.
+    await nativePool.query(`INSERT INTO acc_training_effort_intervals(request_key,kind,actor_user_id,learner_user_id,record_id,course_id,served,ended_at,start_basis,edc_effort_request_id)
+      VALUES($1,'attestation',22,22,$2,$3,'[]'::jsonb,NOW(),'not-supplied',$4) ON CONFLICT DO NOTHING`,[randomUUID(),started.id,courseId,attestation.edcEffort.requestId]);
+    expect(await efforts()).toHaveLength(4);
+    for(const sql of ["UPDATE acc_training_effort_intervals SET ended_at=NOW()",'DELETE FROM acc_training_effort_intervals','TRUNCATE acc_training_effort_intervals','TRUNCATE acc_training_records CASCADE'])
+      await expect(nativePool.query(sql)).rejects.toThrow('Training history is append-only');
+    // Replica mode is covered for this table with every other history table by the owned audit suite.
+    expect(await efforts()).toHaveLength(4);
+  }));
+  test('a decision rolled back after its interval was written leaves none, and with the switch off no decision writes one',async()=>{
+    await assign();const started=await start();
+    await withEffort(async()=>{
+      // The attempt's final access check fails after the interval insert: the whole attempt, interval included, rolls back.
+      let targets=0;intercept=async input=>{if(input.op==='targets'&&input.action==='records:read'&&++targets===2)throw Object.assign(new Error('Synthetic final authority outage'),{statusCode:503});};
+      expect((await quiz(started,1,randomUUID())).status).toBe(503);intercept=undefined;
+      expect(await efforts()).toEqual([]);
+      expect((await nativePool.query("SELECT count(*)::int AS n FROM acc_training_record_history WHERE event_kind='quiz_attempt'")).rows[0].n).toBe(0);
+      expect((await quiz(started,1,randomUUID())).status).toBe(200);expect(await efforts()).toHaveLength(1);
+    });
+    expect((await quiz(started,0,randomUUID())).body.data.passed).toBe(true);
+    expect((await api(33).post(`/verify/${started.id}`,{notes:'Unsigned synthetic verification'})).status).toBe(200);
+    expect(await efforts()).toHaveLength(1);
+  });
+  test('a client key reused in a new cycle, or by another person or kind, records its own interval (R11)',()=>withEffort(async()=>{
+    const row=await assign(),key=randomUUID();
+    const pass=async()=>{const started=await start();expect((await quiz(started,0,key)).body.data.passed).toBe(true);return started;};
+    const first=await pass();
+    expect((await api(33).post(`/verify/${first.id}`,{notes:'Unsigned synthetic verification'})).status).toBe(200);
+    // A course change requires retraining: a new assessment cycle of the same record, submitted with the same client key.
+    await nativePool.query("UPDATE acc_training_courses SET version='2' WHERE id=$1",[courseId]);revision++;
+    expect((await api().post(`/obligations/${row.id}/revise`,{...payload(),expectedRevision:row.revision,reason:'Amendment retraining'})).status).toBe(200);
+    const second=await pass();expect([second.id,second.assessmentCycleId===first.assessmentCycleId]).toEqual([first.id,false]);
+    // The learner's attestation and the verifier's signature use the same key as their EDC request keys.
+    expect((await api(22).post(`/attest/${second.id}`,{signatureReceipt:await edcSign(22,subjectQuery('completion-attestation',second.id),'completion-attestation',key)})).status).toBe(200);
+    expect((await api(33).post(`/verify/${second.id}`,{notes:'Signed synthetic verification',signatureReceipt:await edcSign(33,subjectQuery('verification',second.id),'verification',key)})).status).toBe(200);
+    expect((await efforts()).map(r=>[r.kind,r.actor_user_id,r.assessment_cycle_id,r.request_key===key])).toEqual([
+      ['learning',22,first.assessmentCycleId,true],['verification',33,first.assessmentCycleId,false],['learning',22,second.assessmentCycleId,true],
+      ['attestation',22,second.assessmentCycleId,true],['verification',33,second.assessmentCycleId,true]]);
+  }));
+  test('the effort observation over real rows: regimen arm hours and measured lead time, a treatment-assignment arm withheld, valid against its schema',()=>withEffort(async()=>{
+    process.env.TRAINING_DATA_CLASS='synthetic';
+    try{
+      await nativePool.query("INSERT INTO study_group VALUES(8,1,'Arm T')");
+      await assign();expect((await api().post('/obligations',payload({scope:{studyId:100,siteId:101,armId:8}}))).status).toBe(201);
+      const onboardedAt=new Date(Date.now()-3600000).toISOString();
+      effortArms=[{armId:5,classId:1,disclosureLevel:'regimen',groupStatus:null,lifecycleState:'pending',onboardedAt,onboardEventId:41},
+        {armId:8,classId:1,disclosureLevel:'treatment-assignment',groupStatus:null,lifecycleState:null,onboardedAt:null,onboardEventId:null}];
+      const started=await start();
+      expect((await quiz(started,0,randomUUID(),new Date(Date.now()-30*60000).toISOString())).body.data.passed).toBe(true);
+      expect((await request(app).post(`/api/training/verify/${started.id}`).set('Authorization',`Bearer ${token(33)}`).set('X-Work-Started-At',new Date(Date.now()-5*60000).toISOString())
+        .send({notes:'Synthetic independent verification'})).status).toBe(200);
+      const requestBody={schemaVersion:'training-effort-observation-request/1',requestId:randomUUID(),installationId:'synthetic-installation',scope:{studyId:100}};
+      expect(conforms('training-effort-observation-request/1',requestBody)).toBe('valid');
+      const observed=await request(app).post('/api/training/effort-source/observe').set('x-api-key',EFFORT_KEY).send(requestBody);
+      expect([observed.status,observed.headers['cache-control']]).toEqual([200,'no-store']);
+      const receipt=observed.body.data,doc=receipt.data;
+      expect(receipt).toMatchObject({schemaVersion:'TrainingEffortServiceObservationV1@1.0.0',requestId:requestBody.requestId,requestHash:trainingDutyHash(requestBody),scope:{studyId:100},
+        authority:{apiKeyId:7,serviceUserId:99,authorityHash:'d'.repeat(64)},consistency:'current-observations-not-atomic',externalDeliveryConfirmed:false});
+      expect(conforms('TrainingEffortSourceV1@1.0.0',doc)).toBe('valid');
+      const rows=await efforts(),verifiedAt:Date=(await nativePool.query('SELECT verified_at FROM acc_training_records WHERE id=$1',[started.id])).rows[0].verified_at;
+      const hours=(row:any)=>Math.round((row.ended_at.getTime()-row.work_started_at.getTime())/3600000*1000)/1000;
+      const hoursRow=(level:string,armId:number|null,kind:string,role:string,row:any)=>({level,armId,role,roleBasis:kind==='verification'?'actor-platform-role':'obligation-role',kind,
+        hours:hours(row),intervals:1,unknownIntervals:0,actors:1,disclosure:level==='platform'?'platform':'regimen-or-cohort'});
+      expect(rows.map(r=>[r.kind,r.start_basis,r.served.map((s:any)=>s.scope.armId)])).toEqual([['learning','client-work-start',[5,8]],['verification','client-work-start',[5,8]]]);
+      // The interval served both arms: arm 5 (regimen) gets its rows, arm 8 (treatment-assignment) none.
+      expect(doc.hours).toEqual([hoursRow('platform',null,'learning','coordinator',rows[0]),hoursRow('platform',null,'verification','monitor',rows[1]),
+        hoursRow('arm',5,'learning','coordinator',rows[0]),hoursRow('arm',5,'verification','monitor',rows[1])]);
+      expect(doc.arms).toEqual([
+        {armId:5,disclosureLevel:'regimen',onboardedAt,onboardEventId:41,leadTime:{status:'measured',days:Math.round((verifiedAt.getTime()-Date.parse(onboardedAt))/86400000*1000)/1000,
+          startedAt:onboardedAt,trainedAt:verifiedAt.toISOString(),obligations:{assigned:1,complete:1},learners:1,sites:1,trainedBeforeOnboarding:false,reason:null}},
+        {armId:8,disclosureLevel:'treatment-assignment',onboardedAt:null,onboardEventId:null,leadTime:{status:'withheld',days:null,startedAt:null,trainedAt:null,obligations:null,
+          learners:null,sites:null,trainedBeforeOnboarding:null,reason:'per-arm values are given only for arms whose class is declared regimen or cohort'}}]);
+      expect([doc.dataClass,doc.counts,doc.limitations[0].startsWith('SYNTHETIC ENGINEERING STUDY. NOT A REAL TRIAL.')]).toEqual(['synthetic',{intervals:2,throughIntervalId:Number(rows[1].id)},true]);
+      const {asOf:_asOf,sourceHash,...body}=doc;expect(sourceHash).toBe(trainingDutyHash(body));
+      expect(JSON.stringify(doc)).not.toMatch(/"(userId|learnerUserId|actorUserId|obligationId|recordId)"/);
+      // Opt-in: keep these exact response bytes, synthetic, for the Command Center register lane (T-4/cc).
+      const out=process.env['TRAINING_EFFORT_SOURCE_FIXTURE_OUT'];
+      if(out){fs.mkdirSync(out,{recursive:true});fs.writeFileSync(path.join(out,'training-effort-source-v1.synthetic.json'),observed.text);
+        fs.writeFileSync(path.join(out,'training-effort-source-v1.synthetic.provenance.json'),`${JSON.stringify({note:'SYNTHETIC ENGINEERING STUDY. NOT A REAL TRIAL.',
+          producer:'accura-training-module',producerHead:process.env['TRAINING_EFFORT_SOURCE_FIXTURE_HEAD']??null,route:'POST /api/training/effort-source/observe',
+          test:'tests/integration/training-obligations.postgres.test.ts',case:expect.getState().currentTestName,generatedAt:new Date().toISOString(),
+          bytes:Buffer.byteLength(observed.text),sha256:createHash('sha256').update(observed.text).digest('hex'),
+          contract:'TrainingEffortServiceObservationV1@1.0.0 with data TrainingEffortSourceV1@1.0.0',edcCensus:'synthetic stand-in for resolve-due op arms'},null,2)}\n`);}
+    }finally{delete process.env.TRAINING_DATA_CLASS;}
+  }));
 });
