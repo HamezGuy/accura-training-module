@@ -20,11 +20,20 @@ export const PUBLIC_RATE_LIMIT = { windowMs: 15 * 60 * 1000, max: 200 } as const
  * 200-request budget and refused clinical saves after about 100 (EDC defect D-EDC-7), so they have their own,
  * higher per-address bucket: TRAINING_DUTY_READINESS_RATE_LIMIT requests per 15 minutes (default 6000). */
 export const DUTY_READINESS_PATH = '/api/training/duty-readiness';
-export function dutyReadinessRateLimit(): number {
-  const raw = process.env['TRAINING_DUTY_READINESS_RATE_LIMIT'];
-  const value = raw === undefined || raw === '' ? 6000 : Number(raw);
-  if (!Number.isSafeInteger(value) || value < 1 || value > 1000000) throw new Error('TRAINING_DUTY_READINESS_RATE_LIMIT must be an integer from 1 to 1000000.');
+/** Requests per 15 minutes from the named setting; unset or empty keeps the default. Invalid refuses startup. */
+function rateLimitSetting(name: string, fallback: number): number {
+  const raw = process.env[name];
+  const value = raw === undefined || raw === '' ? fallback : Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1 || value > 1000000) throw new Error(`${name} must be an integer from 1 to 1000000.`);
   return value;
+}
+export function dutyReadinessRateLimit(): number {
+  return rateLimitSetting('TRAINING_DUTY_READINESS_RATE_LIMIT', 6000);
+}
+/** Test stacks only: a synthetic run that drives many learners through the EDC proxy (one client address) may raise
+ * the public bucket with TRAINING_PUBLIC_RATE_LIMIT. Unset, it stays PUBLIC_RATE_LIMIT.max (200). */
+export function publicRateLimit(): number {
+  return rateLimitSetting('TRAINING_PUBLIC_RATE_LIMIT', PUBLIC_RATE_LIMIT.max);
 }
 
 /** Build the HTTP application without starting runtime resources. */
@@ -34,7 +43,7 @@ export function createApp(): express.Express {
   application.use(cors({ origin: config.cors.origin, credentials: true }));
   application.use(express.json({ limit: '1mb' }));
   const dutyReadiness = (req: express.Request) => req.method === 'POST' && req.path === DUTY_READINESS_PATH;
-  application.use(rateLimit({ ...PUBLIC_RATE_LIMIT, standardHeaders: true, legacyHeaders: false, skip: dutyReadiness }));
+  application.use(rateLimit({ ...PUBLIC_RATE_LIMIT, max: publicRateLimit(), standardHeaders: true, legacyHeaders: false, skip: dutyReadiness }));
   application.use(rateLimit({ windowMs: PUBLIC_RATE_LIMIT.windowMs, max: dutyReadinessRateLimit(), standardHeaders: true, legacyHeaders: false,
     skip: req => !dutyReadiness(req) }));
   // Liveness only; dependency and native workflow qualification is separate.
