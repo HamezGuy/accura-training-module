@@ -300,3 +300,14 @@ export interface TrainingSignatureBinding {
 }
 /** A cited signature in training-duty-readiness/2; the EDC re-hashes the subject against its own signature row. */
 export interface TrainingSignatureReference { signatureId: number; subjectHash: string; subject: TrainingSignatureSubject }
+
+/** Training effort intervals (T-4, src/services/training-effort.service.ts): one per graded quiz attempt, completion
+ * attestation and verification, recorded only while TRAINING_EFFORT_LEDGER_ENABLED=true. */
+export type TrainingEffortKind = 'learning' | 'attestation' | 'verification';
+export type TrainingEffortStartBasis = 'client-work-start' | 'server-cycle-start' | 'edc-signed-effort' | 'not-supplied';
+/** What a decision route passes to the service: the X-Work-Started-At the EDC proxy forwarded (unchecked here; the
+ * effort service applies the EDC rule) and the actor's current platform role from the authenticated identity. */
+export interface TrainingEffortInput { workStartedAt?: string; actorRole?: string }
+/** One of the learner's assigned obligations for the course at capture; it attributes the interval to its study,
+ * site, arm and role. */
+export interface TrainingEffortServed { obligationId: number; revision: number; role: string; scope: TrainingObligationScope }

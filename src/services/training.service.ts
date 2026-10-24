@@ -7,6 +7,7 @@ import { getObligations } from './training-obligations.service';
 import { authorizeTrainingTargets, readTrainingDirectory, revalidateTrainingDirectory, resolveObligationScope, resolveSignature, TrainingAuthorityContext } from './training-authority.service';
 import {assertMaterialUse,materialCourseVisible} from './training-materials.service';
 import {bindingFor,bindingStatus,bindSignatureReceipt,checkSignedDecision,readSignatureReceipt,recordDecisionSubject,signatureAuditDetails,signatureBindings,signatureContext} from './training-signatures.service';
+import {recordEffortInterval} from './training-effort.service';
 import {randomUUID} from 'node:crypto';
 import {assessmentContentHash,assessmentReference,assessmentRequestHash,assertStartedContent,canonicalAnswers,gradeAssessment,sealAssessment,validateSubmission,verifyAssessmentRows,verifyRecordAssessment,AssessmentHistoryRow} from './training-assessment-evidence';
 import {
@@ -24,6 +25,7 @@ import {
   CreateQuestionRequest,
   TrainingRecordSignatureDecision,
   TrainingSignatureContext,
+  TrainingEffortInput,
 } from '../types/training.types';
 
 const database: TransactionClient = { query, queryOne };
@@ -341,9 +343,9 @@ export async function startTraining(userId: number, courseId: number, client?: T
 export async function submitQuiz(
   userId:number, courseId:number, answers:TrainingQuizAnswer[], client?:TransactionClient,
   expectedRevision?:number, authority?:TrainingAuthorityContext, submission?:TrainingQuizSubmission,
-  auditContext?:{ipAddress?:string;userAgent?:string}
+  auditContext?:{ipAddress?:string;userAgent?:string}, effort?:TrainingEffortInput
 ):Promise<TrainingQuizResult> {
-  if(!client)return transaction(tx=>submitQuiz(userId,courseId,answers,tx,expectedRevision,authority,submission,auditContext));
+  if(!client)return transaction(tx=>submitQuiz(userId,courseId,answers,tx,expectedRevision,authority,submission,auditContext,effort));
   requireUserId(userId);requireUserId(courseId);validateSubmission(submission);
   // PostgreSQL UUID identity is case-insensitive; keep request meaning and
   // retained-key comparisons identical to its canonical representation.
@@ -394,6 +396,11 @@ export async function submitQuiz(
     VALUES($1,$2,$3,$4::jsonb,'quiz_attempt',$5,$6,$7,$8::jsonb)`,[record.id,userId,courseId,JSON.stringify(updated),submission.cycleId,submission.requestId,requestHash,JSON.stringify(receipt)]);
   await logAudit({userId,action:result.passed?'quiz_passed':'quiz_failed',recordId:record.id,courseId,
     details:{contentRevision:expectedRevision,score:result.score,passed:result.passed,totalQuestions:result.totalQuestions,assessment:assessmentReference(receipt)},...auditContext},client);
+  // T-4: the attempt's learning interval in this transaction (nothing unless TRAINING_EFFORT_LEDGER_ENABLED=true).
+  // A replay returned above and records none.
+  await recordEffortInterval(client,{kind:'learning',actorUserId:userId,learnerUserId:userId,recordId:record.id,courseId,assessmentCycleId:submission.cycleId,
+    requestKey:submission.requestId,input:effort,endedAt:assessedAt,served:obligations,
+    cycle:{startedAt:record.startedAt,previousAssessedAt:history.filter(row=>row.eventKind==='quiz_attempt').at(-1)?.assessment?.assessedAt??null}});
   await verifyRecordAssessment(client,updated);
   for(const assignment of assignments){const current=await resolveObligationScope(authority,'obligations:read',userId,assignment.obligation.scope,assignment.observation);
     if(!current.eligible||!current.roles.includes(assignment.obligation.role))throw Object.assign(new Error('Learner assignment changed during assessment'),{statusCode:409});}
@@ -408,7 +415,7 @@ export async function verifyTraining(
   authority: TrainingAuthorityContext,
   notes?: string,
   client: TransactionClient = database,
-  options: { signatureReceipt?: unknown; auditContext?: { ipAddress?: string; userAgent?: string } } = {}
+  options: { signatureReceipt?: unknown; auditContext?: { ipAddress?: string; userAgent?: string }; effort?: TrainingEffortInput } = {}
 ): Promise<{ verified: boolean; replayed?: boolean; signature?: { signatureId: number; subjectHash: string; signedAt: string } }> {
   if (!Number.isSafeInteger(recordId) || recordId < 1) {
     throw Object.assign(new Error('An exact positive training record ID is required'), { statusCode: 400 });
@@ -486,9 +493,13 @@ export async function verifyTraining(
   await logAudit({ userId: authority.actorUserId, action: 'training_verified', recordId, courseId: record.courseId,
     details: { notes, courseId: record.courseId, courseVersion: record.courseVersion ?? null, contentRevision: record.contentRevision ?? null,
       assessmentCycleId: record.assessmentCycleId ?? null }, ...options.auditContext }, client);
-  if (!bound) return { verified: true };
-  if (!bound.replayed) await logAudit({ userId: authority.actorUserId, action: 'training_signature_bound', recordId, courseId: record.courseId,
+  if (bound && !bound.replayed) await logAudit({ userId: authority.actorUserId, action: 'training_signature_bound', recordId, courseId: record.courseId,
     details: signatureAuditDetails(bound.binding), ...options.auditContext }, client);
+  // T-4: the verifier's interval in this transaction (nothing unless TRAINING_EFFORT_LEDGER_ENABLED=true): signed, it
+  // ends at the EDC signature and takes the receipt's effort; unsigned, it ends now and takes the stated start.
+  if (!bound?.replayed) await recordEffortInterval(client, { kind: 'verification', actorUserId: authority.actorUserId, learnerUserId: record.userId,
+    recordId: record.id, courseId: record.courseId, assessmentCycleId: record.assessmentCycleId ?? null, receipt, input: options.effort });
+  if (!bound) return { verified: true };
   return { verified: true, replayed: bound.replayed, signature: { signatureId: bound.binding.signatureId, subjectHash: bound.binding.subjectHash, signedAt: bound.binding.signedAt } };
 }
 
@@ -558,7 +569,7 @@ export async function readRecordSignatureSubject(authority: TrainingAuthorityCon
 /** The learner's Part 11 completion attestation (POST /attest/:recordId, receipt required). It changes no record
  * field: the decision is the append-only binding and its audit row. */
 export async function attestTraining(recordId: number, authority: TrainingAuthorityContext, value: unknown,
-  auditContext: { ipAddress?: string; userAgent?: string } = {}) {
+  auditContext: { ipAddress?: string; userAgent?: string } = {}, effort?: TrainingEffortInput) {
   requireRecordId(recordId);
   const receipt = readSignatureReceipt(value);
   const admission = await authorizeTrainingTargets(authority, 'records:read', [authority.actorUserId]);
@@ -578,6 +589,10 @@ export async function attestTraining(recordId: number, authority: TrainingAuthor
     if (!bound.replayed) await logAudit({ userId: authority.actorUserId, action: 'training_completion_attested', recordId: record.id, courseId: record.courseId,
       details: { ...signatureAuditDetails(bound.binding), courseVersion: record.courseVersion, contentRevision: record.contentRevision, assessmentCycleId: record.assessmentCycleId },
       ...auditContext }, client);
+    // T-4: the learner's attestation interval, ending at the EDC signature with the receipt's effort (nothing unless
+    // TRAINING_EFFORT_LEDGER_ENABLED=true); the same receipt again replays and records none.
+    if (!bound.replayed) await recordEffortInterval(client, { kind: 'attestation', actorUserId: record.userId, learnerUserId: record.userId, recordId: record.id,
+      courseId: record.courseId, assessmentCycleId: record.assessmentCycleId ?? null, receipt, input: effort });
     const current = await authorizeTrainingTargets(authority, 'records:read', [authority.actorUserId], { scopeFingerprint: admission.scopeFingerprint });
     if (!current.decisions[0]?.allowed) throw Object.assign(new Error('Training access changed during the request'), { statusCode: 409 });
     return { attested: true, replayed: bound.replayed, signature: { signatureId: bound.binding.signatureId, subjectHash: bound.binding.subjectHash, signedAt: bound.binding.signedAt } };

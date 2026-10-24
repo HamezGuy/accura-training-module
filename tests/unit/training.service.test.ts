@@ -168,7 +168,8 @@ describe('TrainingService', () => {
       mockQueryOne.mockResolvedValue(null);
       await expect(trainingService.submitQuiz(1,999,[],undefined,1,learner,submission)).rejects.toMatchObject({statusCode:404});
     });
-    it('grades the retained snapshot and writes receipt and audit in the same transaction',async()=>{
+    /** A started retained cycle of a two-question course; the mocks keep every history row the service writes. */
+    function retainedQuiz(){
       const course:any={id:1,courseCode:'GCP-101',passingScore:80,validityPeriodDays:365,version:'1',contentRevision:1,active:true};
       const questions:any[]=[{id:1,courseId:1,options:[{text:'A',isCorrect:true},{text:'B',isCorrect:false}],questionType:'multiple_choice',questionText:'Q1',orderIndex:1},
         {id:2,courseId:1,options:[{text:'True',isCorrect:true},{text:'False',isCorrect:false}],questionType:'true_false',questionText:'Q2',orderIndex:2}];
@@ -187,6 +188,11 @@ describe('TrainingService', () => {
         if(sql.startsWith('INSERT INTO acc_training_record_history'))history.push({recordId:10,userId:1,courseId:1,recordSnapshot:JSON.parse(values[3]),eventKind:'quiz_attempt',assessmentCycleId:values[4],requestKey:values[5],requestHash:values[6],assessment:JSON.parse(values[7])});
         return {rows:[]};
       });
+      return {history};
+    }
+    const effortRows=()=>mockQuery.mock.calls.filter(([sql])=>String(sql).startsWith('INSERT INTO acc_training_effort_intervals'));
+    it('grades the retained snapshot and writes receipt and audit in the same transaction',async()=>{
+      const {history}=retainedQuiz();
       const result=await trainingService.submitQuiz(1,1,[{questionId:1,selectedOptions:[0]},{questionId:2,selectedOptions:[0]}],undefined,1,learner,submission);
       expect(result).toMatchObject({passed:true,score:100,replayed:false,receipt:{cycleId,attemptNumber:1}});
       expect(history[1].assessment.answers).toEqual([{questionId:1,selectedOptions:[0]},{questionId:2,selectedOptions:[0]}]);
@@ -194,6 +200,24 @@ describe('TrainingService', () => {
       const again=await trainingService.submitQuiz(1,1,[{questionId:2,selectedOptions:[0]},{questionId:1,selectedOptions:[0]}],undefined,1,learner,submission);
       expect(again).toMatchObject({replayed:true,receipt:result.receipt});expect(history).toHaveLength(2);
       expect(mockQuery.mock.calls.filter(([sql])=>sql.includes('INSERT INTO acc_training_audit_log'))).toHaveLength(1);
+      // The effort ledger is off unless switched on: no interval is written.
+      expect(effortRows()).toHaveLength(0);
+    });
+    it('with the effort ledger on, an attempt writes one learning interval in its transaction and a replay none (T-4)',async()=>{
+      process.env.TRAINING_EFFORT_LEDGER_ENABLED='true';
+      try{
+        const {history}=retainedQuiz(),stated=new Date(Date.now()-30*60000).toISOString(),answers=[{questionId:1,selectedOptions:[0]},{questionId:2,selectedOptions:[1]}];
+        expect(await trainingService.submitQuiz(1,1,answers,undefined,1,learner,submission,undefined,{workStartedAt:stated,actorRole:'coordinator'})).toMatchObject({passed:false,replayed:false});
+        expect(effortRows()).toHaveLength(1);
+        const values=effortRows()[0][1] as unknown[];
+        expect(values.slice(0,8)).toEqual([requestId,'learning',1,null,1,10,1,cycleId]);
+        expect(values.slice(9)).toEqual([stated,history[1].assessment.assessedAt,'client-work-start',null]);
+        // The audit row precedes the interval in the same transaction; a replay writes neither again.
+        const order=mockQuery.mock.calls.map(([sql])=>String(sql)).filter(sql=>/INSERT INTO acc_training_(audit_log|effort_intervals)/.test(sql)).map(sql=>sql.includes('audit_log')?'audit':'effort');
+        expect(order).toEqual(['audit','effort']);
+        expect(await trainingService.submitQuiz(1,1,answers,undefined,1,learner,submission,undefined,{workStartedAt:stated})).toMatchObject({replayed:true});
+        expect(effortRows()).toHaveLength(1);
+      }finally{delete process.env.TRAINING_EFFORT_LEDGER_ENABLED;}
     });
   });
 
@@ -229,6 +253,21 @@ describe('TrainingService', () => {
       const result = await trainingService.verifyTraining(1, authority, 'Verified during audit');
 
       expect(result.verified).toBe(true);
+    });
+
+    it('with the effort ledger on, records the verifier interval with the platform role and stated start (T-4)', async () => {
+      process.env.TRAINING_EFFORT_LEDGER_ENABLED = 'true';
+      try {
+        mockQueryOne.mockResolvedValueOnce({userId:3,courseId:4}).mockResolvedValueOnce({version:'1',contentRevision:1}).mockResolvedValueOnce({ id: 1, userId: 3, courseId: 4, status: 'completed',courseVersion:'1',contentRevision:1,expirationDate:null });
+        mockQuery.mockImplementation(async (sql: string) => ({ rows: sql.startsWith('SELECT id,revision,role,scope') ? [{ id: 8, revision: 1, role: 'coordinator', scope: { studyId: 100, siteId: 101 } }] : [], rowCount: 1 }));
+        const stated = new Date(Date.now() - 20 * 60000).toISOString();
+        expect(await trainingService.verifyTraining(1, authority, 'Verified during audit', undefined, { effort: { workStartedAt: stated, actorRole: 'monitor' } })).toEqual({ verified: true });
+        const effort = mockQuery.mock.calls.filter(([sql]) => String(sql).startsWith('INSERT INTO acc_training_effort_intervals'));
+        expect(effort).toHaveLength(1);
+        const values = effort[0][1] as unknown[];
+        expect(values.slice(1, 9)).toEqual(['verification', 2, 'monitor', 3, 1, 4, null, JSON.stringify([{ obligationId: 8, revision: 1, role: 'coordinator', scope: { studyId: 100, siteId: 101 } }])]);
+        expect([values[9], values[11], values[12]]).toEqual([stated, 'client-work-start', null]);
+      } finally { delete process.env.TRAINING_EFFORT_LEDGER_ENABLED; }
     });
   });
 

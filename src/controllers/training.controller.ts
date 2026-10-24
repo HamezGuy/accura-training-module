@@ -12,7 +12,14 @@ import {
   TrainingComplianceStatus,
   TrainingComplianceCheck,
   TrainingQuizQuestion,
+  TrainingEffortInput,
 } from '../types/training.types';
+
+/** T-4 effort input of a training decision: the work start the EDC proxy forwards as X-Work-Started-At (the effort
+ * service applies the EDC rule to it) and the actor's current platform role from the authenticated identity. */
+function effortInput(req: AuthRequest): TrainingEffortInput {
+  return { workStartedAt: req.get('x-work-started-at'), actorRole: req.user!.role };
+}
 
 // ============================================================================
 // Course Endpoints
@@ -165,7 +172,7 @@ export async function submitQuiz(req: AuthRequest, res: Response): Promise<void>
   const result = await transaction(async (client) => {
     const submitted = await trainingService.submitQuiz(userId, courseId, answers, client, req.body.contentRevision,req.trainingAuthority!,
       {recordId:req.body.recordId,cycleId:req.body.cycleId,requestId:req.body.requestId},
-      {ipAddress:req.ip,userAgent:req.headers['user-agent']});
+      {ipAddress:req.ip,userAgent:req.headers['user-agent']},effortInput(req));
     return submitted;
   });
 
@@ -190,7 +197,7 @@ export async function verifyTraining(req: AuthRequest, res: Response): Promise<v
 
   // The service writes the verification audit (and a signature binding's) in this transaction.
   const result = await transaction((client) => trainingService.verifyTraining(recordId, req.trainingAuthority!, notes, client,
-    { signatureReceipt, auditContext: { ipAddress: req.ip, userAgent: req.headers['user-agent'] } }));
+    { signatureReceipt, auditContext: { ipAddress: req.ip, userAgent: req.headers['user-agent'] }, effort: effortInput(req) }));
 
   res.json({ success: true, data: result });
 }
@@ -202,7 +209,7 @@ export async function verifyTraining(req: AuthRequest, res: Response): Promise<v
 export async function attestTraining(req: AuthRequest, res: Response): Promise<void> {
   const recordId = exactPositiveId(req.params['recordId'], 'training record ID')!;
   const result = await trainingService.attestTraining(recordId, req.trainingAuthority!, req.body.signatureReceipt,
-    { ipAddress: req.ip, userAgent: req.headers['user-agent'] });
+    { ipAddress: req.ip, userAgent: req.headers['user-agent'] }, effortInput(req));
   res.json({ success: true, data: result });
 }
 

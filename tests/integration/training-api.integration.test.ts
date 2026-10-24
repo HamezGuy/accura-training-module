@@ -483,7 +483,7 @@ describe('Training API Integration', () => {
       const unsigned = await request(app).post('/api/training/verify/5').set('Authorization', bearer('monitor')).send({ notes: 'Synthetic' });
       expect(unsigned.body.data).toEqual({ verified: true });
       expect(mockVerifyTraining).toHaveBeenLastCalledWith(5, expect.objectContaining({ actorUserId: 1 }), 'Synthetic', expect.anything(),
-        { signatureReceipt: undefined, auditContext: { ipAddress: expect.any(String), userAgent: undefined } });
+        { signatureReceipt: undefined, auditContext: { ipAddress: expect.any(String), userAgent: undefined }, effort: { workStartedAt: undefined, actorRole: 'monitor' } });
       await request(app).post('/api/training/verify/5').set('Authorization', bearer('monitor')).send({ notes: 'Synthetic', signatureReceipt: receipt });
       expect(mockVerifyTraining.mock.calls.at(-1)![4].signatureReceipt).toEqual(receipt);
     });
@@ -500,7 +500,8 @@ describe('Training API Integration', () => {
       const attested = await request(app).post('/api/training/attest/5').set('Authorization', bearer('coordinator')).send({ signatureReceipt: receipt });
       expect(attested.status).toBe(200);
       expect(attested.body.data).toEqual({ attested: true, replayed: false, signature: { signatureId: 501 } });
-      expect(mockAttestTraining).toHaveBeenCalledWith(5, expect.objectContaining({ actorUserId: 1 }), receipt, expect.objectContaining({ ipAddress: expect.any(String) }));
+      expect(mockAttestTraining).toHaveBeenCalledWith(5, expect.objectContaining({ actorUserId: 1 }), receipt, expect.objectContaining({ ipAddress: expect.any(String) }),
+        { workStartedAt: undefined, actorRole: 'coordinator' });
     });
     test('only verifier roles sign a recorded verification, and only training managers sign material approval', async () => {
       expect((await request(app).post('/api/training/verify/5/signature').set('Authorization', bearer('coordinator')).send({ signatureReceipt: receipt })).status).toBe(403);
@@ -532,6 +533,26 @@ describe('Training API Integration', () => {
     ])('refuses %s before any service', async (_name, query, role, status) => {
       expect((await request(app).get(`/api/training/signature-subject?${query}`).set('Authorization', bearer(role))).status).toBe(status);
       expect(mockReadRecordSignatureSubject).not.toHaveBeenCalled();
+    });
+  });
+  describe('T-4 effort input of the three effort decisions', () => {
+    const bearer = (role = 'admin') => `Bearer ${generateToken({ role })}`;
+    const stated = '2026-10-24T09:10:00.000Z';
+    test('the forwarded X-Work-Started-At and the authenticated platform role reach the service unchanged; the body field never does', async () => {
+      mockSubmitQuiz.mockResolvedValue({ passed: true, score: 100, totalQuestions: 1, correctAnswers: 1 });
+      const quiz = { recordId: 1, cycleId: '11111111-1111-4111-8111-111111111111', requestId: '22222222-2222-4222-8222-222222222222', contentRevision: 1,
+        answers: [{ questionId: 1, selectedOptions: [0] }] };
+      expect((await request(app).post('/api/training/submit-quiz/1').set('Authorization', bearer('coordinator')).set('X-Work-Started-At', stated)
+        .send({ ...quiz, workStartedAt: '2026-10-24T01:00:00.000Z' })).status).toBe(200);
+      expect(mockSubmitQuiz.mock.calls.at(-1)![8]).toEqual({ workStartedAt: stated, actorRole: 'coordinator' });
+      mockVerifyTraining.mockResolvedValue({ verified: true });
+      await request(app).post('/api/training/verify/5').set('Authorization', bearer('investigator')).set('X-Work-Started-At', stated).send({ notes: 'Synthetic' });
+      expect(mockVerifyTraining.mock.calls.at(-1)![4].effort).toEqual({ workStartedAt: stated, actorRole: 'investigator' });
+      mockAttestTraining.mockResolvedValue({ attested: true, replayed: false });
+      await request(app).post('/api/training/attest/5').set('Authorization', bearer('coordinator')).set('X-Work-Started-At', 'not an instant')
+        .send({ signatureReceipt: { schemaVersion: 'training-signature-receipt/1' } });
+      // The service applies the EDC rule; an unusable value is passed as stated and falls through there, never refused here.
+      expect(mockAttestTraining.mock.calls.at(-1)![4]).toEqual({ workStartedAt: 'not an instant', actorRole: 'coordinator' });
     });
   });
 });
