@@ -249,7 +249,50 @@ const MIGRATIONS: string[] = [
    action TEXT NOT NULL,snapshot JSONB NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(draft_id,revision))`,
   `DROP TRIGGER IF EXISTS acc_training_material_event_guard ON acc_training_material_events`,
   `CREATE TRIGGER acc_training_material_event_guard BEFORE UPDATE OR DELETE ON acc_training_material_events FOR EACH ROW EXECUTE FUNCTION acc_training_immutable_history()`,
+  // The audit log is append-only like the training history: the service only
+  // inserts it, some transitions (scheduled expiry) are recorded nowhere else,
+  // and an inspection copy hashes its rows only when it is captured.
+  `DROP TRIGGER IF EXISTS acc_training_audit_log_guard ON acc_training_audit_log`,
+  `CREATE TRIGGER acc_training_audit_log_guard BEFORE UPDATE OR DELETE ON acc_training_audit_log
+    FOR EACH ROW EXECUTE FUNCTION acc_training_immutable_history()`,
+  // A row guard never sees TRUNCATE, including a TRUNCATE ... CASCADE that
+  // reaches a history table through a foreign key; a statement guard does.
+  `DROP TRIGGER IF EXISTS acc_training_audit_log_truncate_guard ON acc_training_audit_log`,
+  `CREATE TRIGGER acc_training_audit_log_truncate_guard BEFORE TRUNCATE ON acc_training_audit_log
+    FOR EACH STATEMENT EXECUTE FUNCTION acc_training_immutable_history()`,
+  `DROP TRIGGER IF EXISTS acc_training_obligation_events_truncate_guard ON acc_training_obligation_events`,
+  `CREATE TRIGGER acc_training_obligation_events_truncate_guard BEFORE TRUNCATE ON acc_training_obligation_events
+    FOR EACH STATEMENT EXECUTE FUNCTION acc_training_immutable_history()`,
+  `DROP TRIGGER IF EXISTS acc_training_impact_events_truncate_guard ON acc_training_impact_events`,
+  `CREATE TRIGGER acc_training_impact_events_truncate_guard BEFORE TRUNCATE ON acc_training_impact_events
+    FOR EACH STATEMENT EXECUTE FUNCTION acc_training_immutable_history()`,
+  `DROP TRIGGER IF EXISTS acc_training_material_publications_truncate_guard ON acc_training_material_publications`,
+  `CREATE TRIGGER acc_training_material_publications_truncate_guard BEFORE TRUNCATE ON acc_training_material_publications
+    FOR EACH STATEMENT EXECUTE FUNCTION acc_training_immutable_history()`,
+  `DROP TRIGGER IF EXISTS acc_training_material_events_truncate_guard ON acc_training_material_events`,
+  `CREATE TRIGGER acc_training_material_events_truncate_guard BEFORE TRUNCATE ON acc_training_material_events
+    FOR EACH STATEMENT EXECUTE FUNCTION acc_training_immutable_history()`,
+  // session_replication_role = replica silences every trigger left in the
+  // default (origin) state. Each CREATE above re-creates its guard in that
+  // state at every startup, so these follow the last CREATE of every guard.
+  `ALTER TABLE acc_training_obligation_events ENABLE ALWAYS TRIGGER acc_training_obligation_history_guard`,
+  `ALTER TABLE acc_training_record_history ENABLE ALWAYS TRIGGER acc_training_record_history_guard`,
+  `ALTER TABLE acc_training_record_history ENABLE ALWAYS TRIGGER acc_training_record_history_truncate_guard`,
+  `ALTER TABLE acc_training_impact_plans ENABLE ALWAYS TRIGGER acc_training_impact_source_guard`,
+  `ALTER TABLE acc_training_impact_events ENABLE ALWAYS TRIGGER acc_training_impact_history_guard`,
+  `ALTER TABLE acc_training_material_drafts ENABLE ALWAYS TRIGGER acc_training_material_draft_guard`,
+  `ALTER TABLE acc_training_material_publications ENABLE ALWAYS TRIGGER acc_training_material_publication_guard`,
+  `ALTER TABLE acc_training_material_events ENABLE ALWAYS TRIGGER acc_training_material_event_guard`,
+  `ALTER TABLE acc_training_audit_log ENABLE ALWAYS TRIGGER acc_training_audit_log_guard`,
+  `ALTER TABLE acc_training_audit_log ENABLE ALWAYS TRIGGER acc_training_audit_log_truncate_guard`,
+  `ALTER TABLE acc_training_obligation_events ENABLE ALWAYS TRIGGER acc_training_obligation_events_truncate_guard`,
+  `ALTER TABLE acc_training_impact_events ENABLE ALWAYS TRIGGER acc_training_impact_events_truncate_guard`,
+  `ALTER TABLE acc_training_material_publications ENABLE ALWAYS TRIGGER acc_training_material_publications_truncate_guard`,
+  `ALTER TABLE acc_training_material_events ENABLE ALWAYS TRIGGER acc_training_material_events_truncate_guard`,
 ];
+
+/** The ordered startup statements, read-only, for offline guard checks. */
+export const TRAINING_MIGRATION_STATEMENTS: readonly string[] = Object.freeze([...MIGRATIONS]);
 
 export async function runMigrations(): Promise<void> {
   logger.info('Running training module migrations...');

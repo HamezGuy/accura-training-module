@@ -444,4 +444,47 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
     expect((await fixturePool.query('SELECT content_revision FROM acc_training_courses WHERE id=$1',[courseId])).rows[0].content_revision).toBe(before+12);
   });
 
+  // Statement guards fire whether or not a table holds rows; the log and record history hold real ones here.
+  const historyTables = ['acc_training_audit_log', 'acc_training_obligation_events', 'acc_training_record_history',
+    'acc_training_impact_events', 'acc_training_material_publications', 'acc_training_material_events'];
+  const tamper = (id: number) => [`UPDATE acc_training_audit_log SET action='tampered' WHERE id=${id}`, `DELETE FROM acc_training_audit_log WHERE id=${id}`];
+
+  test('the audit log refuses UPDATE, DELETE and TRUNCATE and every history table refuses TRUNCATE, also by cascade', async () => {
+    expect((await send('start')).status).toBe(200);
+    const before = await snapshot(), audit = before['acc_training_audit_log'] as Array<{ id: number }>;
+    expect(audit).toHaveLength(1);
+    for (const sql of [...tamper(audit[0].id), ...historyTables.map(table => `TRUNCATE ${table}`), 'TRUNCATE acc_training_courses CASCADE']) {
+      await expect(fixturePool.query(sql)).rejects.toThrow('Training history is append-only');
+    }
+    expect(await snapshot()).toEqual(before);
+    // A further startup re-creates every guard; each must end in the ALWAYS state replica mode cannot silence.
+    await runMigrations();
+    const guards = (await fixturePool.query(`SELECT c.relname, t.tgname, t.tgenabled FROM pg_trigger t
+      JOIN pg_class c ON c.oid = t.tgrelid WHERE NOT t.tgisinternal AND t.tgname ~ '^acc_training_.*_guard$' ORDER BY 1, 2`)).rows;
+    expect(guards).toHaveLength(14);
+    expect(guards.filter(guard => guard.tgenabled !== 'A')).toEqual([]);
+  });
+
+  test('session_replication_role = replica cannot silence the audit and history guards', async () => {
+    expect((await send('start')).status).toBe(200);
+    const before = await snapshot(), audit = before['acc_training_audit_log'] as Array<{ id: number }>;
+    const client = await fixturePool.connect();
+    try {
+      try { await client.query('SET session_replication_role = replica'); }
+      catch (error) {
+        // Entering replica mode needs a superuser (or, from PostgreSQL 15, SET on the parameter).
+        console.warn('SKIPPED replica-mode guard case: the owned role cannot set session_replication_role:', (error as Error).message);
+        return;
+      }
+      expect((await client.query('SHOW session_replication_role')).rows[0].session_replication_role).toBe('replica');
+      for (const sql of [...tamper(audit[0].id), 'DELETE FROM acc_training_record_history', ...historyTables.map(table => `TRUNCATE ${table}`)]) {
+        await expect(client.query(sql)).rejects.toThrow('Training history is append-only');
+      }
+    } finally {
+      await client.query('RESET session_replication_role').catch(() => undefined);
+      client.release(true); // never return a replica-mode session to the pool
+    }
+    expect(await snapshot()).toEqual(before);
+  });
+
 });
