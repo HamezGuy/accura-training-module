@@ -16,6 +16,9 @@ const mockVerifyTraining = jest.fn();
 const mockGetComplianceStatus = jest.fn();
 const mockGetExpiringTraining = jest.fn();
 const mockCheckUserCompliance = jest.fn();
+const mockAttestTraining = jest.fn();
+const mockSignTrainingVerification = jest.fn();
+const mockReadRecordSignatureSubject = jest.fn();
 
 jest.mock('../../src/services/training.service', () => ({
   getCourses: (...args: unknown[]) => mockGetCourses(...args),
@@ -29,6 +32,9 @@ jest.mock('../../src/services/training.service', () => ({
   getComplianceStatus: (...args: unknown[]) => mockGetComplianceStatus(...args),
   getExpiringTraining: (...args: unknown[]) => mockGetExpiringTraining(...args),
   checkUserCompliance: (...args: unknown[]) => mockCheckUserCompliance(...args),
+  attestTraining: (...args: unknown[]) => mockAttestTraining(...args),
+  signTrainingVerification: (...args: unknown[]) => mockSignTrainingVerification(...args),
+  readRecordSignatureSubject: (...args: unknown[]) => mockReadRecordSignatureSubject(...args),
 }));
 
 jest.mock('../../src/services/audit.service', () => ({
@@ -466,6 +472,66 @@ describe('Training API Integration', () => {
       expect((await request(app).get('/api/training/user/1/records').set('Authorization', `Bearer ${bearer}`)).status).toBe(403);
       expect((await request(app).get('/api/training/my-records').set('Authorization', `Bearer ${bearer}`)).status).toBe(200);
       expect(mockGetMyRecords).toHaveBeenCalledWith(1);
+    });
+  });
+  describe('Part 11 signature routes (receipts come only from the EDC proxy)', () => {
+    const receipt = { schemaVersion: 'training-signature-receipt/1', signatureId: 501, decision: 'verification' };
+    const bearer = (role = 'admin') => `Bearer ${generateToken({ role })}`;
+    const draftPath = '/api/training/material-drafts/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/approval-signature';
+    test('verification passes a receipt object through, and without one stays the unsigned call', async () => {
+      mockVerifyTraining.mockResolvedValue({ verified: true });
+      const unsigned = await request(app).post('/api/training/verify/5').set('Authorization', bearer('monitor')).send({ notes: 'Synthetic' });
+      expect(unsigned.body.data).toEqual({ verified: true });
+      expect(mockVerifyTraining).toHaveBeenLastCalledWith(5, expect.objectContaining({ actorUserId: 1 }), 'Synthetic', expect.anything(),
+        { signatureReceipt: undefined, auditContext: { ipAddress: expect.any(String), userAgent: undefined } });
+      await request(app).post('/api/training/verify/5').set('Authorization', bearer('monitor')).send({ notes: 'Synthetic', signatureReceipt: receipt });
+      expect(mockVerifyTraining.mock.calls.at(-1)![4].signatureReceipt).toEqual(receipt);
+    });
+    test.each([['a string', 'signed'], ['an array', [receipt]], ['null', null]])('a receipt that is %s is refused 400 before any service', async (_name, value) => {
+      for (const route of ['/verify/5', '/verify/5/signature', '/attest/5']) {
+        expect((await request(app).post(`/api/training${route}`).set('Authorization', bearer()).send({ signatureReceipt: value })).status).toBe(400);
+      }
+      for (const service of [mockVerifyTraining, mockSignTrainingVerification, mockAttestTraining]) expect(service).not.toHaveBeenCalled();
+    });
+    test('attestation and the signature of a recorded verification require a receipt', async () => {
+      expect((await request(app).post('/api/training/attest/5').set('Authorization', bearer('coordinator')).send({})).status).toBe(400);
+      expect((await request(app).post('/api/training/verify/5/signature').set('Authorization', bearer()).send({ notes: 'no receipt' })).status).toBe(400);
+      mockAttestTraining.mockResolvedValue({ attested: true, replayed: false, signature: { signatureId: 501 } });
+      const attested = await request(app).post('/api/training/attest/5').set('Authorization', bearer('coordinator')).send({ signatureReceipt: receipt });
+      expect(attested.status).toBe(200);
+      expect(attested.body.data).toEqual({ attested: true, replayed: false, signature: { signatureId: 501 } });
+      expect(mockAttestTraining).toHaveBeenCalledWith(5, expect.objectContaining({ actorUserId: 1 }), receipt, expect.objectContaining({ ipAddress: expect.any(String) }));
+    });
+    test('only verifier roles sign a recorded verification, and only training managers sign material approval', async () => {
+      expect((await request(app).post('/api/training/verify/5/signature').set('Authorization', bearer('coordinator')).send({ signatureReceipt: receipt })).status).toBe(403);
+      expect((await request(app).post(draftPath).set('Authorization', bearer('monitor')).send({ signatureReceipt: receipt })).status).toBe(403);
+      mockSignTrainingVerification.mockResolvedValue({ signed: true });
+      expect((await request(app).post('/api/training/verify/5/signature').set('Authorization', bearer('investigator')).send({ signatureReceipt: receipt })).status).toBe(200);
+      expect(mockSignTrainingVerification).toHaveBeenCalledWith(5, expect.objectContaining({ actorUserId: 1 }), receipt, expect.anything());
+    });
+    test('the signature subject route dispatches exact completion selectors and never caches', async () => {
+      mockReadRecordSignatureSubject.mockResolvedValue({ subject: { kind: 'completion-attestation' }, subjectHash: 'a'.repeat(64), binding: { status: 'unbound' } });
+      const read = await request(app).get('/api/training/signature-subject?kind=completion-attestation&recordId=5&studyId=100&siteId=101').set('Authorization', bearer('coordinator'));
+      expect(read.status).toBe(200);
+      expect(read.headers['cache-control']).toBe('no-store');
+      expect(mockReadRecordSignatureSubject).toHaveBeenCalledWith(expect.objectContaining({ actorUserId: 1 }),
+        { kind: 'completion-attestation', recordId: 5, context: { studyId: 100, siteId: 101 } });
+      await request(app).get('/api/training/signature-subject?kind=verification&recordId=5&studyId=100').set('Authorization', bearer('investigator'));
+      expect(mockReadRecordSignatureSubject).toHaveBeenLastCalledWith(expect.anything(), { kind: 'verification', recordId: 5, context: { studyId: 100 } });
+    });
+    test.each([
+      ['a verification subject for a non-verifier role', 'kind=verification&recordId=5&studyId=100', 'coordinator', 403],
+      ['a material subject for a non-manager role', 'kind=material-approval&draftId=x', 'monitor', 403],
+      ['no kind', 'recordId=5&studyId=100', 'admin', 400],
+      ['the reserved matrix kind', 'kind=matrix-approval&recordId=5&studyId=100', 'admin', 400],
+      ['no study context', 'kind=completion-attestation&recordId=5', 'admin', 400],
+      ['an arm selector', 'kind=completion-attestation&recordId=5&studyId=100&armId=7', 'admin', 400],
+      ['a malformed record', 'kind=verification&recordId=05&studyId=100', 'admin', 400],
+      ['a repeated study', 'kind=verification&recordId=5&studyId=100&studyId=101', 'admin', 400],
+      ['a record selector on a material subject', 'kind=material-approval&draftId=x&recordId=5', 'admin', 400],
+    ])('refuses %s before any service', async (_name, query, role, status) => {
+      expect((await request(app).get(`/api/training/signature-subject?${query}`).set('Authorization', bearer(role))).status).toBe(status);
+      expect(mockReadRecordSignatureSubject).not.toHaveBeenCalled();
     });
   });
 });

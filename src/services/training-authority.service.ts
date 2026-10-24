@@ -1,7 +1,7 @@
 import { getRoleByName, ROLES } from '@accura-trial/auth-core';
 import { config } from '../config/environment';
 import type { ReadableStreamDefaultReader } from 'node:stream/web';
-import type { TrainingObligationScope, TrainingImpactSource,TrainingMaterialSource } from '../types/training.types';
+import type { TrainingObligationScope, TrainingImpactSource,TrainingMaterialSource,TrainingSignatureConfirmation,TrainingSignatureDecision,TrainingSignatureReceipt } from '../types/training.types';
 
 /** Request-local native credentials; never persist or serialize this context. */
 export interface TrainingAuthorityContext {
@@ -119,6 +119,7 @@ export class TrainingAuthorityTransport {
         if (response.status === 401 || response.status === 403) fail(response.status,
           code === 'PASSWORD_EXPIRED' ? 'Password expired. Change your password before continuing.' : 'Authentication or training access refused by the account authority', code);
         if (response.status === 404 && code === 'TRAINING_AUTHORITY_STUDY_NOT_FOUND') fail(404, 'Study not found for training compliance', code);
+        if (response.status === 404 && code === 'TRAINING_AUTHORITY_SIGNATURE_NOT_FOUND') fail(409, 'The EDC holds no such training signature by you', code);
         if (response.status === 409 && code === 'TRAINING_AUTHORITY_ROLE_INVALID') fail(409, 'Unknown native platform role for training compliance', code);
         if (response.status === 409 && code === 'TRAINING_AUTHORITY_SCOPE_INVALID') fail(409, 'The study, site or arm is no longer an active native scope', code);
         if (response.status === 409 && ['TRAINING_AUTHORITY_SCOPE_CHANGED', 'TRAINING_AUTHORITY_SELECTION_CHANGED'].includes(code)) {
@@ -171,6 +172,22 @@ export async function observeMaterialSource(context:TrainingAuthorityContext,sou
   ||typeof data.actorAuthorityHash!=='string'||!HASH.test(data.actorAuthorityHash)
   ||options.authorityHash!==undefined&&data.actorAuthorityHash!==options.authorityHash)invalid();
  return {source:{scope:source.scope,armIds:source.armIds,originals:source.originals,sourceHash:data.sourceHash},authorityHash:data.actorAuthorityHash as string|undefined};
+}
+
+/** Part 11 confirmation from the EDC (op `signature`, action `signatures:read`): the EDC's own signature row, which
+ * only its signer may read. It must name exactly the receipt's signature and the subject this service recomputed. */
+export async function resolveSignature(context:TrainingAuthorityContext,receipt:Pick<TrainingSignatureReceipt,'signatureId'|'requestKey'|'decision'|'subjectHash'>,subject:unknown):Promise<TrainingSignatureConfirmation>{
+ const data=await transport.resolve(context,{op:'signature',action:'signatures:read',signatureId:receipt.signatureId,requestKey:receipt.requestKey,decision:receipt.decision,subjectHash:receipt.subjectHash});
+ const s=data.signature;
+ if(data.complete!==true||!isRecord(s)||typeof data.observationHash!=='string'||!HASH.test(data.observationHash)||!Number.isSafeInteger(s.signatureId)||typeof s.requestKey!=='string'
+  ||typeof s.decision!=='string'||!isId(s.studyId)||typeof s.subjectHash!=='string'||typeof s.meaning!=='string'||!isId(s.signerUserId)||typeof s.signerUsername!=='string'
+  ||typeof s.signerFullName!=='string'||typeof s.signedAt!=='string'||!Number.isFinite(Date.parse(s.signedAt))||s.effortRequestId!==null&&typeof s.effortRequestId!=='string')invalid();
+ if(s.signatureId!==receipt.signatureId||(s.requestKey as string).toLowerCase()!==receipt.requestKey||s.decision!==receipt.decision||s.subjectHash!==receipt.subjectHash
+  ||s.signerUserId!==context.actorUserId||!same(s.subject,subject))fail(409,'The native EDC signature does not confirm this training decision','TRAINING_SIGNATURE_UNCONFIRMED');
+ return {signatureId:s.signatureId as number,requestKey:(s.requestKey as string).toLowerCase(),decision:s.decision as TrainingSignatureDecision,studyId:s.studyId as number,
+  subjectHash:s.subjectHash as string,meaning:s.meaning as string,signerUserId:s.signerUserId as number,signerUsername:s.signerUsername as string,
+  signerFullName:s.signerFullName as string,signedAt:s.signedAt as string,effortRequestId:typeof s.effortRequestId==='string'?s.effortRequestId.toLowerCase():null,
+  observationHash:data.observationHash};
 }
 
 export interface ObligationScopeObservation {

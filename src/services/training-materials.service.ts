@@ -1,7 +1,8 @@
 import {randomUUID} from 'node:crypto';
 import {query,queryOne,transaction,TransactionClient} from '../config/database';
 import {logAudit,trainingEvidenceHash as hash,AuditAction} from './audit.service';
-import {observeMaterialSource,inspectImpactSource,resolveObligationScope,TrainingAuthorityContext} from './training-authority.service';
+import {observeMaterialSource,inspectImpactSource,resolveObligationScope,resolveSignature,TrainingAuthorityContext} from './training-authority.service';
+import {bindingFor,bindingStatus,bindSignatureReceipt,checkSignedDecision,materialApprovalSubject,readSignatureReceipt,signatureAuditDetails,signatureBindings} from './training-signatures.service';
 import {TrainingCourse,TrainingMaterial,TrainingMaterialDraftRequest,TrainingMaterialSource,TrainingObligationScope,TrainingObligation} from '../types/training.types';
 
 const database={query,queryOne};
@@ -46,7 +47,8 @@ async function draftById(client:Pick<TransactionClient,'queryOne'>,draftId:strin
 async function checkPublication(client:Pick<TransactionClient,'queryOne'>,pub:Publication){const draft=await draftById(client,pub.draftId),r=pub.receipt;
  if(!r||r.schemaVersion!=='training-material-publication/1'||draft.status!=='published'||draft.createdBy===draft.reviewedBy||r.courseVersion!==draft.request.material.version||r.clinicalAdequacyClaimed!==false
   ||hash(pub.runtimeSnapshot)!==pub.runtimeHash||r.runtimeHash!==pub.runtimeHash||r.publicationId!==pub.id||r.courseId!==pub.courseId||draft.courseId!==pub.courseId||r.draftId!==draft.id||r.requestHash!==draft.requestHash
-  ||r.contentRevision!==pub.contentRevision||hash(r.source)!==hash(draft.request.source)||r.authorUserId!==draft.createdBy||r.reviewerUserId!==draft.reviewedBy||r.reviewReason!==draft.reviewReason)fail('Retained material publication integrity failed');return pub;}
+  ||r.contentRevision!==pub.contentRevision||hash(r.source)!==hash(draft.request.source)||r.authorUserId!==draft.createdBy||r.reviewerUserId!==draft.reviewedBy||r.reviewReason!==draft.reviewReason
+  ||r.reviewSignature!==undefined&&r.reviewSignature!==null&&(typeof r.reviewSignature!=='object'||!Number.isSafeInteger(r.reviewSignature.signatureId)||r.reviewSignature.signatureId<1||!/^[a-f0-9]{64}$/.test(r.reviewSignature.subjectHash)))fail('Retained material publication integrity failed');return pub;}
 /** Validate historic as well as current publications through the same custody
  * rules; inspection is not allowed to trust a stored hash column alone. */
 export async function validateInspectionMaterial(client:Pick<TransactionClient,'queryOne'>,drafts:Draft[],publications:Publication[],events:Array<{draftId:string;revision:number;snapshot:Draft}>){
@@ -87,13 +89,68 @@ export async function proposeMaterialDraft(authority:TrainingAuthorityContext,va
   await client.query('UPDATE acc_training_courses SET material_draft_id=$2 WHERE id=$1',[course.id,row!.id]);await event(client,row!,authority.actorUserId,'training_material_drafted');return row!;
  });
 }
-export async function reviewMaterialDraft(authority:TrainingAuthorityContext,draftId:string,input:unknown){exact(input,['expectedRevision','requestHash','accepted','reason']);if(!id(input.expectedRevision)||typeof input.accepted!=='boolean')fail('Exact review disposition required',400);text(input.reason,2000);
+/** An accepted review with an EDC signature receipt also binds the reviewer's Part 11 approval of the exact draft in
+ * the same transaction; without one it is the existing authenticated review. A rejection cannot be signed here. */
+export async function reviewMaterialDraft(authority:TrainingAuthorityContext,draftId:string,input:unknown){exact(input,['expectedRevision','requestHash','accepted','reason','signatureReceipt']);if(!id(input.expectedRevision)||typeof input.accepted!=='boolean')fail('Exact review disposition required',400);text(input.reason,2000);
+ if(input.signatureReceipt!==undefined&&input.accepted!==true)fail('Only an accepted review can carry a material approval signature',400);
+ const receipt=input.signatureReceipt===undefined?undefined:readSignatureReceipt(input.signatureReceipt);
  return transaction(async client=>{const {course,row}=await locked(client,draftId);await manager(authority,row.request.source.scope);
   if(row.createdBy===authority.actorUserId)fail('A different authorized reviewer must review the material',403);
+  // An uncertain signed review is reconciled by repeating the same receipt: it replays, never reviews again.
+  if(receipt&&row.status==='reviewed'&&row.reviewedBy===authority.actorUserId&&row.revision===input.expectedRevision+1&&row.requestHash===input.requestHash){
+   const prior=bindingFor(await signatureBindings(client,{recordIds:[],draftIds:[row.id]}),'material-approval',{draftId:row.id});
+   if(prior&&prior.signatureId===receipt.signatureId&&prior.subjectHash===receipt.subjectHash)return {...row,replayed:true,signature:{signatureId:prior.signatureId,subjectHash:prior.subjectHash,signedAt:prior.signedAt}};}
   if(course.materialDraftId!==row.id||row.revision!==input.expectedRevision||row.requestHash!==input.requestHash||row.status!=='draft')fail('The exact current unreviewed draft is required');
+  const signed=receipt?await approvalSubject(client,authority,row,course.materialDraftId):undefined;
+  if(receipt&&signed)checkSignedDecision(receipt,'material-approval',authority.actorUserId,signed.subjectHash);
   const observed=input.accepted?await observeMaterialSource(authority,row.request.source):null;
   const updated=await client.queryOne<Draft>(`UPDATE acc_training_material_drafts SET status=$2,revision=revision+1,reviewed_by=$3,review_authority_hash=$4,review_reason=$5,reviewed_at=NOW() WHERE id=$1 RETURNING *`,[draftId,input.accepted?'reviewed':'rejected',authority.actorUserId,observed?.authorityHash??null,input.reason]);
-  if(observed)await observeMaterialSource(authority,row.request.source,{authorityHash:observed.authorityHash});await event(client,updated!,authority.actorUserId,input.accepted?'training_material_reviewed':'training_material_rejected');return updated!;
+  if(observed)await observeMaterialSource(authority,row.request.source,{authorityHash:observed.authorityHash});await event(client,updated!,authority.actorUserId,input.accepted?'training_material_reviewed':'training_material_rejected');
+  if(!receipt||!signed)return updated!;
+  const bound=await bindSignatureReceipt(client,receipt,await resolveSignature(authority,receipt,signed.subject),{decision:'material-approval',...signed,signerUserId:authority.actorUserId,draftId:row.id});
+  if(!bound.replayed)await logAudit({userId:authority.actorUserId,courseId:row.courseId,action:'training_signature_bound',details:{draftId:row.id,...signatureAuditDetails(bound.binding)}},client);
+  return {...updated!,replayed:bound.replayed,signature:{signatureId:bound.binding.signatureId,subjectHash:bound.binding.subjectHash,signedAt:bound.binding.signedAt}};
+ });
+}
+/** The revision a review was made against: the draft head before its review event. */
+async function reviewedRevision(client:Pick<TransactionClient,'queryOne'>,row:Draft){
+ if(row.status==='draft')return row.revision;
+ const reviewed=await client.queryOne<{revision:number}>("SELECT revision FROM acc_training_material_events WHERE draft_id=$1 AND action='training_material_reviewed'",[row.id]);
+ if(!reviewed||!id(reviewed.revision-1))fail('Retained material review history is incomplete');return reviewed.revision-1;
+}
+/** The material-approval subject this person may sign: the current unreviewed head, for a reviewer about to accept
+ * it, or an accepted draft, for its recorded reviewer. An author never approves their own material. */
+async function approvalSubject(client:Pick<TransactionClient,'queryOne'>,authority:TrainingAuthorityContext,row:Draft,currentDraftId:string|null){
+ if(row.createdBy===authority.actorUserId)fail('A different authorized reviewer must approve the material',403);
+ if(row.status==='rejected')fail('A rejected material draft cannot be approved');
+ if(row.status==='draft'&&currentDraftId!==row.id)fail('Only the current material draft can be reviewed');
+ if(row.status!=='draft'&&row.reviewedBy!==authority.actorUserId)fail('Only the recorded reviewer can sign this material approval',403);
+ const subject=materialApprovalSubject({draftId:row.id,draftRevision:await reviewedRevision(client,row),requestHash:row.requestHash,courseId:row.courseId,
+  authorUserId:row.createdBy,sourceHash:row.request.source.sourceHash,context:row.request.source.scope});
+ return {subject,subjectHash:hash(subject)};
+}
+/** GET /signature-subject for material approval: the exact subject, and whether it is already bound. */
+export async function readMaterialSignatureSubject(authority:TrainingAuthorityContext,draftId:string){
+ const prior=await draftById(database,draftId);await manager(authority,prior.request.source.scope);
+ const read=await transaction(async client=>{await client.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
+  const row=await draftById(client,prior.id),course=await client.queryOne<TrainingCourse>('SELECT * FROM acc_training_courses WHERE id=$1',[row.courseId]);
+  const signed=await approvalSubject(client,authority,row,course?.materialDraftId??null);
+  return {...signed,binding:bindingStatus(bindingFor(await signatureBindings(client,{recordIds:[],draftIds:[row.id]}),'material-approval',{draftId:row.id}))};
+ });
+ await manager(authority,prior.request.source.scope);return read;
+}
+/** POST /material-drafts/:id/approval-signature: the recorded reviewer signs a review already accepted, before or
+ * after publication. Binding only: the review and any publication are never rewritten. */
+export async function signMaterialApproval(authority:TrainingAuthorityContext,draftId:string,input:unknown){exact(input,['signatureReceipt']);const receipt=readSignatureReceipt(input.signatureReceipt);
+ return transaction(async client=>{const prior=await draftById(client,draftId);
+  const row=await client.queryOne<Draft>('SELECT * FROM acc_training_material_drafts WHERE id=$1 FOR UPDATE',[prior.id]);if(!row)fail('Draft custody missing');checkDraft(row);
+  await manager(authority,row.request.source.scope);
+  if(!['reviewed','published'].includes(row.status))fail('Only an accepted material review can be signed');
+  const signed=await approvalSubject(client,authority,row,null);checkSignedDecision(receipt,'material-approval',authority.actorUserId,signed.subjectHash);
+  const bound=await bindSignatureReceipt(client,receipt,await resolveSignature(authority,receipt,signed.subject),{decision:'material-approval',...signed,signerUserId:authority.actorUserId,draftId:row.id});
+  if(!bound.replayed)await logAudit({userId:authority.actorUserId,courseId:row.courseId,action:'training_signature_bound',details:{draftId:row.id,...signatureAuditDetails(bound.binding)}},client);
+  await manager(authority,row.request.source.scope);
+  return {draftId:row.id,signed:true,replayed:bound.replayed,signature:{signatureId:bound.binding.signatureId,subjectHash:bound.binding.subjectHash,signedAt:bound.binding.signedAt}};
  });
 }
 /** Whole live projection, including disabled questions, is retained and hashed.
@@ -112,6 +169,9 @@ export async function publishMaterialDraft(authority:TrainingAuthorityContext,dr
   if(row.status==='published'&&row.revision===input.expectedRevision+1&&row.requestHash===input.requestHash){const prior=await client.queryOne<Publication>('SELECT * FROM acc_training_material_publications WHERE draft_id=$1',[row.id]);if(!prior)fail('Publication custody missing');await checkPublication(client,prior);return {draft:row,publication:prior.receipt,replay:true};}
   if(course.materialDraftId!==row.id||row.status!=='reviewed'||row.revision!==input.expectedRevision||row.requestHash!==input.requestHash||!row.reviewedBy||!row.reviewAuthorityHash)fail('Publish the exact current independently reviewed draft');
   if(row.request.courseId!==null&&course.contentRevision!==row.request.expectedContentRevision)fail('Live course changed after drafting');
+  // A Part 11 approval bound before publication is named in the receipt; one signed later is read from its binding.
+  const approval=bindingFor(await signatureBindings(client,{recordIds:[],draftIds:[row.id]}),'material-approval',{draftId:row.id});
+  if(approval&&approval.signerUserId!==row.reviewedBy)fail('Retained material approval signature does not name the reviewer');
   const opts={authorityHash:row.authorAuthorityHash,reviewer:{userId:row.reviewedBy,authorityHash:row.reviewAuthorityHash}};
   await observeMaterialSource(authority,row.request.source,opts);const m=row.request.material;
   await client.query('DELETE FROM acc_training_slides WHERE course_id=$1',[course.id]);await client.query('DELETE FROM acc_training_questions WHERE course_id=$1',[course.id]);
@@ -120,7 +180,8 @@ export async function publishMaterialDraft(authority:TrainingAuthorityContext,dr
   const current=await client.queryOne<TrainingCourse>(`UPDATE acc_training_courses SET course_name=$2,description=$3,version=$4,passing_score=$5,duration_minutes=$6,
    validity_period_days=$7,active=$8,required_for_roles='[]'::jsonb,regulatory_reference=NULL,updated_at=NOW() WHERE id=$1 RETURNING *`,[course.id,m.courseName,m.description,m.version,m.passingScore,m.durationMinutes,m.validityPeriodDays,m.active]);
   const runtime=await materialRuntimeSnapshot(client,current!),publicationId=randomUUID();
-  const receipt={schemaVersion:'training-material-publication/1',publicationId,courseId:course.id,draftId:row.id,requestHash:row.requestHash,contentRevision:current!.contentRevision,courseVersion:m.version,runtimeHash:hash(runtime),source:row.request.source,authorUserId:row.createdBy,reviewerUserId:row.reviewedBy,reviewReason:row.reviewReason,reviewedAt:row.reviewedAt,publishedAt:new Date().toISOString(),clinicalAdequacyClaimed:false};
+  const receipt={schemaVersion:'training-material-publication/1',publicationId,courseId:course.id,draftId:row.id,requestHash:row.requestHash,contentRevision:current!.contentRevision,courseVersion:m.version,runtimeHash:hash(runtime),source:row.request.source,authorUserId:row.createdBy,reviewerUserId:row.reviewedBy,reviewReason:row.reviewReason,reviewedAt:row.reviewedAt,publishedAt:new Date().toISOString(),clinicalAdequacyClaimed:false,
+   reviewSignature:approval?{signatureId:approval.signatureId,subjectHash:approval.subjectHash}:null};
   await client.query('INSERT INTO acc_training_material_publications(id,course_id,draft_id,content_revision,runtime_hash,runtime_snapshot,receipt) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb)',[publicationId,course.id,row.id,current!.contentRevision,receipt.runtimeHash,JSON.stringify(runtime),JSON.stringify(receipt)]);
   await client.query('UPDATE acc_training_courses SET material_publication_id=$2 WHERE id=$1',[course.id,publicationId]);
   await observeMaterialSource(authority,row.request.source,opts);

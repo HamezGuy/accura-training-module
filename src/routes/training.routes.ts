@@ -88,8 +88,14 @@ const submitQuizSchema = Joi.object({
     .required(),
 });
 
+// signatureReceipt is training-signature-receipt/1, added only by the EDC proxy; the service checks its exact keys.
 const verifyTrainingSchema = Joi.object({
   notes: Joi.string().allow('', null).optional(),
+  signatureReceipt: Joi.object().optional(),
+});
+
+const signatureReceiptSchema = Joi.object({
+  signatureReceipt: Joi.object().required(),
 });
 
 // ============================================================================
@@ -159,6 +165,9 @@ router.post('/material-drafts/:id/review',authorize(['admin','data_manager']),as
 router.post('/material-drafts/:id/publish',authorize(['admin','data_manager']),asyncHandler<AuthRequest>(async(req,res)=>{
   res.json({success:true,data:await materials.publishMaterialDraft(req.trainingAuthority!,req.params['id'],req.body)});
 }));
+router.post('/material-drafts/:id/approval-signature',authorize(['admin','data_manager']),asyncHandler<AuthRequest>(async(req,res)=>{
+  res.json({success:true,data:await materials.signMaterialApproval(req.trainingAuthority!,req.params['id'],req.body)});
+}));
 router.post('/impact-source',authorize(['admin','data_manager']),asyncHandler<AuthRequest>(async(req,res)=>{
   if(!req.body||Object.keys(req.body).some(key=>!['scope','originals'].includes(key)))throw Object.assign(new Error('Exact source selectors required'),{statusCode:400});
   res.setHeader('Cache-Control','no-store');res.json({success:true,data:await inspectImpactSource(req.trainingAuthority!,req.body.scope,req.body.originals)});
@@ -227,6 +236,35 @@ router.post(
   authorize(['admin', 'data_manager', 'monitor', 'investigator']),
   validate(verifyTrainingSchema),
   asyncHandler<AuthRequest>(controller.verifyTraining)
+);
+
+// ============================================================================
+// Part 11 Signature Routes (signed in the EDC; receipts come only from its proxy)
+// ============================================================================
+
+const subjectRoles: Record<string, string[]> = {
+  verification: ['admin', 'data_manager', 'monitor', 'investigator'],
+  'material-approval': ['admin', 'data_manager'],
+};
+router.get('/signature-subject', (req: AuthRequest, res, next) => {
+  const roles = subjectRoles[String(req.query['kind'])];
+  if (roles) authorize(roles)(req, res, next); else next();
+}, asyncHandler<AuthRequest>(async (req, res) => {
+  if (req.query['kind'] !== 'material-approval') { await controller.getRecordSignatureSubject(req, res); return; }
+  if (Object.keys(req.query).some(key => !['kind', 'draftId'].includes(key)) || typeof req.query['draftId'] !== 'string') {
+    throw Object.assign(new Error('Exact signature kind and material draft required'), { statusCode: 400 });
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ success: true, data: await materials.readMaterialSignatureSubject(req.trainingAuthority!, req.query['draftId']) });
+}));
+
+router.post('/attest/:recordId', validate(signatureReceiptSchema), asyncHandler<AuthRequest>(controller.attestTraining));
+
+router.post(
+  '/verify/:recordId/signature',
+  authorize(['admin', 'data_manager', 'monitor', 'investigator']),
+  validate(signatureReceiptSchema),
+  asyncHandler<AuthRequest>(controller.signTrainingVerification)
 );
 
 // ============================================================================

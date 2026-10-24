@@ -185,24 +185,48 @@ export async function submitQuiz(req: AuthRequest, res: Response): Promise<void>
 }
 
 export async function verifyTraining(req: AuthRequest, res: Response): Promise<void> {
-  const verifierId = req.user!.userId;
   const recordId = exactPositiveId(req.params['recordId'], 'training record ID')!;
-  const { notes } = req.body;
+  const { notes, signatureReceipt } = req.body;
 
-  const result = await transaction(async (client) => {
-    const verified = await trainingService.verifyTraining(recordId, req.trainingAuthority!, notes, client);
-    await logAudit({
-      userId: verifierId,
-      action: 'training_verified',
-      recordId,
-      details: { notes },
-      ipAddress: req.ip,
-      userAgent: req.headers['user-agent'],
-    }, client);
-    return verified;
-  });
+  // The service writes the verification audit (and a signature binding's) in this transaction.
+  const result = await transaction((client) => trainingService.verifyTraining(recordId, req.trainingAuthority!, notes, client,
+    { signatureReceipt, auditContext: { ipAddress: req.ip, userAgent: req.headers['user-agent'] } }));
 
   res.json({ success: true, data: result });
+}
+
+// ============================================================================
+// Part 11 Signature Endpoints
+// ============================================================================
+
+export async function attestTraining(req: AuthRequest, res: Response): Promise<void> {
+  const recordId = exactPositiveId(req.params['recordId'], 'training record ID')!;
+  const result = await trainingService.attestTraining(recordId, req.trainingAuthority!, req.body.signatureReceipt,
+    { ipAddress: req.ip, userAgent: req.headers['user-agent'] });
+  res.json({ success: true, data: result });
+}
+
+export async function signTrainingVerification(req: AuthRequest, res: Response): Promise<void> {
+  const recordId = exactPositiveId(req.params['recordId'], 'training record ID')!;
+  const result = await trainingService.signTrainingVerification(recordId, req.trainingAuthority!, req.body.signatureReceipt,
+    { ipAddress: req.ip, userAgent: req.headers['user-agent'] });
+  res.json({ success: true, data: result });
+}
+
+/** Completion subjects of GET /signature-subject; the route dispatches material approval to the material service. */
+export async function getRecordSignatureSubject(req: AuthRequest, res: Response): Promise<void> {
+  const kind = req.query['kind'];
+  if ((kind !== 'completion-attestation' && kind !== 'verification')
+    || Object.keys(req.query).some(key => !['kind', 'recordId', 'studyId', 'siteId'].includes(key))) {
+    throw Object.assign(new Error('Exact signature kind, record and study or site context required'), { statusCode: 400 });
+  }
+  const recordId = exactPositiveId(req.query['recordId'], 'training record ID'), studyId = exactPositiveId(req.query['studyId'], 'study ID');
+  const siteId = exactPositiveId(req.query['siteId'], 'site ID');
+  if (!recordId || !studyId) throw Object.assign(new Error('Exact signature kind, record and study or site context required'), { statusCode: 400 });
+  const subject = await trainingService.readRecordSignatureSubject(req.trainingAuthority!,
+    { kind, recordId, context: { studyId, ...(siteId === undefined ? {} : { siteId }) } });
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ success: true, data: subject });
 }
 
 // ============================================================================

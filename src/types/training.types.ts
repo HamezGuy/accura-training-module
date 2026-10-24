@@ -199,8 +199,10 @@ export interface TrainingObligationView extends TrainingObligation {
 /** Proposed duty assignments are approved by the native clinical lifecycle,
  * never by the training assessment endpoint itself. */
 export interface TrainingDutyPolicy {
-  schemaVersion: 'training-duty-policy/1';
+  schemaVersion: 'training-duty-policy/1' | 'training-duty-policy/2';
   scope: { studyId: number; siteId?: number };
+  /** training-duty-policy/2 only: a complete pin also needs its Part 11 signatures. */
+  signatures?: 'part11-required';
   assignments: Array<{
     userId: number;
     role: string;
@@ -213,7 +215,8 @@ export interface TrainingDutyPolicy {
 }
 
 export interface TrainingDutyReadinessRequest {
-  schemaVersion: 'training-duty-readiness-request/1';
+  /** /2 carries exactly a training-duty-policy/2 and is answered with training-duty-readiness/2. */
+  schemaVersion: 'training-duty-readiness-request/1' | 'training-duty-readiness-request/2';
   nonce: string;
   policy: TrainingDutyPolicy;
   /** Omitted only when evaluating the complete activation census. */
@@ -257,3 +260,43 @@ export interface TrainingMaterialDraftRequest {
   schemaVersion:'training-material-draft/1';idempotencyKey:string;courseId:number|null;
   expectedContentRevision:number;expectedDraftId:string|null;source:TrainingMaterialSource;reason:string;material:TrainingMaterial;
 }
+
+/** Part 11 signature decisions on training (contracts/training-signature-subject-v1.schema.json).
+ * Matrix approval is reserved for the curriculum matrix (T-1); nothing produces or binds it yet. */
+export type TrainingSignatureDecision = 'completion-attestation' | 'verification' | 'material-approval' | 'matrix-approval';
+export type TrainingRecordSignatureDecision = 'completion-attestation' | 'verification';
+/** Where the person signs: the study, or the site, of an assigned obligation or of the material. Never an arm. */
+export interface TrainingSignatureContext { studyId: number; siteId?: number }
+/** One exact completion: its retained assessment cycle, passing receipt and certificate. No participant data. */
+export interface TrainingRecordSignatureSubject {
+  schemaVersion: 'training-signature-subject/1'; kind: TrainingRecordSignatureDecision; context: TrainingSignatureContext;
+  learnerUserId: number; recordId: number; courseId: number; courseVersion: string; contentRevision: number;
+  assessmentCycleId: string; assessment: { id: string; hash: string }; completedAt: string; certificateNumber: string;
+}
+/** One exact reviewed material draft: its immutable request hash, author and source, as accepted. */
+export interface TrainingMaterialSignatureSubject {
+  schemaVersion: 'training-signature-subject/1'; kind: 'material-approval'; context: TrainingSignatureContext;
+  draftId: string; draftRevision: number; requestHash: string; courseId: number; authorUserId: number; sourceHash: string; disposition: 'accepted';
+}
+export type TrainingSignatureSubject = TrainingRecordSignatureSubject | TrainingMaterialSignatureSubject;
+/** training-signature-receipt/1, produced by the EDC proxy after a password re-entry signature. Only the proxy adds
+ * it to a forwarded body; this service binds it only after the EDC confirms the same signature (op `signature`). */
+export interface TrainingSignatureReceipt {
+  schemaVersion: 'training-signature-receipt/1'; signatureId: number; requestKey: string; decision: TrainingSignatureDecision;
+  meaning: string; signerUserId: number; signerUsername: string; signerFullName: string; signedAt: string;
+  context: TrainingSignatureContext; subjectHash: string;
+  edcEffort: { requestId: string; workStartedAt: string | null; startBasis: 'client-work-start' | 'not-supplied' } | null;
+}
+/** The EDC's answer to authority op `signature`: its own signature row, which only the signer may read. */
+export interface TrainingSignatureConfirmation {
+  signatureId: number; requestKey: string; decision: TrainingSignatureDecision; studyId: number; subjectHash: string; meaning: string;
+  signerUserId: number; signerUsername: string; signerFullName: string; signedAt: string; effortRequestId: string | null; observationHash: string;
+}
+/** An append-only acc_training_decision_signatures row; signatureId is the EDC's own signature id. */
+export interface TrainingSignatureBinding {
+  id: number; signatureId: number; decision: TrainingSignatureDecision; requestKey: string; signerUserId: number; signedAt: string;
+  context: TrainingSignatureContext; subject: TrainingSignatureSubject; subjectHash: string; receipt: TrainingSignatureReceipt;
+  edcObservationHash: string; recordId: number | null; assessmentCycleId: string | null; draftId: string | null; createdAt: string;
+}
+/** A cited signature in training-duty-readiness/2; the EDC re-hashes the subject against its own signature row. */
+export interface TrainingSignatureReference { signatureId: number; subjectHash: string; subject: TrainingSignatureSubject }

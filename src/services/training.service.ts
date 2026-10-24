@@ -1,11 +1,12 @@
 import { getRoleByName, ROLES } from '@accura-trial/auth-core';
 import { query, queryOne, transaction, TransactionClient } from '../config/database';
 import { logger } from '../config/logger';
-import { logAudit } from './audit.service';
+import { logAudit, trainingEvidenceHash } from './audit.service';
 import { generateCertificateNumber, calculateExpirationDate } from './certificate.service';
 import { getObligations } from './training-obligations.service';
-import { authorizeTrainingTargets, readTrainingDirectory, revalidateTrainingDirectory, resolveObligationScope, TrainingAuthorityContext } from './training-authority.service';
+import { authorizeTrainingTargets, readTrainingDirectory, revalidateTrainingDirectory, resolveObligationScope, resolveSignature, TrainingAuthorityContext } from './training-authority.service';
 import {assertMaterialUse,materialCourseVisible} from './training-materials.service';
+import {bindingFor,bindingStatus,bindSignatureReceipt,checkSignedDecision,readSignatureReceipt,recordDecisionSubject,signatureAuditDetails,signatureBindings,signatureContext} from './training-signatures.service';
 import {randomUUID} from 'node:crypto';
 import {assessmentContentHash,assessmentReference,assessmentRequestHash,assertStartedContent,canonicalAnswers,gradeAssessment,sealAssessment,validateSubmission,verifyAssessmentRows,verifyRecordAssessment,AssessmentHistoryRow} from './training-assessment-evidence';
 import {
@@ -21,6 +22,8 @@ import {
   CreateCourseRequest,
   UpdateCourseRequest,
   CreateQuestionRequest,
+  TrainingRecordSignatureDecision,
+  TrainingSignatureContext,
 } from '../types/training.types';
 
 const database: TransactionClient = { query, queryOne };
@@ -398,15 +401,20 @@ export async function submitQuiz(
   return {...result,receipt:assessmentReference(receipt),replayed:false,evidenceStatus:'recorded_assessment'};
 }
 
+/** Independent verification, written with its audit row. With an EDC signature receipt the same transaction also
+ * binds the verifier's Part 11 signature over the exact completion; without one it is the existing unsigned update. */
 export async function verifyTraining(
   recordId: number,
   authority: TrainingAuthorityContext,
   notes?: string,
-  client: TransactionClient = database
-): Promise<{ verified: boolean }> {
+  client: TransactionClient = database,
+  options: { signatureReceipt?: unknown; auditContext?: { ipAddress?: string; userAgent?: string } } = {}
+): Promise<{ verified: boolean; replayed?: boolean; signature?: { signatureId: number; subjectHash: string; signedAt: string } }> {
   if (!Number.isSafeInteger(recordId) || recordId < 1) {
     throw Object.assign(new Error('An exact positive training record ID is required'), { statusCode: 400 });
   }
+  // A malformed receipt refuses the verification; it is never dropped into an unsigned one.
+  const receipt = options.signatureReceipt === undefined ? undefined : readSignatureReceipt(options.signatureReceipt);
   const admission = await authorizeTrainingTargets(authority, 'records:verify', []);
   const owner = await client.queryOne<{ userId: number; courseId: number }>('SELECT user_id,course_id FROM acc_training_records WHERE id = $1', [recordId]);
   if (!owner) throw Object.assign(new Error('Training record not found'), { statusCode: 404 });
@@ -446,7 +454,17 @@ export async function verifyTraining(
     || record.expirationDate !== null && (!Number.isFinite(new Date(record.expirationDate).getTime()) || new Date(record.expirationDate).getTime() <= Date.now())) {
     throw Object.assign(new Error('Only current, unexpired course completion can be verified'), {statusCode:409});
   }
-  if (record.verifiedAt || record.verifiedBy) throw Object.assign(new Error('This completion has already been verified; its evidence cannot be overwritten'), {statusCode:409});
+  if (record.verifiedAt || record.verifiedBy) {
+    // An uncertain signed verification is reconciled by repeating the same receipt; it replays, never re-verifies.
+    const prior = receipt && record.verifiedBy === authority.actorUserId ? bindingFor(await signatureBindings(client, { recordIds: [record.id], draftIds: [] }),
+      'verification', { recordId: record.id, assessmentCycleId: record.assessmentCycleId }) : undefined;
+    if (receipt && prior && prior.signatureId === receipt.signatureId && prior.subjectHash === receipt.subjectHash) {
+      return { verified: true, replayed: true, signature: { signatureId: prior.signatureId, subjectHash: prior.subjectHash, signedAt: prior.signedAt } };
+    }
+    throw Object.assign(new Error('This completion has already been verified; its evidence cannot be overwritten'), {statusCode:409});
+  }
+  const signed = receipt ? await recordSignatureSubject(client, 'verification', record, course, receipt.context) : undefined;
+  if (receipt && signed) checkSignedDecision(receipt, 'verification', authority.actorUserId, signed.subjectHash);
 
   await client.query(
     `UPDATE acc_training_records 
@@ -454,6 +472,8 @@ export async function verifyTraining(
      WHERE id = $3`,
     [authority.actorUserId, notes ?? null, recordId]
   );
+  const bound = receipt && signed ? await bindSignatureReceipt(client, receipt, await resolveSignature(authority, receipt, signed.subject),
+    { decision: 'verification', ...signed, signerUserId: authority.actorUserId, recordId: record.id, assessmentCycleId: signed.subject.assessmentCycleId }) : undefined;
 
   const finalTarget=await authorizeTrainingTargets(authority,'records:verify',[record.userId],{scopeFingerprint:admission.scopeFingerprint});
   if(!finalTarget.decisions[0].allowed)throw Object.assign(new Error('Training verification authority changed'),{statusCode:409});
@@ -462,7 +482,139 @@ export async function verifyTraining(
     await recheckMaterialUse(proof.proof,authority,client,course!,{userId:record.userId,scope:proof.scope});}
   if(record.expirationDate!==null&&Date.parse(record.expirationDate)<=Date.now())throw Object.assign(new Error('Completion expired during verification'),{statusCode:409});
 
-  return { verified: true };
+  // The audit names the exact completion verified; a restart reuses the record ID with a new cycle.
+  await logAudit({ userId: authority.actorUserId, action: 'training_verified', recordId, courseId: record.courseId,
+    details: { notes, courseId: record.courseId, courseVersion: record.courseVersion ?? null, contentRevision: record.contentRevision ?? null,
+      assessmentCycleId: record.assessmentCycleId ?? null }, ...options.auditContext }, client);
+  if (!bound) return { verified: true };
+  if (!bound.replayed) await logAudit({ userId: authority.actorUserId, action: 'training_signature_bound', recordId, courseId: record.courseId,
+    details: signatureAuditDetails(bound.binding), ...options.auditContext }, client);
+  return { verified: true, replayed: bound.replayed, signature: { signatureId: bound.binding.signatureId, subjectHash: bound.binding.subjectHash, signedAt: bound.binding.signedAt } };
+}
+
+// ============================================================================
+// Part 11 Signatures (training-signature-subject/1)
+// ============================================================================
+
+function requireRecordId(value: number): void {
+  if (!Number.isSafeInteger(value) || value < 1) throw Object.assign(new Error('An exact positive training record ID is required'), { statusCode: 400 });
+}
+
+/** A current, unexpired completion with its verified retained assessment, signed in the study or site of one of
+ * the learner's assigned obligations for the course (the arm is not part of the context). The caller has run
+ * verifyRecordAssessment on the record it holds. */
+async function recordSignatureSubject(client: TransactionClient, kind: TrainingRecordSignatureDecision, record: TrainingRecord,
+  course: TrainingCourse | null, context: TrainingSignatureContext) {
+  const expiration = record.expirationDate === null ? null : new Date(record.expirationDate).getTime();
+  if (record.status !== 'completed' || !record.assessmentEvidenceVerified || !course?.active || record.courseVersion !== course.version
+    || record.contentRevision !== course.contentRevision || expiration !== null && (!Number.isFinite(expiration) || expiration <= Date.now())) {
+    throw Object.assign(new Error('Only a current, unexpired completion with its retained assessment can be signed'), { statusCode: 409 });
+  }
+  const assigned = (await client.query<TrainingObligation>("SELECT * FROM acc_training_obligations WHERE user_id=$1 AND course_id=$2 AND status='assigned' ORDER BY id",
+    [record.userId, record.courseId])).rows;
+  if (!assigned.some(row => row.scope.studyId === context.studyId && row.scope.siteId === context.siteId)) {
+    throw Object.assign(new Error('Sign in the study or site of an assigned obligation for this course'), { statusCode: 409 });
+  }
+  const subject = recordDecisionSubject(kind, record, context);
+  return { subject, subjectHash: trainingEvidenceHash(subject) };
+}
+
+/** The subject the EDC asks this person to sign for a completion, and whether it is already bound. A learner reads
+ * their own attestation; a verifier reads an unverified completion, or one they verified themselves. */
+export async function readRecordSignatureSubject(authority: TrainingAuthorityContext,
+  input: { kind: TrainingRecordSignatureDecision; recordId: number; context: unknown }) {
+  requireRecordId(input.recordId);
+  const context = signatureContext(input.context), learner = input.kind === 'completion-attestation';
+  const action = learner ? 'records:read' : 'records:verify';
+  const admission = await authorizeTrainingTargets(authority, action, learner ? [authority.actorUserId] : []);
+  if (learner && !admission.decisions[0]?.allowed) throw Object.assign(new Error('Training record is outside current access'), { statusCode: 403 });
+  const owner = await queryOne<{ userId: number; courseId: number }>('SELECT user_id,course_id FROM acc_training_records WHERE id=$1', [input.recordId]);
+  if (!owner || learner && owner.userId !== authority.actorUserId) throw Object.assign(new Error('Training record not found'), { statusCode: 404 });
+  const targets = learner ? [authority.actorUserId] : [owner.userId];
+  if (!learner) {
+    const target = await authorizeTrainingTargets(authority, action, targets, { scopeFingerprint: admission.scopeFingerprint });
+    if (!target.decisions[0]?.allowed) throw Object.assign(new Error('Training record not found'), { statusCode: 404 });
+    if (owner.userId === authority.actorUserId) throw Object.assign(new Error('Cannot verify your own training'), { statusCode: 403 });
+  }
+  const read = await transaction(async client => {
+    await client.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
+    const course = await client.queryOne<TrainingCourse>('SELECT * FROM acc_training_courses WHERE id=$1', [owner.courseId]);
+    const record = await client.queryOne<TrainingRecord>('SELECT * FROM acc_training_records WHERE id=$1 AND user_id=$2', [input.recordId, owner.userId]);
+    if (!record) throw Object.assign(new Error('Training record not found'), { statusCode: 404 });
+    if (!learner && record.verifiedBy !== null && record.verifiedBy !== authority.actorUserId) {
+      throw Object.assign(new Error('This completion was verified by another person'), { statusCode: 409 });
+    }
+    await verifyRecordAssessment(client, record);
+    const signed = await recordSignatureSubject(client, input.kind, record, course, context);
+    const binding = bindingFor(await signatureBindings(client, { recordIds: [record.id], draftIds: [] }), input.kind,
+      { recordId: record.id, assessmentCycleId: record.assessmentCycleId });
+    return { ...signed, binding: bindingStatus(binding) };
+  });
+  const current = await authorizeTrainingTargets(authority, action, targets, { scopeFingerprint: admission.scopeFingerprint });
+  if (!current.decisions[0]?.allowed) throw Object.assign(new Error('Training access changed during the request'), { statusCode: 409 });
+  return read;
+}
+
+/** The learner's Part 11 completion attestation (POST /attest/:recordId, receipt required). It changes no record
+ * field: the decision is the append-only binding and its audit row. */
+export async function attestTraining(recordId: number, authority: TrainingAuthorityContext, value: unknown,
+  auditContext: { ipAddress?: string; userAgent?: string } = {}) {
+  requireRecordId(recordId);
+  const receipt = readSignatureReceipt(value);
+  const admission = await authorizeTrainingTargets(authority, 'records:read', [authority.actorUserId]);
+  if (!admission.decisions[0]?.allowed) throw Object.assign(new Error('Training record is outside current access'), { statusCode: 403 });
+  return transaction(async client => {
+    const owner = await client.queryOne<{ courseId: number }>('SELECT course_id FROM acc_training_records WHERE id=$1 AND user_id=$2', [recordId, authority.actorUserId]);
+    if (!owner) throw Object.assign(new Error('Training record not found'), { statusCode: 404 });
+    // The existing course -> record lock order of verification.
+    const course = await client.queryOne<TrainingCourse>('SELECT * FROM acc_training_courses WHERE id=$1 FOR SHARE', [owner.courseId]);
+    const record = await client.queryOne<TrainingRecord>('SELECT * FROM acc_training_records WHERE id=$1 AND user_id=$2 FOR UPDATE', [recordId, authority.actorUserId]);
+    if (!record) throw Object.assign(new Error('Training record not found'), { statusCode: 404 });
+    await verifyRecordAssessment(client, record);
+    const signed = await recordSignatureSubject(client, 'completion-attestation', record, course, receipt.context);
+    checkSignedDecision(receipt, 'completion-attestation', record.userId, signed.subjectHash);
+    const bound = await bindSignatureReceipt(client, receipt, await resolveSignature(authority, receipt, signed.subject),
+      { decision: 'completion-attestation', ...signed, signerUserId: record.userId, recordId: record.id, assessmentCycleId: signed.subject.assessmentCycleId });
+    if (!bound.replayed) await logAudit({ userId: authority.actorUserId, action: 'training_completion_attested', recordId: record.id, courseId: record.courseId,
+      details: { ...signatureAuditDetails(bound.binding), courseVersion: record.courseVersion, contentRevision: record.contentRevision, assessmentCycleId: record.assessmentCycleId },
+      ...auditContext }, client);
+    const current = await authorizeTrainingTargets(authority, 'records:read', [authority.actorUserId], { scopeFingerprint: admission.scopeFingerprint });
+    if (!current.decisions[0]?.allowed) throw Object.assign(new Error('Training access changed during the request'), { statusCode: 409 });
+    return { attested: true, replayed: bound.replayed, signature: { signatureId: bound.binding.signatureId, subjectHash: bound.binding.subjectHash, signedAt: bound.binding.signedAt } };
+  });
+}
+
+/** The recorded verifier signs a verification already made (POST /verify/:recordId/signature, receipt required).
+ * Binding only: verified_by and verified_at are never rewritten, so a scope can adopt training-duty-policy/2
+ * without its learners retraining. */
+export async function signTrainingVerification(recordId: number, authority: TrainingAuthorityContext, value: unknown,
+  auditContext: { ipAddress?: string; userAgent?: string } = {}) {
+  requireRecordId(recordId);
+  const receipt = readSignatureReceipt(value);
+  const admission = await authorizeTrainingTargets(authority, 'records:verify', []);
+  return transaction(async client => {
+    const owner = await client.queryOne<{ userId: number; courseId: number }>('SELECT user_id,course_id FROM acc_training_records WHERE id = $1', [recordId]);
+    if (!owner) throw Object.assign(new Error('Training record not found'), { statusCode: 404 });
+    const target = await authorizeTrainingTargets(authority, 'records:verify', [owner.userId], { scopeFingerprint: admission.scopeFingerprint });
+    if (!target.decisions[0].allowed) throw Object.assign(new Error('Training record not found'), { statusCode: 404 });
+    const course = await client.queryOne<TrainingCourse>('SELECT * FROM acc_training_courses WHERE id=$1 FOR SHARE', [owner.courseId]);
+    const record = await client.queryOne<TrainingRecord>('SELECT r.* FROM acc_training_records r WHERE r.id = $1 AND r.user_id = $2 FOR UPDATE', [recordId, owner.userId]);
+    if (!record) throw Object.assign(new Error('Training record not found'), { statusCode: 404 });
+    if (record.userId === authority.actorUserId) throw Object.assign(new Error('Cannot verify your own training'), { statusCode: 403 });
+    if (record.verifiedBy !== authority.actorUserId || !record.verifiedAt) {
+      throw Object.assign(new Error('Only the person who recorded this verification can sign it'), { statusCode: 409 });
+    }
+    await verifyRecordAssessment(client, record);
+    const signed = await recordSignatureSubject(client, 'verification', record, course, receipt.context);
+    checkSignedDecision(receipt, 'verification', authority.actorUserId, signed.subjectHash);
+    const bound = await bindSignatureReceipt(client, receipt, await resolveSignature(authority, receipt, signed.subject),
+      { decision: 'verification', ...signed, signerUserId: authority.actorUserId, recordId: record.id, assessmentCycleId: signed.subject.assessmentCycleId });
+    if (!bound.replayed) await logAudit({ userId: authority.actorUserId, action: 'training_signature_bound', recordId: record.id, courseId: record.courseId,
+      details: signatureAuditDetails(bound.binding), ...auditContext }, client);
+    const current = await authorizeTrainingTargets(authority, 'records:verify', [record.userId], { scopeFingerprint: admission.scopeFingerprint });
+    if (!current.decisions[0].allowed) throw Object.assign(new Error('Training verification authority changed'), { statusCode: 409 });
+    return { signed: true, replayed: bound.replayed, signature: { signatureId: bound.binding.signatureId, subjectHash: bound.binding.subjectHash, signedAt: bound.binding.signedAt } };
+  });
 }
 
 // ============================================================================
