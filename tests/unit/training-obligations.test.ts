@@ -1,4 +1,4 @@
-import {obligationReadiness,validateObligationRequest} from '../../src/services/training-obligations.service';
+import {obligationReadiness,validateDutyPolicy,validateObligationRequest} from '../../src/services/training-obligations.service';
 import {verifyRecordAssessment} from '../../src/services/training-assessment-evidence';
 import {mapRecordToDto} from '../../src/services/training-record-dto';
 jest.mock('../../src/config/database',()=>({}));
@@ -35,3 +35,12 @@ test('inactive or revised course cannot keep readiness complete',()=>{
 const valid:any={userId:22,courseId:1,contentRevision:8,role:'coordinator',scope:{studyId:1,siteId:2,armId:3},dueAt:'2026-10-10T10:00:00Z',reason:'Required procedure'};
 test.each([{dueAt:'2026-02-30T12:00:00Z'},{dueAt:'2026-10-10T12:00:00'},{userId:1.5},{scope:{studyId:1,siteId:0}},{scope:{studyId:1,extra:'claim'}},{role:'study_director'},{reason:'  '}])('refuses invalid obligation input %j',patch=>{expect(()=>validateObligationRequest({...valid,...patch})).toThrow();});
 test('explicit valid UTC-offset due date is retained',()=>{expect(()=>validateObligationRequest({...valid,dueAt:'2026-10-10T10:00:00-05:00'})).not.toThrow();});
+const dutyPolicy=(version:1|2,extra:object={}):any=>({schemaVersion:`training-duty-policy/${version}`,scope:{studyId:1,siteId:2},...(version===2?{signatures:'part11-required'}:{}),
+ assignments:[{userId:22,role:'coordinator',disposition:'required',rationale:'Synthetic delegated data entry',duties:['data_entry'],obligations:[{id:9,revision:1,courseId:1,courseVersion:'2',contentRevision:8}]}],...extra});
+test('training-duty-policy/2 is /1 plus a required Part 11 signature rule; /1 is unchanged',()=>{
+ expect(()=>validateDutyPolicy(dutyPolicy(1))).not.toThrow();expect(()=>validateDutyPolicy(dutyPolicy(2))).not.toThrow();
+});
+test.each([['/2 without the rule',dutyPolicy(2,{signatures:undefined})],['/2 with another rule',dutyPolicy(2,{signatures:'optional'})],
+ ['/1 carrying the /2 rule',dutyPolicy(1,{signatures:'part11-required'})],['an unknown version',dutyPolicy(2,{schemaVersion:'training-duty-policy/3'})]])('refuses %s',(_name,policy)=>{
+ expect(()=>validateDutyPolicy(policy)).toThrow(expect.objectContaining({statusCode:400}));
+});

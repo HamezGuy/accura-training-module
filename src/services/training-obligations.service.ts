@@ -6,8 +6,9 @@ import { TrainingCourse, TrainingDutyPolicy, TrainingDutyReadinessRequest, Train
 import {assertMaterialUse,publishedMaterial,observePublication,validateInspectionMaterial} from './training-materials.service';
 import {mapRecordToDto} from './training-record-dto';
 import {verifyRecordAssessment,verifyAssessmentRows,AssessmentHistoryRow} from './training-assessment-evidence';
+import {bindingFor,recordDecisionSubject,signatureBindings,signatureReference} from './training-signatures.service';
 import {createHash} from 'node:crypto';
-import type {TrainingInspectionEvidence,TrainingMaterialSource} from '../types/training.types';
+import type {TrainingInspectionEvidence,TrainingMaterialSource,TrainingRecordSignatureDecision,TrainingSignatureBinding,TrainingSignatureReference} from '../types/training.types';
 
 function fail(message: string, statusCode = 409): never { throw Object.assign(new Error(message), { statusCode }); }
 const id = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) > 0 && Number(value) <= 2147483647;
@@ -276,10 +277,12 @@ function exactObject(value: unknown, keys: string[]): asserts value is Record<st
 }
 export const trainingDutyHash = trainingEvidenceHash;
 
-/** Strict, bounded source contract. Empty requirements never mean trained. */
+/** Strict, bounded source contract. Empty requirements never mean trained. training-duty-policy/2 is /1 plus a
+ * reviewed per-scope rule that every complete pin also carries its Part 11 signatures. */
 export function validateDutyPolicy(value: unknown): asserts value is TrainingDutyPolicy {
-  exactObject(value, ['schemaVersion', 'scope', 'assignments']);
-  if (value.schemaVersion !== 'training-duty-policy/1') fail('Unsupported training duty policy', 400);
+  exactObject(value, ['schemaVersion', 'scope', 'assignments', 'signatures']);
+  if (value.schemaVersion === 'training-duty-policy/2') { if (value.signatures !== 'part11-required') fail('A training-duty-policy/2 requires signatures part11-required', 400); }
+  else if (value.schemaVersion !== 'training-duty-policy/1' || value.signatures !== undefined) fail('Unsupported training duty policy', 400);
   exactObject(value.scope, ['studyId', 'siteId']);
   if (!id(value.scope.studyId) || value.scope.siteId !== undefined && !id(value.scope.siteId)) fail('Exact native duty scope is required', 400);
   if (!Array.isArray(value.assignments) || value.assignments.length < 1 || value.assignments.length > 1000) fail('A complete duty census of 1 to 1000 assignments is required', 400);
@@ -305,13 +308,41 @@ export function validateDutyPolicy(value: unknown): asserts value is TrainingDut
   }
 }
 
+type DutyPublication=NonNullable<Awaited<ReturnType<typeof publishedMaterial>>>;
+/** The signatures one pin cites under training-duty-policy/2: the learner's attestation and the recorded verifier's
+ * signature over the record's current completion, and the reviewer's approval of the current governed publication.
+ * A retained binding that no longer matches its completion or publication refuses the observation; it is never
+ * read as unsigned. */
+function pinSignatures(bindings:TrainingSignatureBinding[],record:TrainingRecord|null,publication:DutyPublication|null){
+  const completion=(kind:TrainingRecordSignatureDecision,signer:number|null):TrainingSignatureReference|null=>{
+    if(!record||record.status!=='completed'||!record.assessmentCycleId)return null;
+    const binding=bindingFor(bindings,kind,{recordId:record.id,assessmentCycleId:record.assessmentCycleId});if(!binding)return null;
+    if(binding.signerUserId!==signer||trainingDutyHash(binding.subject)!==binding.subjectHash||trainingDutyHash(recordDecisionSubject(kind,record,binding.context))!==binding.subjectHash)
+      fail('A retained training signature no longer matches its completion');
+    return signatureReference(binding);
+  };
+  let materialApproval:TrainingSignatureReference|null=null;
+  const approval=publication?bindingFor(bindings,'material-approval',{draftId:publication.draftId}):undefined;
+  if(publication&&approval){const r=publication.receipt,s=approval.subject as Record<string,any>;
+    if(approval.signerUserId!==r.reviewerUserId||approval.signerUserId===r.authorUserId||trainingDutyHash(s)!==approval.subjectHash||s.kind!=='material-approval'
+      ||s.draftId!==publication.draftId||s.requestHash!==r.requestHash||s.courseId!==publication.courseId||s.authorUserId!==r.authorUserId
+      ||s.sourceHash!==r.source?.sourceHash||canonical(s.context)!==canonical(r.source?.scope))fail('A retained material approval signature no longer matches its publication');
+    materialApproval=signatureReference(approval);}
+  return {attestation:completion('completion-attestation',record?.userId??null),verification:completion('verification',record?.verifiedBy??null),materialApproval};
+}
+
 /** Assessment of an explicitly supplied policy, not approval of its adequacy.
  * Native clinical decisions retain and independently approve that exact policy.
- * Remote authority and training reads are current observations, not a distributed transaction. */
+ * Remote authority and training reads are current observations, not a distributed transaction.
+ * Request /2 carries a /2 policy and is answered in training-duty-readiness/2: each pin cites its signatures, and a
+ * pin complete by the /1 rules whose signatures are missing reads signature_required. /1 is answered as before. */
 export async function getDutyReadiness(authority: TrainingAuthorityContext, value: unknown) {
   exactObject(value, ['schemaVersion', 'nonce', 'policy', 'actorUserId', 'duty', 'armIds']);
-  if (value.schemaVersion !== 'training-duty-readiness-request/1' || typeof value.nonce !== 'string' || !/^[a-f0-9]{32}$/.test(value.nonce)) fail('An exact duty request and fresh nonce are required', 400);
+  const signed = value.schemaVersion === 'training-duty-readiness-request/2';
+  if (!signed && value.schemaVersion !== 'training-duty-readiness-request/1' || typeof value.nonce !== 'string' || !/^[a-f0-9]{32}$/.test(value.nonce)) fail('An exact duty request and fresh nonce are required', 400);
   validateDutyPolicy(value.policy);
+  // The versions pair exactly, so a /1 reader is never answered for a /2 policy whose signature rule it cannot see.
+  if (signed !== (value.policy.schemaVersion === 'training-duty-policy/2')) fail('A training-duty-readiness-request/2 carries exactly a training-duty-policy/2, and /1 a /1 policy', 400);
   if ((value.actorUserId === undefined) !== (value.duty === undefined) || value.actorUserId !== undefined && (!id(value.actorUserId) || !['participant_enrollment', 'arm_assignment', 'supply_dispensing', 'data_entry'].includes(value.duty))) fail('An actor-specific request requires an exact learner and delegated duty', 400);
   if (value.actorUserId !== undefined && value.actorUserId !== authority.actorUserId) fail('A clinical duty assessment must identify the authenticated actor', 403);
   if(value.armIds!==undefined&&(value.actorUserId===undefined||!Array.isArray(value.armIds)||value.armIds.length>100||value.armIds.some((n:unknown)=>!id(n))||new Set(value.armIds).size!==value.armIds.length))fail('Exact distinct native arm selection is required',400);
@@ -332,8 +363,10 @@ export async function getDutyReadiness(authority: TrainingAuthorityContext, valu
     const records=await client.query<TrainingRecord>('SELECT * FROM acc_training_records WHERE user_id=ANY($1::integer[]) AND course_id=ANY($2::integer[])',[[...new Set(selected.map(row=>row.userId))],[...new Set(pins.map(pin=>pin.courseId))]]);
     for(const record of records.rows)await verifyRecordAssessment(client,record);
     const materials=new Map<number,NonNullable<Awaited<ReturnType<typeof publishedMaterial>>>>();for(const course of courses.rows){const pub=await publishedMaterial(client,course);if(pub)materials.set(course.id,pub);}
-    return {obligations:new Map(obligations.rows.map(row=>[row.id,row])),courses:new Map(courses.rows.map(row=>[row.id,row])),records:new Map(records.rows.map(row=>[`${row.userId}:${row.courseId}`,row])),materials};
-  }):{obligations:new Map<number,TrainingObligation>(),courses:new Map<number,TrainingCourse>(),records:new Map<string,TrainingRecord>(),materials:new Map<number,NonNullable<Awaited<ReturnType<typeof publishedMaterial>>>>()};
+    // Signature bindings share the snapshot of the completions and publications they sign (/2 only).
+    const signatures=signed?await signatureBindings(client,{recordIds:records.rows.map(row=>row.id),draftIds:[...materials.values()].map(pub=>pub.draftId)}):[];
+    return {obligations:new Map(obligations.rows.map(row=>[row.id,row])),courses:new Map(courses.rows.map(row=>[row.id,row])),records:new Map(records.rows.map(row=>[`${row.userId}:${row.courseId}`,row])),materials,signatures};
+  }):{obligations:new Map<number,TrainingObligation>(),courses:new Map<number,TrainingCourse>(),records:new Map<string,TrainingRecord>(),materials:new Map<number,NonNullable<Awaited<ReturnType<typeof publishedMaterial>>>>(),signatures:[] as TrainingSignatureBinding[]};
   const materialObservations=new Map<string,{publication:NonNullable<Awaited<ReturnType<typeof publishedMaterial>>>;learner:{userId:number;scope:TrainingObligationScope};observationHash:string}>();
   // Resolve the retained obligation scope as well as its declared applicability.
   // A parent obligation does not remain valid after its parent's role is revoked.
@@ -357,11 +390,14 @@ export async function getDutyReadiness(authority: TrainingAuthorityContext, valu
       if(course?.materialScope&&row){const publication=local.materials.get(course.id)!;const learner={userId:row.userId,scope:row.scope},key=canonical({courseId:course.id,learner});
         if(!materialObservations.has(key)){const observed=await observePublication(authority,publication,learner);materialObservations.set(key,{publication,learner,observationHash:trainingDutyHash(observed)});}course.materialReady=true;}
       const record = exact ? local.records.get(`${assignment.userId}:${pin.courseId}`)??null : null;
+      const signatures=signed?pinSignatures(local.signatures,record,course?.materialScope?local.materials.get(course.id)??null:null):undefined;
       const result={ ...pin, readiness:'source_changed',retainedScope,retainedScopeObservationHash:retainedAuthority?.observationHash??null, recordId: record?.id ?? null,
         certificateNumber: record?.certificateNumber ?? null, completedAt: dutyTimestamp(record?.completedAt),
-        verifiedAt: dutyTimestamp(record?.verifiedAt), verifiedBy: record?.verifiedBy ?? null };
+        verifiedAt: dutyTimestamp(record?.verifiedAt), verifiedBy: record?.verifiedBy ?? null, ...(signatures?{signatures}:{}) };
       evaluateCompletions.push(cutoff=>{
         result.readiness=exact&&course?obligationReadiness(row,course,record,observation.eligible&&observation.roles.includes(assignment.role)&&retainedAuthority?.eligible&&retainedAuthority.roles.includes(assignment.role)?'current':'changed',cutoff):'source_changed';
+        // The blocker names the learner and obligation only, never an arm.
+        if(signatures&&result.readiness==='complete'&&(!signatures.attestation||!signatures.verification||course?.materialScope&&!signatures.materialApproval))result.readiness='signature_required';
         if(result.readiness!=='complete')blockers.push(`Learner ${assignment.userId}, obligation ${pin.id}: ${result.readiness}.`);
       });
       evidence.push(result);
@@ -376,6 +412,6 @@ export async function getDutyReadiness(authority: TrainingAuthorityContext, valu
   // native callbacks. A completion expiring during observation cannot be ready.
   const cutoff=Date.now();for(const evaluate of evaluateCompletions)evaluate(cutoff);
   const evidence = { policyHash: trainingDutyHash(request.policy), actorUserId: request.actorUserId ?? null, duty: request.duty ?? 'complete_census',armIds:request.armIds??[], assignments, blockers, ready: !blockers.length };
-  return { schemaVersion: 'training-duty-readiness/1', nonce: request.nonce, observedAt: new Date(cutoff).toISOString(),
+  return { schemaVersion: signed ? 'training-duty-readiness/2' : 'training-duty-readiness/1', nonce: request.nonce, observedAt: new Date(cutoff).toISOString(),
     consistency: 'current-observations-not-atomic', ...evidence, evidenceHash: trainingDutyHash(evidence) };
 }
