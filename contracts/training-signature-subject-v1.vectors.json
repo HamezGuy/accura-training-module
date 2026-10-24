@@ -1,0 +1,100 @@
+{
+  "schemaVersion": "training-signature-subject-vectors/1",
+  "description": "Committed hash vectors for training-signature-subject/1. subjectHash is the hex SHA-256 of canonical, the subject in canonical JSON (object keys sorted by code unit, arrays in order, JSON.stringify scalars and strings). The training service and the EDC each hash these subjects with their own canonicalizer and must reproduce both values. Synthetic values only.",
+  "vectors": [
+    {
+      "name": "completion attestation in a site context",
+      "subject": {
+        "schemaVersion": "training-signature-subject/1",
+        "kind": "completion-attestation",
+        "context": {
+          "studyId": 100,
+          "siteId": 101
+        },
+        "learnerUserId": 22,
+        "recordId": 7,
+        "courseId": 3,
+        "courseVersion": "1.0",
+        "contentRevision": 4,
+        "assessmentCycleId": "6f1c2b8e-3d4a-4e5f-9a6b-7c8d9e0f1a2b",
+        "assessment": {
+          "id": "0b1c2d3e-4f50-4617-8829-3a4b5c6d7e8f",
+          "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "completedAt": "2026-10-24T09:15:30.123Z",
+        "certificateNumber": "AT-CERT-SYN-22-MH7Q2K-1A2B3C"
+      },
+      "canonical": "{\"assessment\":{\"hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"id\":\"0b1c2d3e-4f50-4617-8829-3a4b5c6d7e8f\"},\"assessmentCycleId\":\"6f1c2b8e-3d4a-4e5f-9a6b-7c8d9e0f1a2b\",\"certificateNumber\":\"AT-CERT-SYN-22-MH7Q2K-1A2B3C\",\"completedAt\":\"2026-10-24T09:15:30.123Z\",\"contentRevision\":4,\"context\":{\"siteId\":101,\"studyId\":100},\"courseId\":3,\"courseVersion\":\"1.0\",\"kind\":\"completion-attestation\",\"learnerUserId\":22,\"recordId\":7,\"schemaVersion\":\"training-signature-subject/1\"}",
+      "subjectHash": "fa736aa1972f0dddedeef1e2211622f97dbb5b7b20faa04e77855eb771ecec2c"
+    },
+    {
+      "name": "verification in a study context (no site)",
+      "subject": {
+        "schemaVersion": "training-signature-subject/1",
+        "kind": "verification",
+        "context": {
+          "studyId": 100
+        },
+        "learnerUserId": 22,
+        "recordId": 7,
+        "courseId": 3,
+        "courseVersion": "1.0",
+        "contentRevision": 4,
+        "assessmentCycleId": "6f1c2b8e-3d4a-4e5f-9a6b-7c8d9e0f1a2b",
+        "assessment": {
+          "id": "0b1c2d3e-4f50-4617-8829-3a4b5c6d7e8f",
+          "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "completedAt": "2026-10-24T09:15:30.123Z",
+        "certificateNumber": "AT-CERT-SYN-22-MH7Q2K-1A2B3C"
+      },
+      "canonical": "{\"assessment\":{\"hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"id\":\"0b1c2d3e-4f50-4617-8829-3a4b5c6d7e8f\"},\"assessmentCycleId\":\"6f1c2b8e-3d4a-4e5f-9a6b-7c8d9e0f1a2b\",\"certificateNumber\":\"AT-CERT-SYN-22-MH7Q2K-1A2B3C\",\"completedAt\":\"2026-10-24T09:15:30.123Z\",\"contentRevision\":4,\"context\":{\"studyId\":100},\"courseId\":3,\"courseVersion\":\"1.0\",\"kind\":\"verification\",\"learnerUserId\":22,\"recordId\":7,\"schemaVersion\":\"training-signature-subject/1\"}",
+      "subjectHash": "e419def531df1a831f6a0bc15986b3bff6614a443cbcae023d7d91d0ba2c381d"
+    },
+    {
+      "name": "material approval of a site-scoped draft",
+      "subject": {
+        "schemaVersion": "training-signature-subject/1",
+        "kind": "material-approval",
+        "context": {
+          "studyId": 100,
+          "siteId": 101
+        },
+        "draftId": "9d8c7b6a-5f4e-4d3c-8b2a-1f0e9d8c7b6a",
+        "draftRevision": 1,
+        "requestHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "courseId": 3,
+        "authorUserId": 11,
+        "sourceHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "disposition": "accepted"
+      },
+      "canonical": "{\"authorUserId\":11,\"context\":{\"siteId\":101,\"studyId\":100},\"courseId\":3,\"disposition\":\"accepted\",\"draftId\":\"9d8c7b6a-5f4e-4d3c-8b2a-1f0e9d8c7b6a\",\"draftRevision\":1,\"kind\":\"material-approval\",\"requestHash\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"schemaVersion\":\"training-signature-subject/1\",\"sourceHash\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}",
+      "subjectHash": "caeffb995ec1d6a15e90f1fe69a0d25e566e12fca18a896ee50d6686438bf6c7"
+    },
+    {
+      "name": "key order and non-ASCII text do not change the canonical form",
+      "subject": {
+        "certificateNumber": "AT-CERT-SYN-éß-1",
+        "completedAt": "2026-01-02T03:04:05.006Z",
+        "assessment": {
+          "hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "id": "11111111-2222-4333-8444-555555555555"
+        },
+        "assessmentCycleId": "66666666-7777-4888-9999-aaaaaaaaaaaa",
+        "contentRevision": 1,
+        "courseVersion": "v2 \"quoted\"",
+        "courseId": 2147483647,
+        "recordId": 1,
+        "learnerUserId": 2,
+        "context": {
+          "siteId": 2,
+          "studyId": 1
+        },
+        "kind": "completion-attestation",
+        "schemaVersion": "training-signature-subject/1"
+      },
+      "canonical": "{\"assessment\":{\"hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"id\":\"11111111-2222-4333-8444-555555555555\"},\"assessmentCycleId\":\"66666666-7777-4888-9999-aaaaaaaaaaaa\",\"certificateNumber\":\"AT-CERT-SYN-éß-1\",\"completedAt\":\"2026-01-02T03:04:05.006Z\",\"contentRevision\":1,\"context\":{\"siteId\":2,\"studyId\":1},\"courseId\":2147483647,\"courseVersion\":\"v2 \\\"quoted\\\"\",\"kind\":\"completion-attestation\",\"learnerUserId\":2,\"recordId\":1,\"schemaVersion\":\"training-signature-subject/1\"}",
+      "subjectHash": "3045e300cccd031af85e8d66156bafb415ae1611738eb2a8dd3ed58fc12d089f"
+    }
+  ]
+}

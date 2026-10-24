@@ -1,0 +1,3 @@
+# Producer-owned contract schemas are vendored and pinned by hash in other repositories:
+# keep their bytes identical on every checkout (no line-ending conversion).
+contracts/** -text

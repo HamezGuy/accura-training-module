@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.accuratrials.com/training/training-duty-readiness/2",
+  "title": "training-duty-readiness/2",
+  "description": "The training service's answer (the data member of POST /api/training/duty-readiness) to a training-duty-readiness-request/2, which carries exactly a reviewed training-duty-policy/2. It is training-duty-readiness/1 plus, on every obligation pin, the Part 11 signatures it cites. A pin that /1 would report complete reads signature_required until the learner's attestation, the recorded verifier's signature and, for governed material, the reviewer's approval are bound. The EDC verifies each cited signature against its own signature rows. evidenceHash is the hex SHA-256 of the canonical JSON of the reply without schemaVersion, nonce, observedAt, consistency and evidenceHash. A request /1 is answered in /1 exactly as before.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "nonce", "observedAt", "consistency", "policyHash", "actorUserId", "duty", "armIds", "assignments", "blockers", "ready", "evidenceHash"],
+  "properties": {
+    "schemaVersion": { "const": "training-duty-readiness/2" },
+    "nonce": { "type": "string", "pattern": "^[a-f0-9]{32}$" },
+    "observedAt": { "$ref": "#/$defs/Instant" },
+    "consistency": { "const": "current-observations-not-atomic" },
+    "policyHash": { "$ref": "#/$defs/Sha256Hex" },
+    "actorUserId": { "oneOf": [{ "$ref": "#/$defs/NativeId" }, { "type": "null" }] },
+    "duty": { "enum": ["participant_enrollment", "arm_assignment", "supply_dispensing", "data_entry", "complete_census"] },
+    "armIds": { "type": "array", "maxItems": 100, "uniqueItems": true, "items": { "$ref": "#/$defs/NativeId" } },
+    "assignments": { "type": "array", "maxItems": 1000, "items": { "$ref": "#/$defs/Assignment" } },
+    "blockers": { "type": "array", "items": { "type": "string" } },
+    "ready": { "type": "boolean" },
+    "evidenceHash": { "$ref": "#/$defs/Sha256Hex" }
+  },
+  "$defs": {
+    "NativeId": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+    "Sha256Hex": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "NativeHash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "Instant": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$" },
+    "Duty": { "enum": ["site_activation", "participant_enrollment", "arm_assignment", "supply_dispensing", "data_entry"] },
+    "Assignment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["userId", "role", "disposition", "rationale", "duties", "scopeObservationHash", "scopeFingerprint", "obligations"],
+      "properties": {
+        "userId": { "$ref": "#/$defs/NativeId" },
+        "role": { "type": "string", "minLength": 1 },
+        "armId": { "$ref": "#/$defs/NativeId" },
+        "disposition": { "enum": ["required", "not_required"] },
+        "rationale": { "type": "string", "minLength": 1, "maxLength": 2000 },
+        "duties": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/Duty" } },
+        "scopeObservationHash": { "$ref": "#/$defs/NativeHash" },
+        "scopeFingerprint": { "$ref": "#/$defs/NativeHash" },
+        "obligations": { "type": "array", "maxItems": 32, "items": { "$ref": "#/$defs/Obligation" } }
+      }
+    },
+    "Obligation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision", "courseId", "courseVersion", "contentRevision", "readiness", "retainedScope", "retainedScopeObservationHash", "recordId", "certificateNumber", "completedAt", "verifiedAt", "verifiedBy", "signatures"],
+      "properties": {
+        "id": { "$ref": "#/$defs/NativeId" },
+        "revision": { "$ref": "#/$defs/NativeId" },
+        "courseId": { "$ref": "#/$defs/NativeId" },
+        "courseVersion": { "type": "string", "minLength": 1, "maxLength": 20 },
+        "contentRevision": { "$ref": "#/$defs/NativeId" },
+        "readiness": { "enum": ["withdrawn", "scope_changed", "scope_unavailable", "course_inactive", "retraining_required", "pending", "in_progress", "awaiting_verification", "complete", "source_changed", "signature_required"] },
+        "retainedScope": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/ObligationScope" }] },
+        "retainedScopeObservationHash": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/NativeHash" }] },
+        "recordId": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/NativeId" }] },
+        "certificateNumber": { "oneOf": [{ "type": "null" }, { "type": "string", "minLength": 1 }] },
+        "completedAt": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/Instant" }] },
+        "verifiedAt": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/Instant" }] },
+        "verifiedBy": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/NativeId" }] },
+        "signatures": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["attestation", "verification", "materialApproval"],
+          "properties": {
+            "attestation": { "$ref": "#/$defs/CitedSignature" },
+            "verification": { "$ref": "#/$defs/CitedSignature" },
+            "materialApproval": { "$ref": "#/$defs/CitedSignature" }
+          }
+        }
+      }
+    },
+    "ObligationScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["studyId"],
+      "properties": {
+        "studyId": { "$ref": "#/$defs/NativeId" },
+        "siteId": { "$ref": "#/$defs/NativeId" },
+        "armId": { "$ref": "#/$defs/NativeId" }
+      }
+    },
+    "CitedSignature": {
+      "description": "null, or a bound signature: the EDC's own signature id, the subject hash and the subject signed.",
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["signatureId", "subjectHash", "subject"],
+          "properties": {
+            "signatureId": { "type": "integer", "minimum": 1 },
+            "subjectHash": { "$ref": "#/$defs/Sha256Hex" },
+            "subject": { "$ref": "https://schemas.accuratrials.com/training/training-signature-subject/1" }
+          }
+        }
+      ]
+    }
+  }
+}

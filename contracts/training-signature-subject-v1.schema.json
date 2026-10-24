@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.accuratrials.com/training/training-signature-subject/1",
+  "title": "training-signature-subject/1",
+  "description": "What a person signs, with password re-entry in the EDC, for a training decision. The training service produces it (GET /api/training/signature-subject); the EDC recomputes its hash before signing and when it verifies a cited signature. Hash: hex SHA-256 of canonical JSON (object keys sorted, arrays in order, JSON.stringify scalars). No participant data and no arm id appear in a subject. matrix-approval is reserved for the curriculum matrix and is not produced.",
+  "oneOf": [
+    { "$ref": "#/$defs/RecordDecisionSubject" },
+    { "$ref": "#/$defs/MaterialApprovalSubject" }
+  ],
+  "$defs": {
+    "NativeId": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+    "Sha256Hex": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "Uuid": { "type": "string", "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$" },
+    "Instant": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$" },
+    "Context": {
+      "description": "The study, or the site, the person signs in. Record decisions use the study and site of an assigned obligation of the learner for the course (its arm is not part of the context); material approval uses the draft's material scope.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["studyId"],
+      "properties": {
+        "studyId": { "$ref": "#/$defs/NativeId" },
+        "siteId": { "$ref": "#/$defs/NativeId" }
+      }
+    },
+    "RecordDecisionSubject": {
+      "description": "Learner completion attestation and independent verification sign the same subject: one exact completion with its retained assessment cycle, passing assessment receipt and certificate. The signer and signing time are facts of the signature, not of the subject.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "context", "learnerUserId", "recordId", "courseId", "courseVersion", "contentRevision", "assessmentCycleId", "assessment", "completedAt", "certificateNumber"],
+      "properties": {
+        "schemaVersion": { "const": "training-signature-subject/1" },
+        "kind": { "enum": ["completion-attestation", "verification"] },
+        "context": { "$ref": "#/$defs/Context" },
+        "learnerUserId": { "$ref": "#/$defs/NativeId" },
+        "recordId": { "$ref": "#/$defs/NativeId" },
+        "courseId": { "$ref": "#/$defs/NativeId" },
+        "courseVersion": { "type": "string", "minLength": 1, "maxLength": 20 },
+        "contentRevision": { "$ref": "#/$defs/NativeId" },
+        "assessmentCycleId": { "$ref": "#/$defs/Uuid" },
+        "assessment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "hash"],
+          "properties": {
+            "id": { "$ref": "#/$defs/Uuid" },
+            "hash": { "$ref": "#/$defs/Sha256Hex" }
+          }
+        },
+        "completedAt": { "$ref": "#/$defs/Instant" },
+        "certificateNumber": { "type": "string", "minLength": 1, "maxLength": 100 }
+      }
+    },
+    "MaterialApprovalSubject": {
+      "description": "An accepted review of one immutable governed material draft, at the draft revision it was reviewed in. The approver is never the author.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "context", "draftId", "draftRevision", "requestHash", "courseId", "authorUserId", "sourceHash", "disposition"],
+      "properties": {
+        "schemaVersion": { "const": "training-signature-subject/1" },
+        "kind": { "const": "material-approval" },
+        "context": { "$ref": "#/$defs/Context" },
+        "draftId": { "$ref": "#/$defs/Uuid" },
+        "draftRevision": { "$ref": "#/$defs/NativeId" },
+        "requestHash": { "$ref": "#/$defs/Sha256Hex" },
+        "courseId": { "$ref": "#/$defs/NativeId" },
+        "authorUserId": { "$ref": "#/$defs/NativeId" },
+        "sourceHash": { "$ref": "#/$defs/Sha256Hex" },
+        "disposition": { "const": "accepted" }
+      }
+    }
+  }
+}
