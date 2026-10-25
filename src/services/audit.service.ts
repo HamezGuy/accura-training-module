@@ -31,6 +31,7 @@ export type AuditAction =
   | 'training_material_rejected'
   | 'training_material_published'
   | 'training_inspection_read'
+  | 'training_inspection_segment_read'
   | 'training_completion_attested'
   | 'training_signature_bound'
   | 'compliance_checked';

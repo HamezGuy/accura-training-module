@@ -1,6 +1,9 @@
 // Opt-in only: an owner-provisioned, empty disposable PostgreSQL database.
 // No existing application database or credential variable is ever selected.
 import express from 'express';
+import fs from 'node:fs';
+import path from 'node:path';
+import Ajv2020 from 'ajv/dist/2020';
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
@@ -179,6 +182,48 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
   }
   const inspect = (body: Record<string, unknown>) => request(app).post('/api/training/inspection-evidence').set('Authorization', `Bearer ${token}`).send(body);
   const tableRows = (evidence: any, table: string) => evidence.tables.find((t: any) => t.table === table).rows.map((row: any) => JSON.parse(row.nativeJson));
+  // training-inspection-evidence/2 (FX-TRN-04): the switch is set only inside these cases and restored after each.
+  const contracts = new Ajv2020({ allErrors: true, strict: true });
+  for (const name of ['training-inspection-evidence-v2.schema.json', 'training-inspection-segment-v1.schema.json'])
+    contracts.addSchema(JSON.parse(fs.readFileSync(path.join(__dirname, '../../contracts', name), 'utf8')));
+  const conforms = (id: string, value: unknown) => { const validate = contracts.getSchema(`https://schemas.accuratrials.com/training/${id}`)!; return validate(value) ? 'valid' : JSON.stringify(validate.errors); };
+  async function withSegments(run: () => Promise<void>) {
+    const previous = process.env['TRAINING_INSPECTION_SEGMENTS_ENABLED']; process.env['TRAINING_INSPECTION_SEGMENTS_ENABLED'] = 'true';
+    try { await run(); } finally { if (previous === undefined) delete process.env['TRAINING_INSPECTION_SEGMENTS_ENABLED']; else process.env['TRAINING_INSPECTION_SEGMENTS_ENABLED'] = previous; }
+  }
+  const segmentOf = (captureId: string, nonce: string, ordinal: number) => request(app).post('/api/training/inspection-evidence/segment').set('Authorization', `Bearer ${token}`)
+    .send({ schemaVersion: 'training-inspection-segment-request/1', captureId, nonce, ordinal });
+  const sha = (text: string) => createHash('sha256').update(text).digest('hex');
+  /** Every segment of a /2 manifest, each checked against its schema and recomputed from its rows. */
+  async function segmentsOf(manifest: any, nonce: string) {
+    const fetched: any[] = [];
+    for (const descriptor of manifest.segments) {
+      const response = await segmentOf(manifest.captureId, nonce, descriptor.ordinal);
+      expect({ ordinal: descriptor.ordinal, status: response.status }).toEqual({ ordinal: descriptor.ordinal, status: 200 });
+      const segment = response.body.data;
+      expect(conforms('training-inspection-segment/1', segment)).toBe('valid');
+      expect(segment).toMatchObject({ captureId: manifest.captureId, manifestHash: manifest.manifestHash, ...descriptor });
+      expect(segment.rows.every((row: any) => row.sha256 === sha(row.nativeJson))).toBe(true);
+      expect(trainingEvidenceHash(segment.rows)).toBe(descriptor.contentHash);
+      expect(segment.rows.reduce((n: number, row: any) => n + Buffer.byteLength(row.nativeJson), 0)).toBe(descriptor.bytes);
+      fetched.push(segment);
+    }
+    return fetched;
+  }
+  const rowsOf = (segments: any[], table: string) => segments.filter(s => s.table === table).flatMap(s => s.rows);
+  const v2Tables = ['acc_training_obligations', 'acc_training_obligation_events', 'acc_training_impact_plans', 'acc_training_impact_events', 'acc_training_courses',
+    'acc_training_slides', 'acc_training_questions', 'acc_training_records', 'acc_training_record_history', 'acc_training_material_drafts',
+    'acc_training_material_publications', 'acc_training_material_events', 'acc_training_audit_log', 'acc_training_decision_signatures', 'acc_training_effort_intervals'];
+  function checkManifest(manifest: any, nonce: string) {
+    expect(conforms('training-inspection-evidence/2', manifest)).toBe('valid');
+    expect(manifest).toMatchObject({ schemaVersion: 'training-inspection-evidence/2', nonce, complete: true, nativeStudyId: 100, actorUserId: 111 });
+    expect(manifest.segments.map((s: any) => s.ordinal)).toEqual(manifest.segments.map((_: any, i: number) => i));
+    expect([...new Set(manifest.segments.map((s: any) => s.table))]).toEqual(v2Tables);
+    expect(trainingEvidenceHash({ captureId: manifest.captureId, capturedAt: manifest.capturedAt, segments: manifest.segments })).toBe(manifest.manifestHash);
+    const { schemaVersion, nonce: _nonce, observedAt, consistency, evidenceHash, ...body } = manifest;
+    expect([schemaVersion, typeof observedAt, consistency]).toEqual(['training-inspection-evidence/2', 'string', 'training-snapshot-with-separate-native-observations']);
+    expect(trainingEvidenceHash(body)).toBe(evidenceHash);
+  }
 
   async function snapshot() {
     const state: Record<string, unknown> = {};
@@ -493,10 +538,86 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
     expect(tableRows(response.body.data, 'acc_training_material_drafts').map((row: any) => row.id)).toEqual([draftId]);
   });
 
+  test('/2 is /1 cut into hashed segments plus scoped signature bindings and effort intervals; out-of-scope rows are withheld whole', () => withSegments(async () => {
+    inspectionScopes = [{ studyId: 100 }];
+    const { draftId } = await governedMaterial();
+    const revision = (await fixturePool.query('SELECT content_revision FROM acc_training_courses WHERE id=$1', [courseId])).rows[0].content_revision;
+    const scope = { studyId: 100 };
+    const obligation = (await fixturePool.query(`INSERT INTO acc_training_obligations(user_id,course_id,course_version,content_revision,role,scope,scope_observation,due_at,reason,assigned_by)
+      VALUES(222,$1,'1',$2,'data_manager',$3,'{}','2099-01-01T00:00:00Z','SYNTHETIC inspection obligation',111) RETURNING id`, [courseId, revision, JSON.stringify(scope)])).rows[0].id;
+    await fixturePool.query(`INSERT INTO acc_training_obligation_events(obligation_id,revision,actor_user_id,action,snapshot) VALUES($1,1,111,'obligation_assigned',$2)`,
+      [obligation, JSON.stringify({ id: obligation, userId: 222, courseId, scope, revision: 1, status: 'assigned', courseVersion: '1', contentRevision: revision })]);
+    const binding = (edc: number, decision: string, context: object, record: number | null, draft: string | null) => fixturePool.query(`INSERT INTO acc_training_decision_signatures
+      (edc_signature_id,decision,request_key,signer_user_id,signed_at,context,subject,subject_hash,receipt,edc_observation_hash,record_id,assessment_cycle_id,draft_id)
+      VALUES($1,$2,$3,333,NOW(),$4,'{}','${'a'.repeat(64)}','{}','synthetic',$5,$6,$7)`, [edc, decision, randomUUID(), JSON.stringify(context), record, record ? randomUUID() : null, draft]);
+    await binding(8101, 'material-approval', scope, null, draftId);
+    await binding(8102, 'completion-attestation', { studyId: 200 }, recordId, null); // another study: withheld
+    await binding(8103, 'verification', scope, recordId, null);
+    const interval = (served: object[]) => fixturePool.query(`INSERT INTO acc_training_effort_intervals(request_key,kind,actor_user_id,learner_user_id,record_id,course_id,served,ended_at,start_basis)
+      VALUES($1,'learning',222,222,$2,$3,$4,NOW(),'not-supplied') RETURNING id`, [randomUUID(), recordId, courseId, JSON.stringify(served)]);
+    const included = Number((await interval([{ obligationId: obligation, revision: 1, role: 'data_manager', scope }])).rows[0].id);
+    await interval([{ obligationId: obligation, revision: 1, role: 'data_manager', scope }, { obligationId: 999, revision: 1, role: 'ra', scope: { studyId: 200, armId: 7 } }]);
+    const nonce = randomBytes(16).toString('hex');
+    const v1 = (await inspect({ nativeStudyId: 100, nonce: randomBytes(16).toString('hex') })).body.data;
+    const response = await inspect({ schemaVersion: 'training-inspection-evidence-request/2', nativeStudyId: 100, nonce });
+    expect(response.status).toBe(200);
+    const manifest = response.body.data; checkManifest(manifest, nonce);
+    expect(manifest.segments).toHaveLength(15);
+    const segments = await segmentsOf(manifest, nonce);
+    // The 13 /1 tables: the same rows in the same order, so each /1 table hash recomputes from the segments.
+    for (const table of v1.tables) {
+      expect({ table: table.table, rows: rowsOf(segments, table.table) }).toEqual({ table: table.table, rows: table.rows });
+      expect(trainingEvidenceHash(rowsOf(segments, table.table))).toBe(table.contentHash);
+    }
+    expect(rowsOf(segments, 'acc_training_decision_signatures').map((row: any) => JSON.parse(row.nativeJson).edc_signature_id)).toEqual([8101, 8103]);
+    expect(rowsOf(segments, 'acc_training_effort_intervals').map((row: any) => JSON.parse(row.nativeJson).id)).toEqual([included]);
+    expect(manifest.gaps).toEqual(expect.arrayContaining([
+      '1 Part 11 signature binding(s) of selected training decisions name a study or site outside this inspection and are withheld whole.',
+      '1 training effort interval(s) of selected records also served obligations outside this inspection and are withheld whole.']));
+    expect(segments.flatMap(segment => segment.rows).filter((row: any) => /"armId": ?7[,}]/.test(row.nativeJson))).toEqual([]);
+    // The capture keeps the census and row keys only, and is append-only.
+    const capture = (await fixturePool.query('SELECT * FROM acc_training_inspection_captures WHERE capture_id=$1', [manifest.captureId])).rows[0];
+    expect(capture).toMatchObject({ actor_user_id: 111, nonce_sha256: sha(nonce), native_study_id: 100, manifest_hash: manifest.manifestHash, evidence_hash: manifest.evidenceHash });
+    expect(JSON.stringify(capture)).not.toContain('SYNTHETIC inspection obligation');
+    await expect(fixturePool.query('UPDATE acc_training_inspection_captures SET manifest_hash=$1', ['0'.repeat(64)])).rejects.toThrow('Training history is append-only');
+    const audit = (await fixturePool.query("SELECT action,details FROM acc_training_audit_log WHERE action IN ('training_inspection_read','training_inspection_segment_read') ORDER BY id")).rows;
+    expect(audit.map(row => row.action)).toEqual(['training_inspection_read', 'training_inspection_read', ...manifest.segments.map(() => 'training_inspection_segment_read')]);
+    expect(audit[1].details).toMatchObject({ schemaVersion: 'training-inspection-evidence/2', captureId: manifest.captureId, evidenceHash: manifest.evidenceHash });
+  }));
+
+  test('25,000 audit rows: /1 is refused whole (413), /2 is complete in segments whose hashes recompute, and a changed row is refused (409)', () => withSegments(async () => {
+    inspectionScopes = [{ studyId: 100 }];
+    const { courseId: governed } = await governedMaterial();
+    await fixturePool.query(`INSERT INTO acc_training_audit_log(user_id,action,course_id,details)
+      SELECT 222,'course_updated',$1,jsonb_build_object('synthetic',n,'note','SYNTHETIC segmented inspection row') FROM generate_series(1,25000) n`, [governed]);
+    const refused = await inspect({ nativeStudyId: 100, nonce: randomBytes(16).toString('hex') });
+    expect(refused.status).toBe(413);
+    const nonce = randomBytes(16).toString('hex');
+    const response = await inspect({ schemaVersion: 'training-inspection-evidence-request/2', nativeStudyId: 100, nonce });
+    expect(response.status).toBe(200);
+    const manifest = response.body.data; checkManifest(manifest, nonce);
+    const audit = manifest.segments.filter((s: any) => s.table === 'acc_training_audit_log');
+    expect(audit.map((s: any) => s.count)).toEqual([10000, 10000, 5000]);
+    const segments = await segmentsOf(manifest, nonce);
+    const ids = rowsOf(segments, 'acc_training_audit_log').map((row: any) => JSON.parse(row.nativeJson).id);
+    expect(ids).toHaveLength(25000); expect(new Set(ids).size).toBe(25000); expect([...ids].sort((a, b) => a - b)).toEqual(ids);
+    // A course changed after capture: its segment is refused, an unchanged one still answers.
+    await fixturePool.query("UPDATE acc_training_courses SET description='SYNTHETIC change after capture' WHERE id=$1", [governed]);
+    const courses = manifest.segments.find((s: any) => s.table === 'acc_training_courses');
+    expect((await segmentOf(manifest.captureId, nonce, courses.ordinal)).status).toBe(409);
+    expect((await segmentOf(manifest.captureId, nonce, audit[2].ordinal)).status).toBe(200);
+    // Another nonce, an ordinal past the census and a switched-off service are refused.
+    expect((await segmentOf(manifest.captureId, randomBytes(16).toString('hex'), 0)).status).toBe(404);
+    expect((await segmentOf(manifest.captureId, nonce, manifest.segments.length)).status).toBe(404);
+    delete process.env['TRAINING_INSPECTION_SEGMENTS_ENABLED'];
+    expect((await segmentOf(manifest.captureId, nonce, 0)).status).toBe(503);
+    expect((await inspect({ schemaVersion: 'training-inspection-evidence-request/2', nativeStudyId: 100, nonce: randomBytes(16).toString('hex') })).status).toBe(503);
+  }), 180_000);
+
   // Statement guards fire whether or not a table holds rows; the log and record history hold real ones here.
   const historyTables = ['acc_training_audit_log', 'acc_training_obligation_events', 'acc_training_record_history',
     'acc_training_impact_events', 'acc_training_material_publications', 'acc_training_material_events', 'acc_training_decision_signatures',
-    'acc_training_effort_intervals'];
+    'acc_training_effort_intervals', 'acc_training_inspection_captures'];
   const tamper = (id: number) => [`UPDATE acc_training_audit_log SET action='tampered' WHERE id=${id}`, `DELETE FROM acc_training_audit_log WHERE id=${id}`];
 
   test('the audit log refuses UPDATE, DELETE and TRUNCATE and every history table refuses TRUNCATE, also by cascade', async () => {
@@ -511,7 +632,7 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
     await runMigrations();
     const guards = (await fixturePool.query(`SELECT c.relname, t.tgname, t.tgenabled FROM pg_trigger t
       JOIN pg_class c ON c.oid = t.tgrelid WHERE NOT t.tgisinternal AND t.tgname ~ '^acc_training_.*_guard$' ORDER BY 1, 2`)).rows;
-    expect(guards).toHaveLength(18);
+    expect(guards).toHaveLength(20);
     expect(guards.filter(guard => guard.tgenabled !== 'A')).toEqual([]);
   });
 

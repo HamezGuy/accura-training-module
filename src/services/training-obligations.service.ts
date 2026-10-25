@@ -10,8 +10,8 @@ import {bindingFor,recordDecisionSubject,signatureBindings,signatureReference} f
 // The impact plan service reaches the signature leaf through this module: the EDC's native suites compile it with
 // replacements for this module only (tests/helpers/synthetic-training-readiness.ts there).
 export {bindingStatus,bindSignatureReceipt,checkSignedDecision,impactReviewBinding,impactReviewSubject,readSignatureReceipt,signatureAuditDetails} from './training-signatures.service';
-import {createHash} from 'node:crypto';
-import type {TrainingInspectionEvidence,TrainingMaterialSource,TrainingRecordSignatureDecision,TrainingSignatureBinding,TrainingSignatureReference} from '../types/training.types';
+import {createHash,randomUUID} from 'node:crypto';
+import type {TrainingInspectionEvidence,TrainingInspectionManifest,TrainingInspectionSegment,TrainingInspectionSegmentDescriptor,TrainingMaterialSource,TrainingRecordSignatureDecision,TrainingSignatureBinding,TrainingSignatureReference} from '../types/training.types';
 
 function fail(message: string, statusCode = 409): never { throw Object.assign(new Error(message), { statusCode }); }
 const id = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) > 0 && Number(value) <= 2147483647;
@@ -219,52 +219,123 @@ export async function getObligationHistory(authority: TrainingAuthorityContext, 
     records: records.rows.map(mapRecordToDto), history: history.rows.map(row=>({...row,record:mapRecordToDto(row.record)})), audit: audit.rows};
 }
 
-/** Privileged constituent of the existing EDC inspection copy. This endpoint
- * never persists a second package and never widens ordinary learner history. */
+/** Privileged constituent of the existing EDC inspection copy. /1 never persists a second package and never widens
+ * ordinary learner history. /2 (FX-TRN-04; off unless TRAINING_INSPECTION_SEGMENTS_ENABLED=true, read at every request)
+ * answers the same snapshot, plus the signature bindings and effort intervals, as a manifest of hashed segments, and
+ * keeps one append-only capture row: the segment census and each segment's primary keys, never the rows. A segment
+ * is re-read from the current rows on request and refused when its hash changed, so no copy of privileged rows is kept. */
 let activeInspectionReads=0;
-export async function getTrainingInspectionEvidence(authority:TrainingAuthorityContext,value:unknown):Promise<TrainingInspectionEvidence>{
+export const inspectionSegmentsEnabled=()=>process.env.TRAINING_INSPECTION_SEGMENTS_ENABLED==='true';
+const INSPECTION_REQUEST_2='training-inspection-evidence-request/2',SEGMENT_REQUEST='training-inspection-segment-request/1';
+/** The declared /2 bounds (contracts/training-inspection-evidence-v2.schema.json). The segment count replaces the /1 table, row and byte budgets. */
+const INSPECTION_LIMITS={maxSegments:256,maxSegmentRows:10000,maxSegmentBytes:8*1024*1024};
+const INSPECTION_PAGE_ROWS=1000;
+/** Every table of the inspection copy in declared order: its primary key, its total row order (with SQL types) and
+ * its projection. /1 reads the first 13 tables; /2 all 15. */
+const INSPECTION_TABLES:Record<string,{key:[string,string];order:Array<[string,string]>;projection:string}>={
+ acc_training_obligations:{key:['id','int'],order:[['id','int']],projection:'*'},
+ acc_training_obligation_events:{key:['id','bigint'],order:[['obligation_id','int'],['revision','int']],projection:'*'},
+ acc_training_impact_plans:{key:['id','uuid'],order:[['id','uuid']],projection:'*'},
+ acc_training_impact_events:{key:['id','bigint'],order:[['plan_id','uuid'],['revision','int']],projection:'*'},
+ acc_training_courses:{key:['id','int'],order:[['id','int']],projection:'*'},
+ acc_training_slides:{key:['id','int'],order:[['course_id','int'],['order_index','int'],['id','int']],projection:'*'},
+ acc_training_questions:{key:['id','int'],order:[['course_id','int'],['order_index','int'],['id','int']],projection:'*'},
+ acc_training_records:{key:['id','int'],order:[['id','int']],projection:'*'},
+ acc_training_record_history:{key:['history_id','bigint'],order:[['history_id','bigint']],projection:'*'},
+ acc_training_material_drafts:{key:['id','uuid'],order:[['id','uuid']],projection:'*'},
+ acc_training_material_publications:{key:['id','uuid'],order:[['id','uuid']],projection:'*'},
+ acc_training_material_events:{key:['id','bigint'],order:[['id','bigint']],projection:'*'},
+ // IP addresses and user agents are never part of the copy.
+ acc_training_audit_log:{key:['id','int'],order:[['id','int']],projection:'id,user_id,action,record_id,course_id,details,created_at'},
+ acc_training_decision_signatures:{key:['id','bigint'],order:[['id','bigint']],projection:'*'},
+ acc_training_effort_intervals:{key:['id','bigint'],order:[['id','bigint']],projection:'*'},
+};
+const sha256=(text:string)=>createHash('sha256').update(text).digest('hex');
+const UUID_TEXT=/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+async function inspectionSlot<T>(read:()=>Promise<T>):Promise<T>{
  if(activeInspectionReads>=4)fail('Training inspection capacity is unavailable; retry without requesting a partial copy',503);
  activeInspectionReads++;
- try{return await collectTrainingInspectionEvidence(authority,value);}finally{activeInspectionReads--;}
+ try{return await read();}finally{activeInspectionReads--;}
 }
-async function collectTrainingInspectionEvidence(authority:TrainingAuthorityContext,value:unknown):Promise<TrainingInspectionEvidence>{
- if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(k=>!['nativeStudyId','nonce'].includes(k)))fail('Exact inspection scope and nonce required',400);
+export async function getTrainingInspectionEvidence(authority:TrainingAuthorityContext,value:unknown):Promise<TrainingInspectionEvidence|TrainingInspectionManifest>{
+ // A /2 request is refused before anything else while the switch is off; every other body is answered as before.
+ if((value as {schemaVersion?:unknown}|null)?.schemaVersion===INSPECTION_REQUEST_2&&!inspectionSegmentsEnabled())fail('Segmented training inspection evidence is not enabled on this service',503);
+ return inspectionSlot(()=>collectTrainingInspectionEvidence(authority,value));
+}
+/** The /2 reader of one table inside the capture snapshot: pages in the table's total order (keyset, so a page
+ * never rescans earlier rows), cuts segments at the declared row and byte bounds, keeps each segment's primary keys
+ * and hash, and returns parsed rows only for the tables the closure checks need. */
+function inspectionSegmenter(client:TransactionClient){
+ const segments:TrainingInspectionSegmentDescriptor[]=[],keys:string[][]=[];
+ const read=async(table:string,select:string,values:unknown[],keep:boolean)=>{
+  const spec=INSPECTION_TABLES[table]!,order=spec.order.map(([column])=>`t.${column}`).join(','),parsed:any[]=[];
+  let open={rows:[] as Array<{nativeJson:string;sha256:string}>,keys:[] as string[],bytes:0};let after:string[]|null=null;
+  const seal=()=>{
+   if(segments.length>=INSPECTION_LIMITS.maxSegments)fail(`Training inspection exceeds ${INSPECTION_LIMITS.maxSegments} segments; no partial evidence returned`,413);
+   segments.push({ordinal:segments.length,table,count:open.rows.length,contentHash:trainingEvidenceHash(open.rows),bytes:open.bytes});keys.push(open.keys);
+   open={rows:[],keys:[],bytes:0};
+  };
+  for(;;){
+   const keyset:string=after?` WHERE (${order})>(${spec.order.map(([,type],i)=>`$${values.length+i+1}::${type}`).join(',')})`:'';
+   const page:Array<Record<string,string>>=(await client.query<Record<string,string>>(`SELECT row_to_json(t)::text AS native_json,t.${spec.key[0]}::text AS row_key,
+     ${spec.order.map(([column],i)=>`t.${column}::text AS k${i}`).join(',')} FROM (${select}) t${keyset} ORDER BY ${order} LIMIT ${INSPECTION_PAGE_ROWS}`,
+     after?[...values,...after]:values)).rows;
+   for(const row of page){
+    const text=row.nativeJson!,size=Buffer.byteLength(text);
+    if(size>INSPECTION_LIMITS.maxSegmentBytes)fail('A retained training row exceeds the segment byte bound; no partial evidence returned',413);
+    if(open.rows.length===INSPECTION_LIMITS.maxSegmentRows||open.bytes+size>INSPECTION_LIMITS.maxSegmentBytes)seal();
+    open.rows.push({nativeJson:text,sha256:sha256(text)});open.keys.push(row.rowKey!);open.bytes+=size;
+    if(keep)parsed.push(JSON.parse(text));
+   }
+   if(page.length<INSPECTION_PAGE_ROWS)break;
+   const last:Record<string,string>=page.at(-1)!;after=spec.order.map((_,i):string=>last[`k${i}`]!);
+  }
+  seal();return parsed;
+ };
+ return {segments,keys,read};
+}
+async function collectTrainingInspectionEvidence(authority:TrainingAuthorityContext,value:unknown):Promise<TrainingInspectionEvidence|TrainingInspectionManifest>{
+ const segmented=(value as {schemaVersion?:unknown}|null)?.schemaVersion===INSPECTION_REQUEST_2;
+ if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(k=>![...['nativeStudyId','nonce'],...(segmented?['schemaVersion']:[])].includes(k)))fail('Exact inspection scope and nonce required',400);
  const input=value as {nativeStudyId:number;nonce:string};if(!id(input.nativeStudyId)||typeof input.nonce!=='string'||! /^[a-f0-9]{32}$/.test(input.nonce))fail('Exact inspection scope and nonce required',400);
  const admitted=await observeTrainingInspection(authority,input.nativeStudyId);
  const captured=await transaction(async client=>{
   await client.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');await client.query("SET LOCAL TIME ZONE 'UTC'");
   let bytes=0,count=0;const tables:TrainingInspectionEvidence['tables']=[];
-  const read=async(table:string,sql:string,values:unknown[])=>{const rows=(await client.query<{nativeJson:string}>(`SELECT row_to_json(t)::text AS native_json FROM (${sql}) t LIMIT 10001`,values)).rows;
+  const segmenter=segmented?inspectionSegmenter(client):null;
+  const read=async(table:string,sql:string,values:unknown[],keep=true)=>{
+   if(segmenter)return segmenter.read(table,sql,values,keep);
+   const rows=(await client.query<{nativeJson:string}>(`SELECT row_to_json(t)::text AS native_json FROM (${sql} ORDER BY ${INSPECTION_TABLES[table]!.order.map(([column])=>column).join(',')}) t LIMIT 10001`,values)).rows;
    if(rows.length>10000)fail('Training inspection exceeds a complete table budget; no partial evidence returned',413);
    count+=rows.length;const copies=rows.map(row=>{bytes+=Buffer.byteLength(row.nativeJson);return {...row,sha256:createHash('sha256').update(row.nativeJson).digest('hex')};});
    if(count>100000||bytes>16*1024*1024)fail('Training inspection exceeds the complete evidence budget; no partial evidence returned',413);
    tables.push({table,count:copies.length,contentHash:trainingEvidenceHash(copies),rows:copies});return rows.map(row=>JSON.parse(row.nativeJson));};
   const nativeScopes=JSON.stringify(admitted.scopes);
   const scopeWhere=`EXISTS(SELECT 1 FROM jsonb_array_elements($1::jsonb) s WHERE t.scope->>'studyId'=s->>'studyId' AND t.scope->>'siteId' IS NOT DISTINCT FROM s->>'siteId')`;
-  const obligations=await read('acc_training_obligations',`SELECT t.* FROM acc_training_obligations t WHERE ${scopeWhere} ORDER BY id`,[nativeScopes]);
+  const obligations=await read('acc_training_obligations',`SELECT t.* FROM acc_training_obligations t WHERE ${scopeWhere}`,[nativeScopes]);
   const obligationIds=obligations.map(r=>r.id);
-  const obligationEvents=await read('acc_training_obligation_events','SELECT * FROM acc_training_obligation_events WHERE obligation_id=ANY($1::int[]) ORDER BY obligation_id,revision',[obligationIds]);
+  const obligationEvents=await read('acc_training_obligation_events','SELECT * FROM acc_training_obligation_events WHERE obligation_id=ANY($1::int[])',[obligationIds]);
   for(const obligation of obligations){const history=obligationEvents.filter(e=>e.obligation_id===obligation.id);
    if(history.length!==obligation.revision||history.some((e,i)=>e.revision!==i+1||e.snapshot.id!==obligation.id||e.snapshot.userId!==obligation.user_id||e.snapshot.courseId!==obligation.course_id||canonical(e.snapshot.scope)!==canonical(obligation.scope)))fail('Retained obligation history is incomplete or inconsistent');
    const last=history.at(-1)?.snapshot;if(!last||last.revision!==obligation.revision||last.status!==obligation.status||last.courseVersion!==obligation.course_version||last.contentRevision!==obligation.content_revision)fail('Retained obligation head differs from its history');}
-  const plans=await read('acc_training_impact_plans',`SELECT t.* FROM acc_training_impact_plans t WHERE EXISTS(SELECT 1 FROM jsonb_array_elements($1::jsonb) s WHERE t.plan->'scope'=s) ORDER BY id`,[nativeScopes]);
-  const impactEvents=await read('acc_training_impact_events','SELECT * FROM acc_training_impact_events WHERE plan_id=ANY($1::uuid[]) ORDER BY plan_id,revision',[plans.map(r=>r.id)]);
+  const plans=await read('acc_training_impact_plans',`SELECT t.* FROM acc_training_impact_plans t WHERE EXISTS(SELECT 1 FROM jsonb_array_elements($1::jsonb) s WHERE t.plan->'scope'=s)`,[nativeScopes]);
+  const impactEvents=await read('acc_training_impact_events','SELECT * FROM acc_training_impact_events WHERE plan_id=ANY($1::uuid[])',[plans.map(r=>r.id)]);
   for(const plan of plans){if(trainingEvidenceHash(plan.plan)!==plan.plan_hash)fail('Retained training impact integrity failed');
    const history=impactEvents.filter(e=>e.plan_id===plan.id);if(history.length!==plan.revision||history.some((e,i)=>e.revision!==i+1||e.snapshot.id!==plan.id||trainingEvidenceHash(e.snapshot.plan)!==plan.plan_hash||e.snapshot.planHash!==plan.plan_hash)||history.at(-1)?.snapshot.status!==plan.status)fail('Retained training impact history is incomplete or inconsistent');}
   const selectedCourseIds=[...new Set([...obligations.map(r=>r.course_id),...plans.flatMap(p=>p.plan.actions.filter((a:any)=>a.kind!=='withdraw').map((a:any)=>a.request.courseId))])];
-  const courses=await read('acc_training_courses',`SELECT t.* FROM acc_training_courses t WHERE id=ANY($2::int[]) OR EXISTS(SELECT 1 FROM jsonb_array_elements($1::jsonb) s WHERE material_scope=s) ORDER BY id`,[nativeScopes,selectedCourseIds]);
+  const courses=await read('acc_training_courses',`SELECT t.* FROM acc_training_courses t WHERE id=ANY($2::int[]) OR EXISTS(SELECT 1 FROM jsonb_array_elements($1::jsonb) s WHERE material_scope=s)`,[nativeScopes,selectedCourseIds]);
   if(selectedCourseIds.some(id=>!courses.some(c=>c.id===id)))fail('A referenced training course is missing from retained custody');
   for(const course of courses)if(course.material_scope&&!admitted.scopes.some(s=>canonical(s)===canonical(course.material_scope)))fail('Training material closure requires an authorized parent-family copy');
   const courseIds=courses.map(r=>r.id);
-  await read('acc_training_slides','SELECT * FROM acc_training_slides WHERE course_id=ANY($1::int[]) ORDER BY course_id,order_index,id',[courseIds]);
-  await read('acc_training_questions','SELECT * FROM acc_training_questions WHERE course_id=ANY($1::int[]) ORDER BY course_id,order_index,id',[courseIds]);
+  await read('acc_training_slides','SELECT * FROM acc_training_slides WHERE course_id=ANY($1::int[])',[courseIds],false);
+  await read('acc_training_questions','SELECT * FROM acc_training_questions WHERE course_id=ANY($1::int[])',[courseIds],false);
   const pairs=JSON.stringify(obligations.map(r=>({userId:r.user_id,courseId:r.course_id})));
   const pairsWhere=`EXISTS(SELECT 1 FROM jsonb_array_elements($1::jsonb) p WHERE t.user_id=(p->>'userId')::int AND t.course_id=(p->>'courseId')::int)`;
-  const records=await read('acc_training_records',`SELECT t.* FROM acc_training_records t WHERE ${pairsWhere} ORDER BY id`,[pairs]);
-  const recordHistory=await read('acc_training_record_history',`SELECT t.* FROM acc_training_record_history t WHERE ${pairsWhere} ORDER BY history_id`,[pairs]);
-  const drafts=await read('acc_training_material_drafts','SELECT * FROM acc_training_material_drafts WHERE course_id=ANY($1::int[]) ORDER BY id',[courseIds]);
-  const publications=await read('acc_training_material_publications','SELECT * FROM acc_training_material_publications WHERE course_id=ANY($1::int[]) ORDER BY id',[courseIds]);
-  const materialEvents=await read('acc_training_material_events','SELECT * FROM acc_training_material_events WHERE draft_id=ANY($1::uuid[]) ORDER BY id',[drafts.map(r=>r.id)]);
+  const records=await read('acc_training_records',`SELECT t.* FROM acc_training_records t WHERE ${pairsWhere}`,[pairs]);
+  const recordHistory=await read('acc_training_record_history',`SELECT t.* FROM acc_training_record_history t WHERE ${pairsWhere}`,[pairs]);
+  const drafts=await read('acc_training_material_drafts','SELECT * FROM acc_training_material_drafts WHERE course_id=ANY($1::int[])',[courseIds]);
+  const publications=await read('acc_training_material_publications','SELECT * FROM acc_training_material_publications WHERE course_id=ANY($1::int[])',[courseIds]);
+  const materialEvents=await read('acc_training_material_events','SELECT * FROM acc_training_material_events WHERE draft_id=ANY($1::uuid[])',[drafts.map(r=>r.id)]);
   const camel=(row:any)=>Object.fromEntries(Object.entries(row).map(([k,v])=>[k.replace(/_([a-z])/g,(_,c)=>c.toUpperCase()),v]));
   const assessmentRows=recordHistory.map(camel) as unknown as AssessmentHistoryRow[];
   verifyAssessmentRows(assessmentRows);
@@ -280,7 +351,25 @@ async function collectTrainingInspectionEvidence(authority:TrainingAuthorityCont
     OR action='training_signature_bound' AND details->>'draftId'=ANY($6::text[])
     OR EXISTS(SELECT 1 FROM jsonb_array_elements($5::jsonb) p WHERE t.course_id=(p->>'courseId')::int AND
       (t.user_id=(p->>'userId')::int AND t.action IN ('training_started','quiz_submitted','quiz_passed','quiz_failed') OR t.action='training_expired' AND t.details->>'affectedUserId'=p->>'userId'))
-    ORDER BY id`,[courseIds,records.map(r=>r.id),plans.map(r=>r.id),obligationIds.map(String),pairs,drafts.map(r=>r.id)]);
+    `,[courseIds,records.map(r=>r.id),plans.map(r=>r.id),obligationIds.map(String),pairs,drafts.map(r=>r.id)],false);
+  // /2 only: the bindings of selected records, drafts and plans, and the effort intervals of selected records. A row
+  // that names a study or site outside this inspection (a signature context, a served obligation's scope) is
+  // withheld whole and counted as a gap, so the copy never reaches another study's obligations or arms.
+  const withheld:string[]=[];
+  if(segmenter){
+   const signed=`(t.record_id=ANY($2::int[]) OR t.draft_id=ANY($3::uuid[]) OR t.impact_plan_id=ANY($4::uuid[]))`;
+   const inside=`EXISTS(SELECT 1 FROM jsonb_array_elements($1::jsonb) s WHERE t.context->>'studyId'=s->>'studyId' AND t.context->>'siteId' IS NOT DISTINCT FROM s->>'siteId')`;
+   const signatureValues=[nativeScopes,records.map(r=>r.id),drafts.map(r=>r.id),plans.map(r=>r.id)];
+   await read('acc_training_decision_signatures',`SELECT t.* FROM acc_training_decision_signatures t WHERE ${signed} AND ${inside}`,signatureValues,false);
+   const signatures=(await client.queryOne<{n:number}>(`SELECT count(*)::int AS n FROM acc_training_decision_signatures t WHERE ${signed} AND NOT ${inside}`,signatureValues))!.n;
+   if(signatures)withheld.push(`${signatures} Part 11 signature binding(s) of selected training decisions name a study or site outside this inspection and are withheld whole.`);
+   const outside=`EXISTS(SELECT 1 FROM jsonb_array_elements(t.served) x WHERE NOT EXISTS(SELECT 1 FROM jsonb_array_elements($1::jsonb) s
+     WHERE x->'scope'->>'studyId'=s->>'studyId' AND x->'scope'->>'siteId' IS NOT DISTINCT FROM s->>'siteId'))`;
+   const effortValues=[nativeScopes,records.map(r=>r.id)];
+   await read('acc_training_effort_intervals',`SELECT t.* FROM acc_training_effort_intervals t WHERE t.record_id=ANY($2::int[]) AND NOT ${outside}`,effortValues,false);
+   const intervals=(await client.queryOne<{n:number}>(`SELECT count(*)::int AS n FROM acc_training_effort_intervals t WHERE t.record_id=ANY($2::int[]) AND ${outside}`,effortValues))!.n;
+   if(intervals)withheld.push(`${intervals} training effort interval(s) of selected records also served obligations outside this inspection and are withheld whole.`);
+  }
   const materialSources:TrainingMaterialSource[]=[...new Map(drafts.map(row=>[canonical(row.request.source),row.request.source as TrainingMaterialSource])).values()];
   if(materialSources.length>500)fail('Training inspection exceeds 500 retained material sources',413);
   const impactSources=[...new Map(plans.map(p=>[canonical({scope:p.plan.scope,source:p.plan.source}),{scope:p.plan.scope,source:p.plan.source}])).values()];
@@ -293,17 +382,73 @@ async function collectTrainingInspectionEvidence(authority:TrainingAuthorityCont
   }
   for(const record of records)if(!record.content_snapshot)gaps.push(`Legacy training record ${record.id}: viewed material snapshot was not retained.`);
   for(const record of records)if(!record.assessment_cycle_id)gaps.push(`Legacy training record ${record.id}: individual graded-attempt receipts were not retained; completion remains summary evidence.`);
+  gaps.push(...withheld);
   const pins=new Map<string,{fileId:string;sha256:string;nativeStudyId:number}>();
   for(const source of [...materialSources,...plans.map(p=>({...p.plan.source,scope:p.plan.scope}))])for(const pin of source.originals){const entry={fileId:pin.fileId,sha256:pin.sha256,nativeStudyId:source.scope.siteId??source.scope.studyId},old=pins.get(pin.fileId);if(old&&canonical(old)!==canonical(entry))fail('Conflicting training original custody');pins.set(pin.fileId,entry);}
   const at=(await client.queryOne<{at:string}>('SELECT transaction_timestamp()::text AS at'))!;
-  return {tables,materialSources,impactSources,gaps,originalPins:[...pins.values()].sort((a,b)=>a.fileId.localeCompare(b.fileId)),capturedAt:new Date(at.at).toISOString()};
+  return {tables,common:{materialSources,impactSources,gaps,originalPins:[...pins.values()].sort((a,b)=>a.fileId.localeCompare(b.fileId)),capturedAt:new Date(at.at).toISOString()},
+   segments:segmenter?.segments,keys:segmenter?.keys};
  });
- const current=await observeTrainingInspection(authority,input.nativeStudyId,captured.materialSources,admitted.scopeFingerprint,captured.impactSources);
+ const current=await observeTrainingInspection(authority,input.nativeStudyId,captured.common.materialSources,admitted.scopeFingerprint,captured.common.impactSources);
  if(canonical(current.studyIds)!==canonical(admitted.studyIds)||canonical(current.scopes)!==canonical(admitted.scopes))fail('Native inspection scope changed');
- const body={nativeStudyId:input.nativeStudyId,actorUserId:authority.actorUserId,studyIds:admitted.studyIds,scopes:admitted.scopes,...captured,sourceChecks:current.sourceChecks,impactChecks:current.impactChecks,
-  authorityHash:current.authorityHash,complete:true as const,limitations:['Complete retained obligations and scoped material; this is not a complete staff curriculum census.','Learner/course attempts may support several scoped obligations; their existence does not prove duty applicability.','New assessment cycles retain immutable quiz definitions, answer selections and grading receipts. Legacy summary-only completions have no reconstructed attempt transcript; existing qualification policy remains unchanged.','Certificate identifiers and independent verification are retained records, not clinical competency or regulated approval.','Snapshot evidence can be historical or superseded. Source currentness is a separate native observation; no distributed atomic snapshot is claimed.','Training audit IP addresses and user agents are excluded; retained audit details and actor identities remain.']};
- await logAudit({userId:authority.actorUserId,action:'training_inspection_read',details:{nativeStudyId:input.nativeStudyId,evidenceHash:trainingEvidenceHash(body)}});
- return {schemaVersion:'training-inspection-evidence/1',nonce:input.nonce,observedAt:new Date().toISOString(),consistency:'training-snapshot-with-separate-native-observations',...body,evidenceHash:trainingEvidenceHash(body)};
+ const limitations=['Complete retained obligations and scoped material; this is not a complete staff curriculum census.','Learner/course attempts may support several scoped obligations; their existence does not prove duty applicability.','New assessment cycles retain immutable quiz definitions, answer selections and grading receipts. Legacy summary-only completions have no reconstructed attempt transcript; existing qualification policy remains unchanged.','Certificate identifiers and independent verification are retained records, not clinical competency or regulated approval.','Snapshot evidence can be historical or superseded. Source currentness is a separate native observation; no distributed atomic snapshot is claimed.','Training audit IP addresses and user agents are excluded; retained audit details and actor identities remain.'];
+ if(!captured.segments){
+  const body={nativeStudyId:input.nativeStudyId,actorUserId:authority.actorUserId,studyIds:admitted.studyIds,scopes:admitted.scopes,tables:captured.tables,...captured.common,sourceChecks:current.sourceChecks,impactChecks:current.impactChecks,
+   authorityHash:current.authorityHash,complete:true as const,limitations};
+  await logAudit({userId:authority.actorUserId,action:'training_inspection_read',details:{nativeStudyId:input.nativeStudyId,evidenceHash:trainingEvidenceHash(body)}});
+  return {schemaVersion:'training-inspection-evidence/1',nonce:input.nonce,observedAt:new Date().toISOString(),consistency:'training-snapshot-with-separate-native-observations',...body,evidenceHash:trainingEvidenceHash(body)};
+ }
+ const common=captured.common,captureId=randomUUID(),segments=captured.segments;
+ const manifestHash=trainingEvidenceHash({captureId,capturedAt:common.capturedAt,segments});
+ const body={nativeStudyId:input.nativeStudyId,actorUserId:authority.actorUserId,studyIds:admitted.studyIds,scopes:admitted.scopes,captureId,limits:INSPECTION_LIMITS,segments,manifestHash,
+  ...common,sourceChecks:current.sourceChecks,impactChecks:current.impactChecks,authorityHash:current.authorityHash,complete:true as const,limitations:[...limitations,
+   'Segments are re-read from current rows when requested and refused (409) once their content changed after capture; this service keeps the segment census and row keys of a capture, never a copy of its rows.',
+   'Part 11 signature bindings and training effort intervals are included only when every study or site they name is in this inspection; others are withheld whole and counted in gaps.']};
+ const evidenceHash=trainingEvidenceHash(body);
+ await transaction(async client=>{
+  await client.query(`INSERT INTO acc_training_inspection_captures(capture_id,actor_user_id,nonce_sha256,native_study_id,scope_fingerprint,study_ids,scopes,
+    segments,segment_keys,manifest_hash,evidence_hash,captured_at) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8::jsonb,$9::jsonb,$10,$11,$12)`,
+   [captureId,authority.actorUserId,sha256(input.nonce),input.nativeStudyId,admitted.scopeFingerprint,JSON.stringify(admitted.studyIds),JSON.stringify(admitted.scopes),
+    JSON.stringify(segments),JSON.stringify(captured.keys),manifestHash,evidenceHash,common.capturedAt]);
+  await logAudit({userId:authority.actorUserId,action:'training_inspection_read',details:{nativeStudyId:input.nativeStudyId,evidenceHash,schemaVersion:'training-inspection-evidence/2',captureId,manifestHash}},client);
+ });
+ return {schemaVersion:'training-inspection-evidence/2',nonce:input.nonce,observedAt:new Date().toISOString(),consistency:'training-snapshot-with-separate-native-observations',...body,evidenceHash};
+}
+
+/** POST /inspection-evidence/segment: one segment of a /2 capture, only to its actor with its nonce, after a current
+ * native inspection observation of the captured scope. Its rows are re-read by primary key in one REPEATABLE READ
+ * snapshot and refused (409) when they no longer hash to the manifest. 503 before anything else while /2 is off. */
+export async function getTrainingInspectionSegment(authority:TrainingAuthorityContext,value:unknown):Promise<TrainingInspectionSegment>{
+ if(!inspectionSegmentsEnabled())fail('Segmented training inspection evidence is not enabled on this service',503);
+ return inspectionSlot(()=>readTrainingInspectionSegment(authority,value));
+}
+async function readTrainingInspectionSegment(authority:TrainingAuthorityContext,value:unknown):Promise<TrainingInspectionSegment>{
+ const input=value as {schemaVersion:string;captureId:string;nonce:string;ordinal:number};
+ if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(k=>!['schemaVersion','captureId','nonce','ordinal'].includes(k))
+  ||input.schemaVersion!==SEGMENT_REQUEST||typeof input.captureId!=='string'||!UUID_TEXT.test(input.captureId)||typeof input.nonce!=='string'||!/^[a-f0-9]{32}$/.test(input.nonce)
+  ||!Number.isSafeInteger(input.ordinal)||input.ordinal<0||input.ordinal>=INSPECTION_LIMITS.maxSegments)fail('An exact capture, nonce and segment ordinal are required',400);
+ const capture=await queryOne<{actorUserId:number;nonceSha256:string;nativeStudyId:number;scopeFingerprint:string;studyIds:number[];scopes:Array<{studyId:number;siteId?:number}>;
+  manifestHash:string;segment:TrainingInspectionSegmentDescriptor|null;rowKeys:string[]|null}>(`SELECT actor_user_id,nonce_sha256,native_study_id,scope_fingerprint,study_ids,scopes,
+  manifest_hash,segments->($2::int) AS segment,segment_keys->($2::int) AS row_keys FROM acc_training_inspection_captures WHERE capture_id=$1`,[input.captureId,input.ordinal]);
+ // An unknown capture, another actor and another nonce get one answer, which never discloses that the capture exists.
+ if(!capture||capture.actorUserId!==authority.actorUserId||capture.nonceSha256!==sha256(input.nonce))fail('No training inspection capture matches this actor and nonce',404);
+ const segment=capture.segment,spec=segment&&Object.prototype.hasOwnProperty.call(INSPECTION_TABLES,segment.table)?INSPECTION_TABLES[segment.table]:undefined;
+ if(!segment)fail('The training inspection capture has no segment with this ordinal',404);
+ if(!spec||!Array.isArray(capture.rowKeys)||capture.rowKeys.length!==segment.count||segment.ordinal!==input.ordinal)fail('Retained training inspection capture integrity failed');
+ const sameScope=(observed:{studyIds:number[];scopes:unknown[]})=>canonical(observed.studyIds)===canonical(capture.studyIds)&&canonical(observed.scopes)===canonical(capture.scopes);
+ if(!sameScope(await observeTrainingInspection(authority,capture.nativeStudyId,[],capture.scopeFingerprint)))fail('Native inspection scope changed; capture the training evidence again');
+ const rows=await transaction(async client=>{
+  await client.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');await client.query("SET LOCAL TIME ZONE 'UTC'");
+  return (await client.query<{nativeJson:string}>(`SELECT row_to_json(t)::text AS native_json FROM (SELECT ${spec.projection} FROM ${segment.table}) t
+    JOIN unnest($1::${spec.key[1]}[]) WITH ORDINALITY AS k(key,position) ON t.${spec.key[0]}=k.key ORDER BY k.position`,[capture.rowKeys])).rows;
+ });
+ const copies=rows.map(row=>({nativeJson:row.nativeJson,sha256:sha256(row.nativeJson)}));
+ if(copies.length!==segment.count||copies.reduce((n,row)=>n+Buffer.byteLength(row.nativeJson),0)!==segment.bytes||trainingEvidenceHash(copies)!==segment.contentHash)
+  fail('The training inspection segment changed after its capture; capture the training evidence again');
+ if(!sameScope(await observeTrainingInspection(authority,capture.nativeStudyId,[],capture.scopeFingerprint)))fail('Native inspection scope changed; capture the training evidence again');
+ await logAudit({userId:authority.actorUserId,action:'training_inspection_segment_read',details:{nativeStudyId:capture.nativeStudyId,captureId:input.captureId,ordinal:segment.ordinal,table:segment.table,contentHash:segment.contentHash}});
+ return {schemaVersion:'training-inspection-segment/1',captureId:input.captureId,ordinal:segment.ordinal,table:segment.table,count:segment.count,contentHash:segment.contentHash,
+  bytes:segment.bytes,manifestHash:capture.manifestHash,rows:copies};
 }
 
 const dutyNames = ['site_activation', 'participant_enrollment', 'arm_assignment', 'supply_dispensing', 'data_entry'];

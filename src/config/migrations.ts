@@ -374,6 +374,26 @@ const MIGRATIONS: string[] = [
   END $$`,
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_training_signature_impact ON acc_training_decision_signatures
     (impact_plan_id) WHERE decision='impact-review'`,
+  // Segmented inspection evidence (FX-TRN-04, training-inspection-evidence/2; nothing writes here unless
+  // TRAINING_INSPECTION_SEGMENTS_ENABLED=true). One append-only row per capture: its actor, the SHA-256 of its nonce,
+  // the captured native scope, the segment census and the primary keys of each segment's rows, never the rows. A
+  // segment is re-read from the current rows and refused when its hash changed, so no copy of privileged rows is kept.
+  `CREATE TABLE IF NOT EXISTS acc_training_inspection_captures (
+    capture_id UUID PRIMARY KEY, actor_user_id INTEGER NOT NULL CHECK(actor_user_id>0),
+    nonce_sha256 TEXT NOT NULL CHECK(nonce_sha256 ~ '^[a-f0-9]{64}$'), native_study_id INTEGER NOT NULL CHECK(native_study_id>0),
+    scope_fingerprint TEXT NOT NULL, study_ids JSONB NOT NULL CHECK(jsonb_typeof(study_ids)='array'), scopes JSONB NOT NULL CHECK(jsonb_typeof(scopes)='array'),
+    segments JSONB NOT NULL CHECK(jsonb_typeof(segments)='array'), segment_keys JSONB NOT NULL CHECK(jsonb_typeof(segment_keys)='array'),
+    manifest_hash TEXT NOT NULL CHECK(manifest_hash ~ '^[a-f0-9]{64}$'), evidence_hash TEXT NOT NULL CHECK(evidence_hash ~ '^[a-f0-9]{64}$'),
+    captured_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT acc_training_inspection_capture_census CHECK(jsonb_array_length(segments)=jsonb_array_length(segment_keys)))`,
+  `DROP TRIGGER IF EXISTS acc_training_inspection_captures_guard ON acc_training_inspection_captures`,
+  `CREATE TRIGGER acc_training_inspection_captures_guard BEFORE UPDATE OR DELETE ON acc_training_inspection_captures
+    FOR EACH ROW EXECUTE FUNCTION acc_training_immutable_history()`,
+  `DROP TRIGGER IF EXISTS acc_training_inspection_captures_truncate_guard ON acc_training_inspection_captures`,
+  `CREATE TRIGGER acc_training_inspection_captures_truncate_guard BEFORE TRUNCATE ON acc_training_inspection_captures
+    FOR EACH STATEMENT EXECUTE FUNCTION acc_training_immutable_history()`,
+  `ALTER TABLE acc_training_inspection_captures ENABLE ALWAYS TRIGGER acc_training_inspection_captures_guard`,
+  `ALTER TABLE acc_training_inspection_captures ENABLE ALWAYS TRIGGER acc_training_inspection_captures_truncate_guard`,
 ];
 
 /** The ordered startup statements, read-only, for offline guard checks. */

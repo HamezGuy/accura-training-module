@@ -141,6 +141,10 @@ router.get('/my-record-history', asyncHandler<AuthRequest>(controller.getMyRecor
 router.post('/inspection-evidence',asyncHandler<AuthRequest>(async(req,res)=>{
   res.setHeader('Cache-Control','private, no-store');res.json({success:true,data:await obligations.getTrainingInspectionEvidence(req.trainingAuthority!,req.body)});
 }));
+// One segment of a training-inspection-evidence/2 capture; 503 unless TRAINING_INSPECTION_SEGMENTS_ENABLED=true.
+router.post('/inspection-evidence/segment',asyncHandler<AuthRequest>(async(req,res)=>{
+  res.setHeader('Cache-Control','private, no-store');res.json({success:true,data:await obligations.getTrainingInspectionSegment(req.trainingAuthority!,req.body)});
+}));
 
 router.post('/duty-readiness', asyncHandler<AuthRequest>(async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');

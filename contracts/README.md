@@ -14,6 +14,8 @@ on every checkout. A change of meaning is a new version (`/2`), never an edit of
 | `training-duty-readiness-v2.schema.json` | `training-duty-readiness/2` | `POST /api/training/duty-readiness` answering `training-duty-readiness-request/2` | EDC duty readiness consumer |
 | `training-effort-observation-request-v1.schema.json` | `training-effort-observation-request/1` | Command Center (the requester) | `POST /api/training/effort-source/observe` (this service) |
 | `training-effort-source-v1.schema.json` | `TrainingEffortSourceV1@1.0.0` | `POST /api/training/effort-source/observe`, the `data` of `TrainingEffortServiceObservationV1@1.0.0` | Command Center TA3 metrics register (plan item T-4/cc) |
+| `training-inspection-evidence-v2.schema.json` | `training-inspection-evidence/2` | `POST /api/training/inspection-evidence` answering `training-inspection-evidence-request/2` (off unless `TRAINING_INSPECTION_SEGMENTS_ENABLED=true`) | EDC inspection copy (FX-EDC-118) |
+| `training-inspection-segment-v1.schema.json` | `training-inspection-segment/1` | `POST /api/training/inspection-evidence/segment` answering `training-inspection-segment-request/1` | EDC inspection copy (FX-EDC-118) |
 
 The subject hash is the hex SHA-256 of canonical JSON: object keys sorted by UTF-16 code unit, arrays in order,
 scalars and strings as `JSON.stringify` writes them. It is the same canonical form as `policyHash` and
@@ -113,3 +115,31 @@ lead time, no counts. No learner or actor identity appears. Signed attestation a
 observed signed-action effort and must not be added to it. `limitations` lists the rest. `sourceHash` is the
 canonical hash of the document without `asOf` and `sourceHash`, so a later observation of unchanged rows, with no
 `open` arm, hashes the same.
+
+## Segmented inspection evidence (FX-TRN-04)
+
+Off unless this service runs with `TRAINING_INSPECTION_SEGMENTS_ENABLED=true`; otherwise both requests below answer
+503. `training-inspection-evidence/1` (request `{nativeStudyId, nonce}`) is unchanged.
+
+Request `training-inspection-evidence-request/2`: `{schemaVersion, nativeStudyId, nonce}`, `nonce` 32 lowercase hex.
+The answer is the manifest `training-inspection-evidence/2`: the `/1` fields without `tables`, plus `captureId`,
+`limits: {maxSegments: 256, maxSegmentRows: 10000, maxSegmentBytes: 8388608}`, `segments` and `manifestHash`. The
+segments cover, in this order, the 13 `/1` tables, `acc_training_decision_signatures` and
+`acc_training_effort_intervals`; ordinals run from 0 without gaps and every table has at least one segment. The rows
+of a `/1` table and the concatenated rows of its `/2` segments are equal, so a `/1` table `contentHash` recomputes
+from them. A signature binding or effort interval that names a study or site outside the inspection is withheld
+whole and counted in `gaps`.
+
+Request `training-inspection-segment-request/1`: `{schemaVersion, captureId, nonce, ordinal}`. The answer
+`training-inspection-segment/1` is `{schemaVersion, captureId, ordinal, table, count, contentHash, bytes,
+manifestHash, rows: [{nativeJson, sha256}]}`, equal to the manifest's segment at that ordinal. Refusals: 400 for a
+malformed request; 404 for an unknown capture, another actor or another nonce (one answer for all three) and for an
+ordinal past the census; 409 when the native inspection scope changed or the re-read rows no longer hash to the
+manifest (capture again); the native authority's 401 and 403 pass through; 503 when four inspection reads are
+already running.
+
+Hashes: `sha256` is the hex SHA-256 of the exact `nativeJson` text; `contentHash` the hex SHA-256 of the canonical
+JSON of `rows`; `bytes` the sum of the UTF-8 byte lengths of the `nativeJson` texts; `manifestHash` the hex SHA-256
+of the canonical JSON of `{captureId, capturedAt, segments}`; `evidenceHash` the hex SHA-256 of the canonical JSON of
+the manifest without `schemaVersion`, `nonce`, `observedAt`, `consistency` and `evidenceHash`. These are the hashes
+of the EDC segmented inspection copy (`docs/inspection-copy-segmentation-contract.md` in the EDC repository).

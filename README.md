@@ -421,6 +421,55 @@ from an uploaded JSON document. The opt-in native test
 `training-inspection.native.postgres.test.ts` exercises actual producer HTTP,
 two isolated PostgreSQL stores and encrypted native package custody.
 
+#### Segmented training inspection evidence (`/2`)
+
+Off unless this service runs with `TRAINING_INSPECTION_SEGMENTS_ENABLED=true`
+(read at every request); otherwise a `/2` request and every segment request
+answer 503 and nothing is captured. Plan item FX-TRN-04 (IR-461). A request
+without `schemaVersion` is answered in `training-inspection-evidence/1` exactly
+as before, with the limits above.
+
+`POST /inspection-evidence` with `{schemaVersion:
+'training-inspection-evidence-request/2', nativeStudyId, nonce}` reads the same
+REPEATABLE READ snapshot as `/1`, with the same closure checks, plus
+`acc_training_decision_signatures` and `acc_training_effort_intervals`, and
+answers a manifest (`training-inspection-evidence/2`) with no rows:
+`{captureId, segments: [{ordinal, table, count, contentHash, bytes}],
+manifestHash, ..., evidenceHash}`. Each of the 15 tables, in declared order, is
+cut into segments of at most 10,000 rows and 8 MiB of native JSON (an empty
+table is one segment of count 0). The hashes are those of the EDC inspection
+copy (`docs/inspection-copy-segmentation-contract.md` there): a row's `sha256`
+is the SHA-256 of its native JSON text, `contentHash` the SHA-256 of the
+canonical JSON of the segment's `[{nativeJson, sha256}]` (as for a `/1` table),
+`manifestHash` that of `{captureId, capturedAt, segments}` and `evidenceHash`
+that of the reply without `schemaVersion`, `nonce`, `observedAt`, `consistency`
+and `evidenceHash`. The only bound is 256 segments (413 above it, or for one
+row above 8 MiB); the `/1` table, row and byte budgets do not apply.
+
+`POST /inspection-evidence/segment` with `{schemaVersion:
+'training-inspection-segment-request/1', captureId, nonce, ordinal}` answers
+one segment (`training-inspection-segment/1`, rows included) only to the actor
+who captured it, with its nonce: another actor, another nonce and an unknown
+capture all get the same 404; an ordinal past the census 404. The native
+inspection observation of the captured scope is repeated before and after the
+read (its scope fingerprint pinned), so a lost authority refuses the segment.
+
+Nothing persists a second package: each capture keeps one row in the
+append-only `acc_training_inspection_captures` (row and TRUNCATE guards, ENABLE
+ALWAYS) with its actor, the SHA-256 of its nonce, the captured scope, the
+segment census and each segment's primary keys, never the rows. A segment is
+re-read by those keys in a new REPEATABLE READ snapshot and refused with 409
+when its count, bytes or hash differ, for example after a course or record
+changed; the consumer then captures again. Signature bindings and effort
+intervals are included only when every study or site they name (a signature
+context, a served obligation's scope) is in this inspection; others are withheld
+whole and counted in `gaps`, so the copy never reaches another study's
+obligations or arms. Schemas: `contracts/training-inspection-evidence-v2.schema.json`
+and `contracts/training-inspection-segment-v1.schema.json`. The EDC consumer
+(FX-EDC-118) must accept `/2` before it requests it. The owned audit suite
+covers 25,000 synthetic audit rows (`/1` 413, `/2` complete, every hash
+recomputed) and the equality of `/2` segments with the `/1` tables.
+
 ### Exact assessment attempts and safe retry
 
 New starts retain an immutable `cycle_started` entry in the existing
@@ -524,8 +573,8 @@ Not covered yet: matrix approval (reserved for the curriculum matrix, T-1); the
 bindings are not a table of `training-inspection-evidence/1` (its audit table
 carries the `training_signature_bound` rows of record decisions through their
 record IDs, of impact reviews through their plan IDs and of material approvals
-through their draft IDs, never by course alone; a `/2` inspection constituent is
-T-5's); the CC due feed still reports a verified but unsigned completion as
+through their draft IDs, never by course alone); they are a table of the
+segmented `/2`, off by default (see above); the CC due feed still reports a verified but unsigned completion as
 satisfied; the meaning texts are the EDC's and await a person's approval. The
 owned obligations suite exercises the routes on real PostgreSQL against an EDC
 stand-in for op `signature`; with an EDC checkout that carries
@@ -579,4 +628,5 @@ counts, and no learner or actor identity appears. More than 100,000 intervals or
 10,000 arm-scoped obligations are refused whole (413). `TRAINING_DATA_CLASS=synthetic`
 labels the document synthetic on a test stack. The contracts and their
 limitations are in `contracts/README.md`. The intervals are not a table of
-`training-inspection-evidence/1`; a `/2` constituent is T-5's.
+`training-inspection-evidence/1`; they are a table of the segmented `/2`, off by
+default.

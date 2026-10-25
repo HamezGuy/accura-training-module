@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.accuratrials.com/training/training-inspection-segment/1",
+  "title": "training-inspection-segment/1",
+  "description": "One segment of a training-inspection-evidence/2 capture: the data member of POST /api/training/inspection-evidence/segment answering {schemaVersion: 'training-inspection-segment-request/1', captureId, nonce, ordinal}; off unless TRAINING_INSPECTION_SEGMENTS_ENABLED=true (otherwise 503). Only the actor who requested the capture, with its nonce, receives it (404 otherwise), after a current native inspection observation of the captured scope. The rows are re-read by primary key from the current tables in a REPEATABLE READ snapshot; when their count, bytes or contentHash differ from the manifest the answer is 409 and the evidence must be captured again. table, count, contentHash and bytes equal the manifest's segment at this ordinal and manifestHash is the capture's. rows[i].sha256 is the hex SHA-256 of rows[i].nativeJson, contentHash the hex SHA-256 of the canonical JSON of rows, and bytes the sum of the UTF-8 byte lengths of the nativeJson texts.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "captureId",
+    "ordinal",
+    "table",
+    "count",
+    "contentHash",
+    "bytes",
+    "manifestHash",
+    "rows"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "training-inspection-segment/1"
+    },
+    "captureId": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+    },
+    "ordinal": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 255
+    },
+    "table": {
+      "enum": [
+        "acc_training_obligations",
+        "acc_training_obligation_events",
+        "acc_training_impact_plans",
+        "acc_training_impact_events",
+        "acc_training_courses",
+        "acc_training_slides",
+        "acc_training_questions",
+        "acc_training_records",
+        "acc_training_record_history",
+        "acc_training_material_drafts",
+        "acc_training_material_publications",
+        "acc_training_material_events",
+        "acc_training_audit_log",
+        "acc_training_decision_signatures",
+        "acc_training_effort_intervals"
+      ]
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10000
+    },
+    "contentHash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 8388608
+    },
+    "manifestHash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "rows": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "nativeJson",
+          "sha256"
+        ],
+        "properties": {
+          "nativeJson": {
+            "type": "string",
+            "minLength": 2
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          }
+        }
+      }
+    }
+  }
+}

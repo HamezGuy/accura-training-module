@@ -137,6 +137,18 @@ export interface TrainingInspectionEvidence {
   impactChecks:Array<{nativeSourceHash:string;lifecycleRevision:number;current:boolean}>;
   originalPins:Array<{fileId:string;sha256:string;nativeStudyId:number}>;gaps:string[];limitations:string[];evidenceHash:string;
 }
+/** One hashed segment of a training-inspection-evidence/2 capture (contracts/training-inspection-evidence-v2.schema.json). */
+export interface TrainingInspectionSegmentDescriptor {ordinal:number;table:string;count:number;contentHash:string;bytes:number}
+/** training-inspection-evidence/2: the /1 snapshot plus two tables as a manifest of segments, without rows. */
+export interface TrainingInspectionManifest extends Omit<TrainingInspectionEvidence,'schemaVersion'|'tables'> {
+  schemaVersion:'training-inspection-evidence/2';captureId:string;
+  limits:{maxSegments:number;maxSegmentRows:number;maxSegmentBytes:number};
+  segments:TrainingInspectionSegmentDescriptor[];manifestHash:string;
+}
+/** training-inspection-segment/1 (contracts/training-inspection-segment-v1.schema.json). */
+export interface TrainingInspectionSegment extends TrainingInspectionSegmentDescriptor {
+  schemaVersion:'training-inspection-segment/1';captureId:string;manifestHash:string;rows:Array<{nativeJson:string;sha256:string}>;
+}
 
 export interface TrainingComplianceStatus {
   userId: number;

@@ -1,0 +1,394 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.accuratrials.com/training/training-inspection-evidence/2",
+  "title": "training-inspection-evidence/2",
+  "description": "The training service's answer (the data member of POST /api/training/inspection-evidence) to a training-inspection-evidence-request/2, {schemaVersion: 'training-inspection-evidence-request/2', nativeStudyId, nonce}; off unless the service runs with TRAINING_INSPECTION_SEGMENTS_ENABLED=true (otherwise 503). It is the manifest of one REPEATABLE READ snapshot: the retained stores of training-inspection-evidence/1 plus acc_training_decision_signatures and acc_training_effort_intervals, in the declared table order, each cut into segments of at most limits.maxSegmentRows rows and limits.maxSegmentBytes bytes of native JSON; every table has at least one segment (an empty table one segment of count 0) and ordinals run from 0 without gaps. Rows are not in the manifest: POST /api/training/inspection-evidence/segment returns one segment (training-inspection-segment/1) to the same actor and nonce. A row's sha256 is the hex SHA-256 of its native JSON text and a segment's contentHash the hex SHA-256 of the canonical JSON of its rows array [{nativeJson, sha256}], as for a training-inspection-evidence/1 table. manifestHash is the hex SHA-256 of the canonical JSON of {captureId, capturedAt, segments}. evidenceHash is the hex SHA-256 of the canonical JSON of the reply without schemaVersion, nonce, observedAt, consistency and evidenceHash. A request without schemaVersion is answered in training-inspection-evidence/1 exactly as before.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "nonce",
+    "observedAt",
+    "consistency",
+    "nativeStudyId",
+    "actorUserId",
+    "studyIds",
+    "scopes",
+    "captureId",
+    "capturedAt",
+    "limits",
+    "segments",
+    "manifestHash",
+    "materialSources",
+    "impactSources",
+    "gaps",
+    "originalPins",
+    "sourceChecks",
+    "impactChecks",
+    "authorityHash",
+    "complete",
+    "limitations",
+    "evidenceHash"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "training-inspection-evidence/2"
+    },
+    "nonce": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{32}$"
+    },
+    "observedAt": {
+      "$ref": "#/$defs/Instant"
+    },
+    "consistency": {
+      "const": "training-snapshot-with-separate-native-observations"
+    },
+    "nativeStudyId": {
+      "$ref": "#/$defs/NativeId"
+    },
+    "actorUserId": {
+      "$ref": "#/$defs/NativeId"
+    },
+    "studyIds": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 500,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/NativeId"
+      }
+    },
+    "scopes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 500,
+      "items": {
+        "$ref": "#/$defs/Scope"
+      }
+    },
+    "captureId": {
+      "$ref": "#/$defs/Uuid"
+    },
+    "capturedAt": {
+      "$ref": "#/$defs/Instant"
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxSegments",
+        "maxSegmentRows",
+        "maxSegmentBytes"
+      ],
+      "properties": {
+        "maxSegments": {
+          "const": 256
+        },
+        "maxSegmentRows": {
+          "const": 10000
+        },
+        "maxSegmentBytes": {
+          "const": 8388608
+        }
+      }
+    },
+    "segments": {
+      "type": "array",
+      "minItems": 15,
+      "maxItems": 256,
+      "items": {
+        "$ref": "#/$defs/Segment"
+      }
+    },
+    "manifestHash": {
+      "$ref": "#/$defs/Sha256Hex"
+    },
+    "materialSources": {
+      "type": "array",
+      "maxItems": 500,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "scope",
+          "armIds",
+          "originals",
+          "sourceHash"
+        ],
+        "properties": {
+          "scope": {
+            "$ref": "#/$defs/Scope"
+          },
+          "armIds": {
+            "type": "array",
+            "maxItems": 100,
+            "uniqueItems": true,
+            "items": {
+              "$ref": "#/$defs/NativeId"
+            }
+          },
+          "originals": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 16,
+            "items": {
+              "$ref": "#/$defs/Original"
+            }
+          },
+          "sourceHash": {
+            "$ref": "#/$defs/Sha256Hex"
+          }
+        }
+      }
+    },
+    "impactSources": {
+      "type": "array",
+      "maxItems": 500,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "scope",
+          "source"
+        ],
+        "properties": {
+          "scope": {
+            "$ref": "#/$defs/Scope"
+          },
+          "source": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "nativeSourceHash",
+              "lifecycleRevision",
+              "originals"
+            ],
+            "properties": {
+              "nativeSourceHash": {
+                "$ref": "#/$defs/Sha256Hex"
+              },
+              "lifecycleRevision": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "originals": {
+                "type": "array",
+                "maxItems": 16,
+                "items": {
+                  "$ref": "#/$defs/Original"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "gaps": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 2000
+      }
+    },
+    "originalPins": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "fileId",
+          "sha256",
+          "nativeStudyId"
+        ],
+        "properties": {
+          "fileId": {
+            "$ref": "#/$defs/Uuid"
+          },
+          "sha256": {
+            "$ref": "#/$defs/Sha256Hex"
+          },
+          "nativeStudyId": {
+            "$ref": "#/$defs/NativeId"
+          }
+        }
+      }
+    },
+    "sourceChecks": {
+      "type": "array",
+      "maxItems": 500,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "sourceHash",
+          "current"
+        ],
+        "properties": {
+          "sourceHash": {
+            "$ref": "#/$defs/Sha256Hex"
+          },
+          "current": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "impactChecks": {
+      "type": "array",
+      "maxItems": 500,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "nativeSourceHash",
+          "lifecycleRevision",
+          "current"
+        ],
+        "properties": {
+          "nativeSourceHash": {
+            "$ref": "#/$defs/Sha256Hex"
+          },
+          "lifecycleRevision": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "current": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "authorityHash": {
+      "$ref": "#/$defs/Sha256Hex"
+    },
+    "complete": {
+      "const": true
+    },
+    "limitations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 2000
+      }
+    },
+    "evidenceHash": {
+      "$ref": "#/$defs/Sha256Hex"
+    }
+  },
+  "$defs": {
+    "NativeId": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+    },
+    "Sha256Hex": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "Uuid": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+    },
+    "Instant": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$"
+    },
+    "Scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "studyId"
+      ],
+      "properties": {
+        "studyId": {
+          "$ref": "#/$defs/NativeId"
+        },
+        "siteId": {
+          "$ref": "#/$defs/NativeId"
+        }
+      }
+    },
+    "Original": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "fileId",
+        "sha256"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "protocol",
+            "product",
+            "duty",
+            "amendment",
+            "staff"
+          ]
+        },
+        "fileId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "sha256": {
+          "$ref": "#/$defs/Sha256Hex"
+        }
+      }
+    },
+    "Table": {
+      "enum": [
+        "acc_training_obligations",
+        "acc_training_obligation_events",
+        "acc_training_impact_plans",
+        "acc_training_impact_events",
+        "acc_training_courses",
+        "acc_training_slides",
+        "acc_training_questions",
+        "acc_training_records",
+        "acc_training_record_history",
+        "acc_training_material_drafts",
+        "acc_training_material_publications",
+        "acc_training_material_events",
+        "acc_training_audit_log",
+        "acc_training_decision_signatures",
+        "acc_training_effort_intervals"
+      ]
+    },
+    "Segment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ordinal",
+        "table",
+        "count",
+        "contentHash",
+        "bytes"
+      ],
+      "properties": {
+        "ordinal": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "table": {
+          "$ref": "#/$defs/Table"
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000
+        },
+        "contentHash": {
+          "$ref": "#/$defs/Sha256Hex"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 8388608
+        }
+      }
+    }
+  }
+}

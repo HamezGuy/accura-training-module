@@ -15,7 +15,7 @@ import { runMigrations, TRAINING_MIGRATION_STATEMENTS } from '../../src/config/m
 
 const APPEND_ONLY = ['acc_training_audit_log', 'acc_training_obligation_events', 'acc_training_record_history',
   'acc_training_impact_events', 'acc_training_material_publications', 'acc_training_material_events', 'acc_training_decision_signatures',
-  'acc_training_effort_intervals'];
+  'acc_training_effort_intervals', 'acc_training_inspection_captures'];
 const IMMUTABLE = 'acc_training_immutable_history';
 
 const statements = TRAINING_MIGRATION_STATEMENTS.map(sql => sql.replace(/\s+/g, ' ').trim());
