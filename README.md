@@ -521,8 +521,10 @@ default), which refuses it with 409. The EDC proxy, its meaning and its signatur
 table must admit the decision first (FX-EDC-120); until then no such receipt exists.
 
 Not covered yet: matrix approval (reserved for the curriculum matrix, T-1); the
-bindings are not a table of `training-inspection-evidence/1` (the audit rows of
-record decisions are, through their record IDs; a `/2` inspection constituent is
+bindings are not a table of `training-inspection-evidence/1` (its audit table
+carries the `training_signature_bound` rows of record decisions through their
+record IDs, of impact reviews through their plan IDs and of material approvals
+through their draft IDs, never by course alone; a `/2` inspection constituent is
 T-5's); the CC due feed still reports a verified but unsigned completion as
 satisfied; the meaning texts are the EDC's and await a person's approval. The
 owned obligations suite exercises the routes on real PostgreSQL against an EDC

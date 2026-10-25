@@ -3,7 +3,7 @@
 import express from 'express';
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { createJwtService } from '@accura-trial/auth-core';
 import { Pool } from 'pg';
 import trainingRoutes from '../../src/routes/training.routes';
@@ -11,6 +11,7 @@ import { errorHandler } from '../../src/middleware/errorHandler.middleware';
 import { pool } from '../../src/config/database';
 import { runMigrations } from '../../src/config/migrations';
 import { expireOverdueRecords } from '../../src/services/training.service';
+import { trainingEvidenceHash } from '../../src/services/audit.service';
 import { nativeTrainingAuthority } from '../fixtures/native-training-authority';
 
 jest.mock('../../src/config/environment', () => ({ config: {
@@ -27,6 +28,9 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
   let nativeAuthority: ReturnType<typeof nativeTrainingAuthority>;
   const guardedClients = new WeakSet<object>();
   let beforeNativeResolve: ((input: any) => Promise<void>) | undefined;
+  // The EDC's op inspection reaches its export service, which this harness does not compile; inspection cases answer
+  // it with this synthetic native observation instead (every other op stays the compiled EDC authority).
+  let inspectionScopes: Array<{ studyId: number; siteId?: number }> | undefined;
   const app = express(); app.use(express.json()); app.use('/api/training', trainingRoutes); app.use(errorHandler);
   const token = jwt.sign({ userId: 111, username: 'owned-fixture-admin', role: 'admin', email: 'owned@example.invalid', type: 'access' }, 'owned-training-postgres-test', { algorithm: 'HS256', issuer: 'libreclinica-api', audience: 'libreclinica-client', expiresIn: '1h' });
   let ready = false, courseId: number, questionId: number, recordId: number;
@@ -79,7 +83,7 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
   }
 
   beforeEach(async () => {
-    beforeNativeResolve = undefined; tab = undefined; auditMark = 0;
+    beforeNativeResolve = undefined; tab = undefined; auditMark = 0; inspectionScopes = undefined;
     const verifier = createJwtService({ secret: 'owned-training-postgres-test' });
     jest.spyOn(globalThis, 'fetch').mockImplementation(async (url, options) => {
       const bearer = new Headers(options?.headers).get('Authorization')!.slice('Bearer '.length);
@@ -88,7 +92,7 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
         try {
           const input = JSON.parse(String(options?.body));
           await beforeNativeResolve?.(input);
-          const data = await nativeAuthority.resolve(111, input);
+          const data = input.op === 'inspection' && inspectionScopes ? syntheticInspection(input) : await nativeAuthority.resolve(111, input);
           return new Response(JSON.stringify({ success: true, data }), { status: 200, headers: { 'content-type': 'application/json' } });
         } catch (error) {
           const failure = error as { statusCode?: number; code?: string; message?: string };
@@ -144,6 +148,37 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
       ? (connect as any)((error: unknown, client: any, release: any) => callback(error, client ? guard(client) : client, release))
       : connect().then(guard)) as any);
   });
+
+  const inspectionHash = createHash('sha256').update('synthetic inspection authority').digest('hex');
+  function syntheticInspection(input: any) {
+    return { schemaVersion: 'training-authority/1', op: 'inspection', action: 'records:inspect', actorUserId: 111, observedAt: new Date().toISOString(),
+      consistency: 'current-page-observations-not-atomic', scopeFingerprint: `sha256:${inspectionHash}`, complete: true, nativeStudyId: input.nativeStudyId,
+      studyIds: inspectionScopes!.map(scope => scope.siteId ?? scope.studyId), scopes: inspectionScopes, authorityHash: inspectionHash,
+      sourceChecks: input.materials.map((m: any) => ({ sourceHash: m.sourceHash, current: true })),
+      impactChecks: input.impacts.map((i: any) => ({ nativeSourceHash: i.source.nativeSourceHash, lifecycleRevision: i.source.lifecycleRevision, current: true })) };
+  }
+  /** One governed course in study 100 with one retained, unreviewed synthetic material draft and its event. */
+  async function governedMaterial() {
+    const course = (await fixturePool.query(`INSERT INTO acc_training_courses (course_code,course_name,version,passing_score,required_for_roles,material_scope)
+      VALUES ('OWNED-GOVERNED','Governed synthetic material','1',80,'[]','{"studyId":100}') RETURNING id,content_revision`)).rows[0];
+    const fileId = randomUUID(), draftId = randomUUID();
+    const draftRequest = { schemaVersion: 'training-material-draft/1', idempotencyKey: randomUUID(), courseId: course.id, expectedContentRevision: course.content_revision,
+      expectedDraftId: null, reason: 'SYNTHETIC inspection fixture',
+      source: { scope: { studyId: 100 }, armIds: [], originals: [{ kind: 'protocol', fileId, sha256: 'd'.repeat(64) }], sourceHash: 'c'.repeat(64) },
+      material: { courseCode: 'OWNED-GOVERNED', courseName: 'Governed synthetic material', description: '', version: '1', passingScore: 80, durationMinutes: null,
+        validityPeriodDays: 365, active: true, intendedUse: 'synthetic_qualification',
+        lessons: [{ title: 'Synthetic lesson', text: 'Synthetic qualification text.', citations: [{ fileId, locator: 'p. 1' }] }],
+        questions: [{ questionText: 'Synthetic question?', questionType: 'true_false', options: [{ text: 'Yes', isCorrect: true }, { text: 'No', isCorrect: false }], explanation: '' }] } };
+    const draft = { id: draftId, courseId: course.id, createdBy: 222, idempotencyKey: draftRequest.idempotencyKey, request: draftRequest, requestHash: trainingEvidenceHash(draftRequest),
+      authorAuthorityHash: `sha256:${'8'.repeat(64)}`, status: 'draft', revision: 1, reviewedBy: null, reviewAuthorityHash: null, reviewReason: null, reviewedAt: null };
+    await fixturePool.query(`INSERT INTO acc_training_material_drafts(id,course_id,created_by,idempotency_key,request,request_hash,author_authority_hash,status)
+      VALUES($1,$2,222,$3,$4,$5,$6,'draft')`, [draftId, course.id, draft.idempotencyKey, JSON.stringify(draftRequest), draft.requestHash, draft.authorAuthorityHash]);
+    await fixturePool.query(`INSERT INTO acc_training_material_events(draft_id,revision,actor_user_id,action,snapshot) VALUES($1,1,222,'training_material_drafted',$2)`,
+      [draftId, JSON.stringify(draft)]);
+    return { courseId: course.id as number, draftId };
+  }
+  const inspect = (body: Record<string, unknown>) => request(app).post('/api/training/inspection-evidence').set('Authorization', `Bearer ${token}`).send(body);
+  const tableRows = (evidence: any, table: string) => evidence.tables.find((t: any) => t.table === table).rows.map((row: any) => JSON.parse(row.nativeJson));
 
   async function snapshot() {
     const state: Record<string, unknown> = {};
@@ -442,6 +477,20 @@ runOwned('owned PostgreSQL training audit atomicity', () => {
       for(let i=0;i<12;i++) await fixturePool.query('UPDATE acc_training_courses SET description=$1 WHERE id=$2',[`Concurrent material ${i}`,courseId]);
     })()]);
     expect((await fixturePool.query('SELECT content_revision FROM acc_training_courses WHERE id=$1',[courseId])).rows[0].content_revision).toBe(before+12);
+  });
+
+  test('the inspection audit table carries the material approval signature rows of its selected drafts, never by course alone (RF-073)', async () => {
+    inspectionScopes = [{ studyId: 100 }];
+    const { courseId: governed, draftId } = await governedMaterial();
+    await fixturePool.query(`INSERT INTO acc_training_audit_log (user_id,action,course_id,details) VALUES
+      (333,'training_signature_bound',$1,$2),(333,'training_signature_bound',$1,$3),(222,'course_updated',$1,'{}')`,
+      [governed, JSON.stringify({ draftId, signatureId: 9101, decision: 'material-approval', subjectHash: 'e'.repeat(64) }),
+        JSON.stringify({ draftId: randomUUID(), signatureId: 9102, decision: 'material-approval', subjectHash: 'f'.repeat(64) })]);
+    const response = await inspect({ nativeStudyId: 100, nonce: randomBytes(16).toString('hex') });
+    expect(response.status).toBe(200);
+    const audit = tableRows(response.body.data, 'acc_training_audit_log');
+    expect(audit.map((row: any) => [row.action, row.details.signatureId ?? null])).toEqual([['training_signature_bound', 9101], ['course_updated', null]]);
+    expect(tableRows(response.body.data, 'acc_training_material_drafts').map((row: any) => row.id)).toEqual([draftId]);
   });
 
   // Statement guards fire whether or not a table holds rows; the log and record history hold real ones here.

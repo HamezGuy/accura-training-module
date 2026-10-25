@@ -272,12 +272,15 @@ async function collectTrainingInspectionEvidence(authority:TrainingAuthorityCont
   await validateInspectionMaterial(client,drafts.map(camel) as any,publications.map(camel) as any,materialEvents.map(camel) as any);
   // A generic course can serve learners in other studies. Include its authored
   // changes, but never another scope's learner activity merely by course ID.
+  // A material approval signature row names its draft (training-materials.service.ts); it is selected by a
+  // selected draft, never by its course alone (RF-073).
   await read('acc_training_audit_log',`SELECT t.id,t.user_id,t.action,t.record_id,t.course_id,t.details,t.created_at FROM acc_training_audit_log t WHERE
     (course_id=ANY($1::int[]) AND action IN ('course_created','course_updated','questions_added','training_material_drafted','training_material_reviewed','training_material_rejected','training_material_published'))
     OR record_id=ANY($2::int[]) OR details->>'planId'=ANY($3::text[]) OR details->>'obligationId'=ANY($4::text[])
+    OR action='training_signature_bound' AND details->>'draftId'=ANY($6::text[])
     OR EXISTS(SELECT 1 FROM jsonb_array_elements($5::jsonb) p WHERE t.course_id=(p->>'courseId')::int AND
       (t.user_id=(p->>'userId')::int AND t.action IN ('training_started','quiz_submitted','quiz_passed','quiz_failed') OR t.action='training_expired' AND t.details->>'affectedUserId'=p->>'userId'))
-    ORDER BY id`,[courseIds,records.map(r=>r.id),plans.map(r=>r.id),obligationIds.map(String),pairs]);
+    ORDER BY id`,[courseIds,records.map(r=>r.id),plans.map(r=>r.id),obligationIds.map(String),pairs,drafts.map(r=>r.id)]);
   const materialSources:TrainingMaterialSource[]=[...new Map(drafts.map(row=>[canonical(row.request.source),row.request.source as TrainingMaterialSource])).values()];
   if(materialSources.length>500)fail('Training inspection exceeds 500 retained material sources',413);
   const impactSources=[...new Map(plans.map(p=>[canonical({scope:p.plan.scope,source:p.plan.source}),{scope:p.plan.scope,source:p.plan.source}])).values()];
